@@ -1,0 +1,57 @@
+server:
+  port: 8080
+  auth_token: "${AUTH_TOKEN}"
+mysql:
+  dsn: "${MYSQL_DSN}"
+llm:
+  roles:
+    reasoner:
+      base_url: "https://ark.cn-beijing.volces.com/api/v3"
+      api_key: "${ARK_KEY}"
+      model: "deepseek-v3-1-terminus"
+      max_tokens: 2048
+    summarizer:
+      base_url: "https://ark.cn-beijing.volces.com/api/v3"
+      api_key: "${ARK_KEY}"
+      model: "deepseek-v3-1-terminus"
+      max_tokens: 1024
+ingest:
+  fingerprint_fields: []
+  severity_label: severity
+  full_dedup_ignore: [starts_at, ends_at, received_at]
+correlate:
+  group_by: [labels.service]
+  window_minutes: 15
+  min_alerts: 1
+diagnose:
+  budget:
+    full_steps: 8
+    light_steps: 3
+  severity_route:
+    critical: full
+    high: full
+    warning: light
+    info: skip
+    low: skip
+memory:
+  ttl_seconds: 3600
+  only_high_confidence: true
+  cmd_history_inject: 5
+approval:
+  ttl_minutes: 30
+tools:
+  prometheus:
+    base_url: "http://127.0.0.1:9090"
+    range_minutes: 15
+    max_points: 300
+  logs:
+    enabled: false
+    provider: cls
+    region: ap-guangzhou
+    topic_id: "${CLS_TOPIC}"
+  mysql_select:
+    dsn: "${MYSQL_RO_DSN}"
+notify:
+  im:
+    provider: wecom
+    webhook: "${IM_WEBHOOK}"
