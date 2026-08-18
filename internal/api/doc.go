@@ -1,2 +1,2 @@
-// Package api contains HTTP transport handlers.
+// Package api contains HTTP boundaries for oncall-agent.
 package api

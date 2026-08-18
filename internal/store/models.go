@@ -21,17 +21,18 @@ func (RawEvent) TableName() string { return "raw_event" }
 
 // Alert stores one normalized alert delivery and is never updated.
 type Alert struct {
-	ID          uint64         `gorm:"column:id;primaryKey;autoIncrement"`
-	Fingerprint string         `gorm:"column:fingerprint;size:64;not null"`
-	AlertHash   string         `gorm:"column:alert_hash;size:32;not null"`
-	Source      string         `gorm:"column:source;size:64;not null"`
-	Name        string         `gorm:"column:name;size:255;not null"`
-	Severity    uint8          `gorm:"column:severity;not null"`
-	Status      string         `gorm:"column:status;size:8;not null"`
-	Labels      datatypes.JSON `gorm:"column:labels;type:json;not null"`
-	Annotations datatypes.JSON `gorm:"column:annotations;type:json;not null"`
-	StartsAt    time.Time      `gorm:"column:starts_at;not null"`
-	ReceivedAt  time.Time      `gorm:"column:received_at;not null"`
+	ID           uint64         `gorm:"column:id;primaryKey;autoIncrement"`
+	Fingerprint  string         `gorm:"column:fingerprint;size:64;not null"`
+	AlertHash    string         `gorm:"column:alert_hash;size:32;not null"`
+	Source       string         `gorm:"column:source;size:64;not null"`
+	Name         string         `gorm:"column:name;size:255;not null"`
+	Severity     uint8          `gorm:"column:severity;not null"`
+	Status       string         `gorm:"column:status;size:8;not null"`
+	Labels       datatypes.JSON `gorm:"column:labels;type:json;not null"`
+	Annotations  datatypes.JSON `gorm:"column:annotations;type:json;not null"`
+	GeneratorURL string         `gorm:"column:generator_url;type:text;not null"`
+	StartsAt     time.Time      `gorm:"column:starts_at;not null"`
+	ReceivedAt   time.Time      `gorm:"column:received_at;not null"`
 }
 
 func (Alert) TableName() string { return "alert" }
