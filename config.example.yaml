@@ -1,3 +1,7 @@
+# D01 示例。占位符是必填环境变量引用，不是可选项。
+# 加载整份文件需要 AUTH_TOKEN、MYSQL_DSN、ARK_KEY、CLS_TOPIC、MYSQL_RO_DSN、IM_WEBHOOK。
+# 最小配置只写 mysql.dsn 时，只需 MYSQL_DSN。
+# D01 的 validate() 只在展开后 mysql.dsn 仍为空时启动失败。
 server:
   port: 8080
   auth_token: "${AUTH_TOKEN}"
@@ -33,13 +37,27 @@ diagnose:
     warning: light
     info: skip
     low: skip
+  evidence:
+    sub2api_base_url: "${SUB2API_BASE_URL}"
+    sub2api_metrics_job: sub2api
+    postgres_dsn: "${PG_RO_DSN}"
+    redis_addr: "${REDIS_ADDR}"
+    docker_container: sub2api
+    docker_socket: /var/run/docker.sock
+    timeout_seconds: 5
+    log_max_lines: 200
 memory:
   ttl_seconds: 3600
   only_high_confidence: true
   cmd_history_inject: 5
 approval:
   ttl_minutes: 30
+  auto_execute_l2: false
+  dry_run: true
+  verify_delay_seconds: 30
 tools:
+  docker:
+    allowed_containers: [sub2api]
   prometheus:
     base_url: "http://127.0.0.1:9090"
     range_minutes: 15

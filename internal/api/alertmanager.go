@@ -11,6 +11,7 @@ import (
 	"github.com/gogf/gf/v2/net/ghttp"
 
 	"oncall-agent/internal/ingest"
+	"oncall-agent/internal/metrics"
 	"oncall-agent/internal/store"
 )
 
@@ -64,5 +65,6 @@ func (h *AlertmanagerWebhook) serveHTTP(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	h.worker.Notify()
+	metrics.Inc(metrics.WebhookReceived)
 	w.WriteHeader(http.StatusAccepted)
 }

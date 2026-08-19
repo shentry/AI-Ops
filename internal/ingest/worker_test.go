@@ -23,6 +23,42 @@ type appliedRawEvent struct {
 	inputs []store.AlertInput
 }
 
+type fakeIncidentTx struct {
+	mu          sync.Mutex
+	assignments []store.IncidentInput
+	touches     []uint64
+	resolutions []uint64
+	runs        []store.AgentRun
+}
+
+func (f *fakeIncidentTx) AssignIncident(_ context.Context, input store.IncidentInput, _ time.Duration, _ int) (store.IncidentAssignment, error) {
+	f.mu.Lock()
+	f.assignments = append(f.assignments, input)
+	f.mu.Unlock()
+	return store.IncidentAssignment{IncidentID: 1, Status: "firing", Severity: input.Severity, Promoted: true}, nil
+}
+
+func (f *fakeIncidentTx) TouchIncident(_ context.Context, id uint64, _ time.Time, _ int) error {
+	f.mu.Lock()
+	f.touches = append(f.touches, id)
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *fakeIncidentTx) ResolveIncident(_ context.Context, id uint64, _ time.Time) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resolutions = append(f.resolutions, id)
+	return true, nil
+}
+
+func (f *fakeIncidentTx) EnqueueAgentRun(_ context.Context, run store.AgentRun) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.runs = append(f.runs, run)
+	return nil
+}
+
 type fakePendingEventStore struct {
 	mu            sync.Mutex
 	events        []store.RawEvent
@@ -32,12 +68,16 @@ type fakePendingEventStore struct {
 	attempts      int
 	appliedCh     chan appliedRawEvent
 	failedCh      chan uint64
+	incidentTx    *fakeIncidentTx
+	dedupResults  []store.DedupResult
+	incidentID    *uint64
 }
 
 func newFakePendingEventStore(events ...store.RawEvent) *fakePendingEventStore {
 	return &fakePendingEventStore{
 		events: events, failed: make(map[uint64]string),
 		appliedCh: make(chan appliedRawEvent, 512), failedCh: make(chan uint64, 16),
+		incidentTx: &fakeIncidentTx{},
 	}
 }
 
@@ -60,7 +100,7 @@ func (f *fakePendingEventStore) NextPendingRawEvent(ctx context.Context) (store.
 	return pending[0], true, nil
 }
 
-func (f *fakePendingEventStore) ApplyRawEvent(ctx context.Context, id uint64, inputs []store.AlertInput, _ time.Time) ([]store.DedupResult, error) {
+func (f *fakePendingEventStore) ApplyRawEvent(ctx context.Context, id uint64, inputs []store.AlertInput, _ time.Time, hook store.RawEventApplyHook) ([]store.AlertApplyResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -71,6 +111,27 @@ func (f *fakePendingEventStore) ApplyRawEvent(ctx context.Context, id uint64, in
 		f.mu.Unlock()
 		return nil, errors.New("transient store failure")
 	}
+	f.mu.Unlock()
+	results := make([]store.AlertApplyResult, len(inputs))
+	for index, input := range inputs {
+		dedup := store.DedupNew
+		if index < len(f.dedupResults) {
+			dedup = f.dedupResults[index]
+		}
+		last := store.LastAlert{Fingerprint: input.Fingerprint}
+		if f.incidentID != nil {
+			incidentID := *f.incidentID
+			last.IncidentID = &incidentID
+		}
+		results[index] = store.AlertApplyResult{Input: input, Dedup: dedup, Last: last}
+		if hook != nil {
+			if err := hook(ctx, f.incidentTx, results[index]); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	f.mu.Lock()
 	for index := range f.events {
 		if f.events[index].ID == id {
 			f.events[index].Status = "processed"
@@ -80,10 +141,6 @@ func (f *fakePendingEventStore) ApplyRawEvent(ctx context.Context, id uint64, in
 	f.applied = append(f.applied, record)
 	f.mu.Unlock()
 	f.appliedCh <- record
-	results := make([]store.DedupResult, len(inputs))
-	for index := range results {
-		results[index] = store.DedupNew
-	}
 	return results, nil
 }
 
@@ -192,10 +249,139 @@ func TestWorkerDrainsMoreThanLegacyChannelCapacity(t *testing.T) {
 	}
 }
 
-func startTestWorker(t *testing.T, fake pendingEventStore, cfg config.IngestConfig) (*Worker, context.CancelFunc) {
+func TestWorkerAssignsFiringAlertToIncident(t *testing.T) {
+	fake := newFakePendingEventStore(testRawEvent(1, time.Now().UTC(), "CorrelateAlert", map[string]string{"service": "payments"}))
+	worker, cancel := startTestWorker(t, fake, config.IngestConfig{SeverityLabel: "severity"})
+	defer func() { cancel(); worker.Wait() }()
+	receiveApplied(t, fake.appliedCh)
+	fake.incidentTx.mu.Lock()
+	assignments := append([]store.IncidentInput(nil), fake.incidentTx.assignments...)
+	fake.incidentTx.mu.Unlock()
+	if len(assignments) != 1 || assignments[0].GroupKey != "name:CorrelateAlert" {
+		t.Fatalf("assignments = %#v", assignments)
+	}
+}
+
+func TestWorkerUsesConfiguredGroupBy(t *testing.T) {
+	fake := newFakePendingEventStore(testRawEvent(1, time.Now().UTC(), "ConfiguredGroupAlert", map[string]string{"service": "payments"}))
+	worker, cancel := startTestWorker(t, fake, config.IngestConfig{SeverityLabel: "severity"}, config.CorrelateConfig{GroupBy: []string{"labels.service"}, WindowMinutes: 15, MinAlerts: 1})
+	defer func() { cancel(); worker.Wait() }()
+	receiveApplied(t, fake.appliedCh)
+	fake.incidentTx.mu.Lock()
+	assignments := append([]store.IncidentInput(nil), fake.incidentTx.assignments...)
+	fake.incidentTx.mu.Unlock()
+	if len(assignments) != 1 || assignments[0].GroupKey != "payments" {
+		t.Fatalf("assignments = %#v", assignments)
+	}
+}
+
+func TestWorkerTouchesFullDuplicateIncident(t *testing.T) {
+	incidentID := uint64(7)
+	fake := newFakePendingEventStore(testRawEvent(1, time.Now().UTC(), "HeartbeatAlert", nil))
+	fake.dedupResults = []store.DedupResult{store.DedupFull}
+	fake.incidentID = &incidentID
+	worker, cancel := startTestWorker(t, fake, config.IngestConfig{SeverityLabel: "severity"})
+	defer func() { cancel(); worker.Wait() }()
+	receiveApplied(t, fake.appliedCh)
+	fake.incidentTx.mu.Lock()
+	touches := append([]uint64(nil), fake.incidentTx.touches...)
+	assignments := append([]store.IncidentInput(nil), fake.incidentTx.assignments...)
+	fake.incidentTx.mu.Unlock()
+	if len(touches) != 1 || touches[0] != incidentID || len(assignments) != 0 {
+		t.Fatalf("touches=%v assignments=%v", touches, assignments)
+	}
+}
+
+func TestWorkerSkipsResolvedAlertForD04(t *testing.T) {
+	fake := newFakePendingEventStore(resolvedRawEvent(1, time.Now().UTC(), "ResolvedAlert"))
+	worker, cancel := startTestWorker(t, fake, config.IngestConfig{SeverityLabel: "severity"})
+	defer func() { cancel(); worker.Wait() }()
+	receiveApplied(t, fake.appliedCh)
+	fake.incidentTx.mu.Lock()
+	assignments := len(fake.incidentTx.assignments)
+	touches := len(fake.incidentTx.touches)
+	fake.incidentTx.mu.Unlock()
+	if assignments != 0 || touches != 0 {
+		t.Fatalf("resolved alert touched D04: assignments=%d touches=%d", assignments, touches)
+	}
+}
+
+func TestWorkerPropagatesResolvedToIncident(t *testing.T) {
+	incidentID := uint64(9)
+	fake := newFakePendingEventStore(resolvedRawEvent(1, time.Now().UTC(), "ResolvePropAlert"))
+	fake.incidentID = &incidentID
+	worker, cancel := startTestWorker(t, fake, config.IngestConfig{SeverityLabel: "severity"})
+	defer func() { cancel(); worker.Wait() }()
+	receiveApplied(t, fake.appliedCh)
+	fake.incidentTx.mu.Lock()
+	resolutions := append([]uint64(nil), fake.incidentTx.resolutions...)
+	assignments := len(fake.incidentTx.assignments)
+	touches := len(fake.incidentTx.touches)
+	fake.incidentTx.mu.Unlock()
+	if len(resolutions) != 1 || resolutions[0] != incidentID || assignments != 0 || touches != 0 {
+		t.Fatalf("resolutions=%v assignments=%d touches=%d", resolutions, assignments, touches)
+	}
+}
+
+func TestWorkerSkipsResolvedWithoutIncidentLink(t *testing.T) {
+	// resolved 告警没挂 incident（从未 firing 过）时不触发 resolved 传播。
+	fake := newFakePendingEventStore(resolvedRawEvent(1, time.Now().UTC(), "OrphanResolvedAlert"))
+	worker, cancel := startTestWorker(t, fake, config.IngestConfig{SeverityLabel: "severity"})
+	defer func() { cancel(); worker.Wait() }()
+	receiveApplied(t, fake.appliedCh)
+	fake.incidentTx.mu.Lock()
+	resolutions := len(fake.incidentTx.resolutions)
+	fake.incidentTx.mu.Unlock()
+	if resolutions != 0 {
+		t.Fatalf("resolutions = %d, want 0", resolutions)
+	}
+}
+
+func TestWorkerEnqueuesDiagnosisOnPromotion(t *testing.T) {
+	fake := newFakePendingEventStore(testRawEvent(1, time.Now().UTC(), "DiagRouteAlert", nil))
+	worker, cancel := startTestWorker(t, fake, config.IngestConfig{SeverityLabel: "severity"})
+	defer func() { cancel(); worker.Wait() }()
+	receiveApplied(t, fake.appliedCh)
+	fake.incidentTx.mu.Lock()
+	runs := append([]store.AgentRun(nil), fake.incidentTx.runs...)
+	fake.incidentTx.mu.Unlock()
+	// testRawEvent 的 severity 是 critical → 路由 full → pending 队列行。
+	if len(runs) != 1 || runs[0].IncidentID != 1 || runs[0].Mode != "full" || runs[0].Status != "pending" || runs[0].RetryOf != nil {
+		t.Fatalf("runs = %#v", runs)
+	}
+}
+
+func TestWorkerEnqueuesSucceededRunForSkipSeverity(t *testing.T) {
+	// info 级别路由到 skip：落一行 succeeded 供统计，不进 pending 队列。
+	payload := `{"version":"4","status":"firing","alerts":[{"status":"firing","labels":{"alertname":"InfoAlert","severity":"info"},"annotations":{},"startsAt":"2026-08-17T09:59:00Z","endsAt":"0001-01-01T00:00:00Z"}]}`
+	event := store.RawEvent{ID: 1, Source: "alertmanager", Payload: datatypes.JSON([]byte(payload)), Status: "pending", CreatedAt: time.Now().UTC()}
+	fake := newFakePendingEventStore(event)
+	worker, cancel := startTestWorker(t, fake, config.IngestConfig{SeverityLabel: "severity"})
+	defer func() { cancel(); worker.Wait() }()
+	receiveApplied(t, fake.appliedCh)
+	fake.incidentTx.mu.Lock()
+	runs := append([]store.AgentRun(nil), fake.incidentTx.runs...)
+	fake.incidentTx.mu.Unlock()
+	if len(runs) != 1 || runs[0].Mode != "skip" || runs[0].Status != "succeeded" || runs[0].FinishedAt == nil {
+		t.Fatalf("runs = %#v", runs)
+	}
+}
+
+func startTestWorker(t *testing.T, fake pendingEventStore, cfg config.IngestConfig, correlateConfigs ...config.CorrelateConfig) (*Worker, context.CancelFunc) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	worker := newWorker(fake, cfg, log.New(io.Discard, "", 0), 5*time.Millisecond)
+	correlateCfg := config.CorrelateConfig{WindowMinutes: 15, MinAlerts: 1}
+	if len(correlateConfigs) > 0 {
+		correlateCfg = correlateConfigs[0]
+	}
+	severityRoute := map[string]string{
+		"critical": "full",
+		"high":     "full",
+		"warning":  "light",
+		"info":     "skip",
+		"low":      "skip",
+	}
+	worker := newWorker(fake, cfg, correlateCfg, severityRoute, log.New(io.Discard, "", 0), 5*time.Millisecond)
 	if err := worker.Start(ctx); err != nil {
 		cancel()
 		t.Fatalf("Start() error = %v", err)
@@ -221,4 +407,10 @@ func testRawEvent(id uint64, createdAt time.Time, alertName string, extraLabels 
 	}
 	payload := fmt.Sprintf(`{"version":"4","status":"firing","alerts":[{"status":"firing","labels":{%s},"annotations":{"summary":"test"},"startsAt":"2026-08-17T09:59:00Z","endsAt":"0001-01-01T00:00:00Z","generatorURL":"http://127.0.0.1:9090/graph?g0.expr=vector(1)"}]}`, labels)
 	return store.RawEvent{ID: id, Source: "alertmanager", Payload: datatypes.JSON([]byte(payload)), Status: "pending", CreatedAt: createdAt}
+}
+
+func resolvedRawEvent(id uint64, createdAt time.Time, alertName string) store.RawEvent {
+	event := testRawEvent(id, createdAt, alertName, nil)
+	event.Payload = datatypes.JSON([]byte(strings.ReplaceAll(string(event.Payload), `"firing"`, `"resolved"`)))
+	return event
 }

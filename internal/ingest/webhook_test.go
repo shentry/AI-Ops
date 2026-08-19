@@ -1,3 +1,4 @@
+// D02 ParseWebhook 测试：字段归一化、缺失 map、以及拒绝未知 version / status / 时间，而不是给默认值。
 package ingest
 
 import (

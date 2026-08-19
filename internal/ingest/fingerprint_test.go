@@ -1,3 +1,4 @@
+// D02 身份测试：label 顺序不影响指纹；firing/resolved 同指纹但 FullHash 不同；时间字段不进 FullHash。
 package ingest
 
 import (

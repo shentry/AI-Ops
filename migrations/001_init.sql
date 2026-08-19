@@ -1,3 +1,9 @@
+-- D01 表结构。手工执行：mysql < migrations/001_init.sql
+-- 不要 AutoMigrate：ENUM、索引、JSON 可空性必须能在这份 SQL 里审查。
+-- 十张表：摄入 raw_event/alert/last_alert，聚合 incident*，
+-- 记忆、审批、诊断 agent_run*。
+
+-- webhook 信封。D03 先写 pending，再由 worker 扫出来补账。
 CREATE TABLE IF NOT EXISTS raw_event (
   id            BIGINT AUTO_INCREMENT PRIMARY KEY,
   source        VARCHAR(64)  NOT NULL,
@@ -9,6 +15,7 @@ CREATE TABLE IF NOT EXISTS raw_event (
   KEY idx_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+-- 归一化告警的追加历史。fingerprint=SHA-256，alert_hash=MD5（D02）。
 CREATE TABLE IF NOT EXISTS alert (
   id            BIGINT AUTO_INCREMENT PRIMARY KEY,
   fingerprint   CHAR(64)     NOT NULL,
@@ -24,6 +31,7 @@ CREATE TABLE IF NOT EXISTS alert (
   KEY idx_fp_time (fingerprint, received_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+-- 每个 fingerprint 的当前快照。D03 去重只跟这一行比。
 CREATE TABLE IF NOT EXISTS last_alert (
   fingerprint   CHAR(64)     PRIMARY KEY,
   alert_id      BIGINT       NOT NULL,
@@ -36,6 +44,7 @@ CREATE TABLE IF NOT EXISTS last_alert (
   incident_id   BIGINT       NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+-- D04/D05 聚合事件。idx_group_open 用来查仍开放的 incident。
 CREATE TABLE IF NOT EXISTS incident (
   id            BIGINT AUTO_INCREMENT PRIMARY KEY,
   group_key     VARCHAR(255) NOT NULL,
@@ -49,6 +58,7 @@ CREATE TABLE IF NOT EXISTS incident (
   KEY idx_group_open (group_key, status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+-- 成员表。联合主键：同一 fingerprint 最多加入一个 incident 一次。
 CREATE TABLE IF NOT EXISTS incident_alert (
   incident_id   BIGINT       NOT NULL,
   fingerprint   CHAR(64)     NOT NULL,
@@ -56,6 +66,7 @@ CREATE TABLE IF NOT EXISTS incident_alert (
   PRIMARY KEY (incident_id, fingerprint)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+-- D13 记忆键是 CHAR(12)，不是 D02 的 SHA-256 告警指纹。
 CREATE TABLE IF NOT EXISTS fault_memory (
   fingerprint   CHAR(12)     PRIMARY KEY,
   group_key     VARCHAR(255) NOT NULL,
@@ -70,6 +81,7 @@ CREATE TABLE IF NOT EXISTS fault_memory (
   ttl_sec       INT          NOT NULL DEFAULT 3600
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+-- 已审批命令结果，后续诊断会注入。
 CREATE TABLE IF NOT EXISTS fault_cmd_history (
   id            BIGINT AUTO_INCREMENT PRIMARY KEY,
   fingerprint   CHAR(12)     NOT NULL,
@@ -81,6 +93,7 @@ CREATE TABLE IF NOT EXISTS fault_cmd_history (
   KEY idx_fp_time (fingerprint, created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+-- D10 的 L2 变更动作状态机。
 CREATE TABLE IF NOT EXISTS approval (
   id            BIGINT AUTO_INCREMENT PRIMARY KEY,
   incident_id   BIGINT       NOT NULL,
@@ -95,6 +108,7 @@ CREATE TABLE IF NOT EXISTS approval (
   created_at    DATETIME(3)  NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+-- 一次诊断尝试，也是 D05 诊断 worker 的队列。
 CREATE TABLE IF NOT EXISTS agent_run (
   id            BIGINT AUTO_INCREMENT PRIMARY KEY,
   incident_id   BIGINT       NOT NULL,
@@ -110,6 +124,7 @@ CREATE TABLE IF NOT EXISTS agent_run (
   KEY idx_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+-- 可回放的流水线一步。idx_run (run_id, seq) 是按序读取路径。
 CREATE TABLE IF NOT EXISTS agent_run_step (
   id            BIGINT AUTO_INCREMENT PRIMARY KEY,
   run_id        BIGINT       NOT NULL,

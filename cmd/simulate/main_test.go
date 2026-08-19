@@ -59,6 +59,9 @@ func TestBuildPayloadUsesAlertmanagerV4AndDuplicateRatio(t *testing.T) {
 		if alert.GeneratorURL != "http://127.0.0.1:9090/graph?g0.expr=vector(1)" {
 			t.Fatalf("generatorURL = %q", alert.GeneratorURL)
 		}
+		if alert.Labels["service"] != "payments" {
+			t.Fatalf("service label = %q, want payments", alert.Labels["service"])
+		}
 	}
 	if len(seen) != 40 {
 		t.Fatalf("unique fingerprints = %d, want 40", len(seen))

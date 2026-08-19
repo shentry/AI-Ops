@@ -1,3 +1,4 @@
+// D02 severity 测试：5..1 映射、未知→3、以及自定义标签名。
 package ingest
 
 import "testing"

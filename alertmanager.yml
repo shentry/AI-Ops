@@ -1,3 +1,5 @@
+# D01 的 Alertmanager 配置。webhook 地址是以后 D03 的接收端。
+# send_resolved 必须保持 true，D03/D05 才能关掉告警和 incident。
 global:
   resolve_timeout: 5m
 

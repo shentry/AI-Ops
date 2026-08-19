@@ -1,3 +1,4 @@
+# D01 只做抓取。告警规则和 alertmanager 对接以后再加。
 global:
   scrape_interval: 5s
   evaluation_interval: 5s

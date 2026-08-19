@@ -2,8 +2,10 @@ package ingest
 
 import "strings"
 
-// Severity maps a configured label value to the numeric severity used by the
-// alert schema. Unknown and missing values use warning (3).
+// Severity 把标签值映射成 5..1。
+// critical=5，error/high=4，warning/medium=3，info=2，low=1。
+// 缺失或未知默认 warning(3)，不是 info。
+// 这不是 alert status。D03 按 cfg.Ingest.SeverityLabel 重算。
 func Severity(labels map[string]string, severityLabel string) int {
 	severity := ""
 	if labels != nil {

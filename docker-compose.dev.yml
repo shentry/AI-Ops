@@ -1,3 +1,5 @@
+# D01 本地依赖。server 不进 Compose，跑在宿主机上，通过 localhost:3306 连 MySQL。
+# Alertmanager 往 host.docker.internal:8080 推 webhook。
 services:
   mysql:
     image: mysql:8.0

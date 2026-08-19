@@ -9,10 +9,12 @@ import (
 	"strings"
 )
 
-// Fingerprint returns a deterministic SHA-256 fingerprint for the selected
-// labels. An empty fields list selects every label. Keys are sorted and each
-// key/value pair is NUL-terminated so label-map iteration order cannot affect
-// the result.
+// Fingerprint 是 D02 的告警对象身份：选中 labels 的 SHA-256。
+// 不算 status，所以 firing 和 resolved 共用指纹。
+//
+// fields 为空则用全部 labels。key 排序后拼接，每对用 NUL 结尾，
+// map 遍历顺序不会影响结果。若配置字段在这条告警上全缺，
+// 会对空串哈希——D03 不能让这种情况悄悄把无关告警并到一起。
 func Fingerprint(labels map[string]string, fields []string) string {
 	keys := fingerprintKeys(labels, fields)
 	var input strings.Builder
@@ -27,9 +29,9 @@ func Fingerprint(labels map[string]string, fields []string) string {
 	return hex.EncodeToString(digest[:])
 }
 
-// FullHash returns the MD5 hash used for full deduplication. Timestamp fields
-// are deliberately absent from the canonical payload so repeated deliveries
-// of one alert remain full duplicates as their received times change.
+// FullHash 是 D02 的内容身份，给全量去重用。
+// 同指纹 + 同哈希 = 全量重复；同指纹 + 不同哈希 = 部分重复（状态/内容变了）。
+// StartsAt、EndsAt、ReceivedAt、AlertHash 自身都不参与。
 func FullHash(a NormalizedAlert) string {
 	payload := struct {
 		Source       string            `json:"source"`
@@ -56,6 +58,8 @@ func FullHash(a NormalizedAlert) string {
 	return hex.EncodeToString(digest[:])
 }
 
+// fingerprintKeys 同时接受 "service" 和 "labels.service"。重复字段只算一次。
+// 配置了但告警上没有的字段直接跳过，不编成空值。
 func fingerprintKeys(labels map[string]string, fields []string) []string {
 	if len(fields) == 0 {
 		keys := make([]string, 0, len(labels))
@@ -86,6 +90,7 @@ func fingerprintKeys(labels map[string]string, fields []string) []string {
 	return keys
 }
 
+// canonicalLabels 把 nil 收成 {}，JSON 编码写成 {} 而不是 null。
 func canonicalLabels(labels map[string]string) map[string]string {
 	if labels == nil {
 		return map[string]string{}

@@ -88,7 +88,7 @@ func buildPayload(n int, dup float64, resolved bool, now time.Time) ([]byte, err
 		if i >= unique {
 			identity = i % unique
 		}
-		alerts[i] = simulateAlert{Status: status, Labels: map[string]string{"alertname": "SimulatedAlert", "instance": "node-" + strconv.Itoa(identity), "severity": "critical"}, Annotations: map[string]string{"summary": "D03 simulated alert"}, StartsAt: now.Add(-time.Minute).Format(time.RFC3339Nano), EndsAt: endsAt, GeneratorURL: "http://127.0.0.1:9090/graph?g0.expr=vector(1)"}
+		alerts[i] = simulateAlert{Status: status, Labels: map[string]string{"alertname": "SimulatedAlert", "instance": "node-" + strconv.Itoa(identity), "service": "payments", "severity": "critical"}, Annotations: map[string]string{"summary": "D03 simulated alert"}, StartsAt: now.Add(-time.Minute).Format(time.RFC3339Nano), EndsAt: endsAt, GeneratorURL: "http://127.0.0.1:9090/graph?g0.expr=vector(1)"}
 	}
 	return json.Marshal(webhookEnvelope{Version: "4", Status: status, Alerts: alerts})
 }

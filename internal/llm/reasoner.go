@@ -1,0 +1,262 @@
+package llm
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/cloudwego/eino/components/tool"
+	"github.com/cloudwego/eino/compose"
+	"github.com/cloudwego/eino/flow/agent/react"
+	"github.com/cloudwego/eino/schema"
+
+	"oncall-agent/internal/config"
+	"oncall-agent/internal/tools"
+)
+
+// PlanTarget 是修复动作的目标。name 必须是真实运行对象（GC-11），
+// Guard（D09）会拿它对照证据里出现过的对象，这里先只做结构定义。
+type PlanTarget struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+}
+
+// Plan 是结构化修复计划。action=none 表示"不建议自动动作"。
+type Plan struct {
+	Action     string     `json:"action"`
+	Target     PlanTarget `json:"target"`
+	Reason     string     `json:"reason"`
+	Confidence string     `json:"confidence"`
+	Risk       string     `json:"risk"`
+	Expected   string     `json:"expected"`
+}
+
+// DiagnoseResult 是一次推理的完整产出，含 token 用量和工具步日志。
+type DiagnoseResult struct {
+	RCA          string
+	Confidence   string
+	EvidenceRefs []string
+	Plan         Plan
+	TokensIn     int
+	TokensOut    int
+	Steps        []StepLog
+}
+
+// StepLog 记录一次工具调用，供审计回放（GC-18）。
+type StepLog struct {
+	Name   string
+	Input  string
+	Output string
+	Err    string
+}
+
+// diagnoseContract 是 LLM 输出 JSON 的解析目标。
+type diagnoseContract struct {
+	RCA          string   `json:"rca"`
+	Confidence   string   `json:"confidence"`
+	EvidenceRefs []string `json:"evidence_refs"`
+	Plan         Plan     `json:"plan"`
+}
+
+// Reasoner 把 Evidence 文本转成 RCA + Plan。Eino react.Agent 只负责
+// 推理循环；流水线编排、Guard、审批都在别处（D09+）。
+type Reasoner struct {
+	factory  *Factory
+	registry *tools.Registry
+	budget   config.DiagnoseBudget
+}
+
+func NewReasoner(factory *Factory, registry *tools.Registry, budget config.DiagnoseBudget) *Reasoner {
+	return &Reasoner{factory: factory, registry: registry, budget: budget}
+}
+
+// maxSteps 把 mode 翻译成 ReAct 步数上限。未知 mode 按 light 收紧，
+// 不让一个陌生 mode 名拿到 full 的预算。
+func (r *Reasoner) maxSteps(mode string) int {
+	if mode == "full" {
+		return r.budget.FullSteps
+	}
+	return r.budget.LightSteps
+}
+
+// Diagnose 执行一次推理。输出不是合法 JSON 时重试一次，仍失败返回错误；
+// 任何失败都不会产生 Plan 副作用 —— Plan 只是数据，执行决策在 D09+。
+func (r *Reasoner) Diagnose(ctx context.Context, evidence string, mode string) (*DiagnoseResult, error) {
+	if strings.TrimSpace(evidence) == "" {
+		return nil, errors.New("llm: evidence is empty")
+	}
+	chatModel, err := r.factory.Build(RoleReasoner)
+	if err != nil {
+		return nil, err
+	}
+	recorder := &stepRecorder{}
+	counter := &usageCounter{}
+	agentTools, err := r.agentTools(recorder)
+	if err != nil {
+		return nil, err
+	}
+	agent, err := react.NewAgent(ctx, &react.AgentConfig{
+		ToolCallingModel: wrapUsageModel(chatModel, counter),
+		ToolsConfig:      compose.ToolsNodeConfig{Tools: agentTools},
+		MaxStep:          r.maxSteps(mode),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("llm: build react agent: %w", err)
+	}
+
+	messages := []*schema.Message{
+		schema.SystemMessage(systemPrompt),
+		schema.UserMessage(evidence),
+	}
+	result, err := r.runOnce(ctx, agent, messages, recorder)
+	if err == nil {
+		result.TokensIn, result.TokensOut = counter.in, counter.out
+		return result, nil
+	}
+	var parseErr *contractError
+	if !errors.As(err, &parseErr) {
+		return nil, err
+	}
+	// 解析失败重试一次：明确告诉模型上次输出的问题，仍失败则放弃。
+	// 计数器跨重试累计 —— 第一次烧掉的 token 也是成本。
+	retryMessages := append(messages,
+		schema.AssistantMessage(parseErr.raw, nil),
+		schema.UserMessage("上次输出不是合法 JSON 契约。请只输出符合契约的 JSON 对象，不要输出其他文字。"),
+	)
+	result, err = r.runOnce(ctx, agent, retryMessages, recorder)
+	if err != nil {
+		return nil, err
+	}
+	result.TokensIn, result.TokensOut = counter.in, counter.out
+	return result, nil
+}
+
+// runOnce 跑一轮 ReAct 并解析最终输出。
+func (r *Reasoner) runOnce(ctx context.Context, agent *react.Agent, messages []*schema.Message, recorder *stepRecorder) (*DiagnoseResult, error) {
+	final, err := agent.Generate(ctx, messages)
+	if err != nil {
+		return nil, fmt.Errorf("llm: react generate: %w", err)
+	}
+	if final == nil || strings.TrimSpace(final.Content) == "" {
+		return nil, errors.New("llm: empty model output")
+	}
+	contract, err := parseContract(final.Content)
+	if err != nil {
+		return nil, err
+	}
+	// token 用量由调用方从 usageCounter 填（跨轮次、跨重试累计），
+	// 这里只看最终消息的内容和契约。
+	return &DiagnoseResult{
+		RCA:          contract.RCA,
+		Confidence:   contract.Confidence,
+		EvidenceRefs: contract.EvidenceRefs,
+		Plan:         contract.Plan,
+		Steps:        recorder.steps,
+	}, nil
+}
+
+// contractError 是"输出不是合法契约"的错误类型，带原文供重试时回放。
+type contractError struct {
+	raw string
+	err error
+}
+
+func (e *contractError) Error() string { return e.err.Error() }
+
+// parseContract 剥离 markdown 围栏后按契约解析。字段校验：
+// rca 非空；confidence 限定三档，非法值视为解析失败（宁可重试）。
+func parseContract(raw string) (*diagnoseContract, error) {
+	cleaned := stripJSONFence(raw)
+	var contract diagnoseContract
+	if err := json.Unmarshal([]byte(cleaned), &contract); err != nil {
+		return nil, &contractError{raw: raw, err: fmt.Errorf("llm: output is not valid plan JSON: %w", err)}
+	}
+	if strings.TrimSpace(contract.RCA) == "" {
+		return nil, &contractError{raw: raw, err: errors.New("llm: plan JSON missing rca")}
+	}
+	switch contract.Confidence {
+	case "high", "medium", "low":
+	default:
+		return nil, &contractError{raw: raw, err: fmt.Errorf("llm: invalid confidence %q", contract.Confidence)}
+	}
+	return &contract, nil
+}
+
+// stripJSONFence 剥掉 ```json ... ``` 或 ``` ... ``` 围栏。
+// 模型经常多包一层，这是宽容不是契约 —— 契约仍是"一个 JSON 对象"。
+func stripJSONFence(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if !strings.HasPrefix(trimmed, "```") {
+		return trimmed
+	}
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) < 2 {
+		return trimmed
+	}
+	// 去掉首行（```json 或 ```）和末尾的 ``` 行。
+	body := lines[1:]
+	if last := strings.TrimSpace(body[len(body)-1]); last == "```" {
+		body = body[:len(body)-1]
+	}
+	return strings.TrimSpace(strings.Join(body, "\n"))
+}
+
+// stepRecorder 记录一次 Diagnose 里的工具调用。ReAct 单 goroutine
+// 顺序执行工具，recorder 不需要锁。
+type stepRecorder struct {
+	steps []StepLog
+}
+
+// agentTools 把 Registry.ForLLM() 的 L1 工具适配成 Eino InvokableTool。
+// 只有 L1 能进这个列表 —— 这是 LLM 权限面的第二道闸（第一道是 ForLLM 本身）。
+func (r *Reasoner) agentTools(recorder *stepRecorder) ([]tool.BaseTool, error) {
+	specs := r.registry.ForLLM()
+	agentTools := make([]tool.BaseTool, 0, len(specs))
+	for _, spec := range specs {
+		params := make(map[string]*schema.ParameterInfo, len(spec.Params))
+		for _, p := range spec.Params {
+			params[p.Name] = &schema.ParameterInfo{
+				Type:     schema.String,
+				Desc:     p.Description,
+				Required: p.Required,
+			}
+		}
+		agentTools = append(agentTools, &registryTool{registry: r.registry, spec: spec, params: params, recorder: recorder})
+	}
+	return agentTools, nil
+}
+
+// registryTool 把 tools.ToolSpec 适配成 Eino InvokableTool：
+// 执行仍走 Registry.Execute —— 超时、截断、未注册拒绝的纪律不变。
+type registryTool struct {
+	registry *tools.Registry
+	spec     tools.ToolSpec
+	params   map[string]*schema.ParameterInfo
+	recorder *stepRecorder
+}
+
+func (t *registryTool) Info(_ context.Context) (*schema.ToolInfo, error) {
+	return &schema.ToolInfo{
+		Name:        t.spec.Name,
+		Desc:        t.spec.Description,
+		ParamsOneOf: schema.NewParamsOneOfByParams(t.params),
+	}, nil
+}
+
+func (t *registryTool) InvokableRun(ctx context.Context, argumentsInJSON string, _ ...tool.Option) (string, error) {
+	output, err := t.registry.Execute(ctx, t.spec.Name, json.RawMessage(argumentsInJSON))
+	entry := StepLog{Name: t.spec.Name, Input: argumentsInJSON}
+	if err != nil {
+		// 工具失败以观测文本喂回模型，而不是炸掉整个 ReAct 循环：
+		// Prometheus 抖一下不该让这次诊断归零，模型看到失败后
+		// 可以基于其余证据出低置信结论。StepLog 里仍记 Err 供审计。
+		entry.Err = err.Error()
+		t.recorder.steps = append(t.recorder.steps, entry)
+		return "tool error: " + err.Error(), nil
+	}
+	entry.Output = output
+	t.recorder.steps = append(t.recorder.steps, entry)
+	return output, nil
+}
