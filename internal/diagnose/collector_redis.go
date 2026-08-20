@@ -12,20 +12,22 @@ import (
 	"oncall-agent/internal/config"
 )
 
-// redisClients 进程级复用：同一地址只建一次客户端。
-var redisClients sync.Map // addr -> *redis.Client
+// redisClients 进程级复用：同一 addr+password 组合只建一次客户端。
+var redisClients sync.Map // addr|password -> *redis.Client
 
-func redisClient(addr string) *redis.Client {
-	if existing, ok := redisClients.Load(addr); ok {
+func redisClient(addr, password string) *redis.Client {
+	key := addr + "|" + password
+	if existing, ok := redisClients.Load(key); ok {
 		return existing.(*redis.Client)
 	}
 	client := redis.NewClient(&redis.Options{
 		Addr:         addr,
+		Password:     password,
 		DialTimeout:  5 * time.Second,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 5 * time.Second,
 	})
-	actual, _ := redisClients.LoadOrStore(addr, client)
+	actual, _ := redisClients.LoadOrStore(key, client)
 	return actual.(*redis.Client)
 }
 
@@ -49,7 +51,7 @@ func (c *redisCollector) Collect(ctx context.Context, _ Target) EvidenceItem {
 	timeout := time.Duration(c.cfg.TimeoutSeconds) * time.Second
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	client := redisClient(addr)
+	client := redisClient(addr, c.cfg.RedisPassword)
 
 	started := time.Now()
 	if err := client.Ping(ctx).Err(); err != nil {

@@ -74,7 +74,8 @@ func (p *Policy) Decide(plan llm.Plan) Decision {
 		base.Reason = "L1 read-only"
 	case tools.L2LowRisk:
 		// L2 自动路径的全部条件（GC-10/白名单/开关）；任一不满足降级审批。
-		if p.cfg.AutoExecuteL2 && !p.cfg.DryRun {
+		hasTarget := strings.TrimSpace(plan.Target.Kind) != "" && strings.TrimSpace(plan.Target.Name) != ""
+		if p.cfg.AutoExecuteL2 && !p.cfg.DryRun && hasTarget {
 			base.Kind = DecisionAutoL2
 			base.Reason = "L2 guardrails satisfied"
 		} else {

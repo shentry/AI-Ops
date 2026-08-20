@@ -87,6 +87,7 @@ type EvidenceConfig struct {
 	Sub2APIMetricsJob string `yaml:"sub2api_metrics_job"`
 	PostgresDSN       string `yaml:"postgres_dsn"`
 	RedisAddr         string `yaml:"redis_addr"`
+	RedisPassword     string `yaml:"redis_password"`
 	DockerContainer   string `yaml:"docker_container"`
 	DockerSocket      string `yaml:"docker_socket"`
 	TimeoutSeconds    int    `yaml:"timeout_seconds"`
@@ -222,7 +223,7 @@ func defaultConfig() Config {
 			OnlyHighConfidence: true,
 			CmdHistoryInject:   5,
 		},
-		Approval: ApprovalConfig{TTLMinutes: 30, VerifyDelaySeconds: 30},
+		Approval: ApprovalConfig{TTLMinutes: 30, DryRun: true, VerifyDelaySeconds: 30},
 		Tools: ToolsConfig{
 			Prometheus: PrometheusConfig{
 				BaseURL:      "http://127.0.0.1:9090",

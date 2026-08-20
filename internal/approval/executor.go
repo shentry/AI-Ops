@@ -18,6 +18,7 @@ type execStore interface {
 	NextApprovedApproval(ctx context.Context, now time.Time) (store.Approval, bool, error)
 	ClaimApprovalExecution(ctx context.Context, id uint64, now time.Time) (bool, error)
 	FinishApprovalExecution(ctx context.Context, id uint64, status string, resultJSON []byte) error
+	RecoverExecutingApprovals(ctx context.Context, now time.Time) (int64, error)
 	InsertFaultCmdHistory(ctx context.Context, row store.FaultCmdHistory) error
 	GetIncident(ctx context.Context, id uint64) (store.Incident, error)
 	ListIncidentMembers(ctx context.Context, incidentID uint64) ([]store.IncidentMember, error)
@@ -68,6 +69,11 @@ func NewExecutor(db execStore, registry *tools.Registry, dryRun bool, verifyDela
 }
 
 func (e *Executor) Start(ctx context.Context) {
+	if recovered, err := e.db.RecoverExecutingApprovals(ctx, time.Now().UTC()); err != nil {
+		e.logger.Printf("executor: recover executing approvals: %v", err)
+	} else if recovered > 0 {
+		e.logger.Printf("executor: recovered %d interrupted approvals", recovered)
+	}
 	go e.loop(ctx)
 }
 
@@ -143,14 +149,6 @@ func (e *Executor) executeOne(ctx context.Context, approval store.Approval) {
 		metrics.Inc(metrics.ApprovalFailedExec)
 		return
 	}
-	if err := e.db.FinishApprovalExecution(ctx, approval.ID, "executed", resultJSON); err != nil {
-		e.logger.Printf("executor: finish %d: %v", approval.ID, err)
-	}
-	metrics.Inc(metrics.ApprovalExecuted)
-
-	// 命令历史：已审批动作的结果写入故障记忆候选（D13 的注入源）。
-	e.recordCmdHistory(ctx, approval, execErr == nil, output)
-
 	// 独立验证（GC-15）。dry_run 没有真实变更，跳过验证。
 	if !e.dryRun && e.verify != nil {
 		result := e.verify.VerifyAfterExecution(ctx, approval.RunID, approval.IncidentID, e.verifyDelay)
@@ -173,6 +171,14 @@ func (e *Executor) executeOne(ctx context.Context, approval store.Approval) {
 			}
 		}
 	}
+	// Verify 完成后才落 executed，避免进程在“已执行但尚未验证”窗口丢失验证结论。
+	if err := e.db.FinishApprovalExecution(ctx, approval.ID, "executed", resultJSON); err != nil {
+		e.logger.Printf("executor: finish %d: %v", approval.ID, err)
+		return
+	}
+	metrics.Inc(metrics.ApprovalExecuted)
+	// 命令历史：已审批动作的结果写入故障记忆候选（D13 的注入源）。
+	e.recordCmdHistory(ctx, approval, execErr == nil, output)
 }
 
 // maybeCommitMemory 只收"干净"的成功案例（GC-16）：

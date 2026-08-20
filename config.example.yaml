@@ -42,6 +42,7 @@ diagnose:
     sub2api_metrics_job: sub2api
     postgres_dsn: "${PG_RO_DSN}"
     redis_addr: "${REDIS_ADDR}"
+    redis_password: "${REDIS_PASSWORD}"
     docker_container: sub2api
     docker_socket: /var/run/docker.sock
     timeout_seconds: 5

@@ -83,6 +83,19 @@ func (f *fakeExecStore) FinishApprovalExecution(_ context.Context, id uint64, st
 	return nil
 }
 
+func (f *fakeExecStore) RecoverExecutingApprovals(_ context.Context, _ time.Time) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var recovered int64
+	for _, a := range f.approvals {
+		if a.Status == "executing" {
+			a.Status = "failed"
+			recovered++
+		}
+	}
+	return recovered, nil
+}
+
 func (f *fakeExecStore) InsertFaultCmdHistory(_ context.Context, row store.FaultCmdHistory) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

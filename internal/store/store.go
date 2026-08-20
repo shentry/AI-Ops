@@ -815,6 +815,18 @@ func (db *DB) FinishApprovalExecution(ctx context.Context, id uint64, status str
 	return nil
 }
 
+// RecoverExecutingApprovals 将进程重启前遗留的 executing 审批标记为 failed。
+// executing 表示动作可能已经触达外部系统，不能自动重放；失败原因要求人工核查。
+func (db *DB) RecoverExecutingApprovals(ctx context.Context, now time.Time) (int64, error) {
+	result := db.WithContext(ctx).Model(&Approval{}).
+		Where("status = ?", "executing").
+		Updates(map[string]any{"status": "failed", "result_json": datatypes.JSON([]byte(`{"error":"executor interrupted; manual verification required"}`))})
+	if result.Error != nil {
+		return 0, fmt.Errorf("store: recover executing approvals: %w", result.Error)
+	}
+	return result.RowsAffected, nil
+}
+
 // InsertFaultCmdHistory 记录一次已审批动作的执行结果（D13 的诊断注入源）。
 func (db *DB) InsertFaultCmdHistory(ctx context.Context, row FaultCmdHistory) error {
 	if row.Fingerprint == "" || row.ToolName == "" {
