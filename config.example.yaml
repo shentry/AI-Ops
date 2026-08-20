@@ -10,14 +10,14 @@ mysql:
 llm:
   roles:
     reasoner:
-      base_url: "https://ark.cn-beijing.volces.com/api/v3"
+      base_url: "https://api.delean.ai/v1"
       api_key: "${ARK_KEY}"
-      model: "deepseek-v3-1-terminus"
+      model: "deepseek-v4-pro"
       max_tokens: 2048
     summarizer:
-      base_url: "https://ark.cn-beijing.volces.com/api/v3"
+      base_url: "https://api.delean.ai/v1"
       api_key: "${ARK_KEY}"
-      model: "deepseek-v3-1-terminus"
+      model: "deepseek-v4-pro"
       max_tokens: 1024
 ingest:
   fingerprint_fields: []
