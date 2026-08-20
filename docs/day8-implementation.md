@@ -42,7 +42,8 @@ go test ./...    # 含 TEST_MYSQL_DSN、TEST_PROMETHEUS_URL 集成测试
 go build ./... && go vet ./...
 ```
 
-## 4. 待真实环境补齐
+## 4. 真实环境验收记录
 
-- 真实 LLM 调用验收（SPEC 要求 `tokens_in > 0` 的真调）待 ARK Key 到位后执行：喂 D07 Evidence → 断言非空 RCA + 合法 Plan + `agent_run.tokens_in > 0` + light 模式工具步数 ≤3；
-- `Factory.Validate()` 将在 D09 诊断 worker 接线时挂到启动路径（当前挂会阻塞无 LLM 配置的摄入部署形态）。
+- 已通过真实 LLM 验收（OpenAI 兼容网关，模型 k3）：喂 D07 格式证据 → 非空 RCA（正确推断出容器 OOM：exit_code=137 + oom_killed + restart_count=3）+ 合法 Plan + `tokens_in > 0`；测试 `TestReasonerAgainstRealLLM` 由 `TEST_LLM_BASE_URL/TEST_LLM_API_KEY/TEST_LLM_MODEL` 门控；
+- light 模式（3 步）对带 extended reasoning 的模型偏紧：模型一轮推理 + 一次工具调用 + 总结即触顶，超预算按设计报错（`exceeds max steps`）。full 模式（8 步）正常。真实部署时 reasoning 型模型建议调大 light_steps 或关 reasoning；
+- `Factory.Validate()` 已挂到启动路径（D09 接线时完成，LLM 缺失时诊断链不启动）。
