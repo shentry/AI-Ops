@@ -25,8 +25,8 @@ func TestWebhookNotifierWecom(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	msg := DiagnosisMessage{IncidentID: 7, RunID: 11, Mode: "full", RCA: "容器退出", Confidence: "high", Decision: "allow", PlanAction: "restart_container", PlanTarget: "container/sub2api", PlanReason: "进程退出"}
-	if err := notifier.Send(context.Background(), msg); err != nil {
+	notification := Notification{Kind: NotificationDiagnosisCompleted, IncidentID: 7, RunID: uint64Ptr(11), Summary: "容器退出", Payload: map[string]any{"mode": "full", "rca": "容器退出", "confidence": "high", "decision": "allow", "plan_action": "restart_container", "plan_target": "container/sub2api", "plan_reason": "进程退出"}}
+	if _, err := notifier.Send(context.Background(), notification); err != nil {
 		t.Fatal(err)
 	}
 	if received["msgtype"] != "markdown" {
@@ -50,7 +50,7 @@ func TestWebhookNotifierBusinessError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := notifier.Send(context.Background(), DiagnosisMessage{}); err == nil {
+	if _, err := notifier.Send(context.Background(), Notification{}); err == nil {
 		t.Fatal("Send() error = nil, want business failure")
 	}
 }
@@ -61,7 +61,7 @@ func TestWebhookNotifierHTTPError(t *testing.T) {
 	}))
 	defer server.Close()
 	notifier, _ := NewWebhookNotifier(config.IMConfig{Provider: "feishu", Webhook: server.URL})
-	if err := notifier.Send(context.Background(), DiagnosisMessage{}); err == nil {
+	if _, err := notifier.Send(context.Background(), Notification{}); err == nil {
 		t.Fatal("Send() error = nil, want HTTP failure")
 	}
 }
@@ -78,13 +78,13 @@ func TestNewWebhookNotifierValidation(t *testing.T) {
 func TestNoopNotifier(t *testing.T) {
 	called := atomic.Int32{}
 	n := NoopNotifier{Logf: func(string, ...any) { called.Add(1) }}
-	if err := n.Send(context.Background(), DiagnosisMessage{IncidentID: 1}); err != nil || called.Load() != 1 {
+	if _, err := n.Send(context.Background(), Notification{IncidentID: 1}); err != nil || called.Load() != 1 {
 		t.Fatalf("NoopNotifier err = %v, calls = %d", err, called.Load())
 	}
 }
 
 func TestRenderMarkdownGuardOverride(t *testing.T) {
-	text := RenderMarkdown(DiagnosisMessage{IncidentID: 1, RunID: 2, Mode: "full", RCA: "rca", Confidence: "low", Decision: "escalate", Overridden: true, GuardNote: "restart blocked"})
+	text := RenderMarkdown(Notification{Kind: NotificationDiagnosisCompleted, IncidentID: 1, RunID: uint64Ptr(2), Summary: "rca", Payload: map[string]any{"mode": "full", "confidence": "low", "decision": "escalate", "overridden": true, "guard_note": "restart blocked"}})
 	if !strings.Contains(text, "Guard 改写了计划") || !strings.Contains(text, "restart blocked") {
 		t.Fatalf("markdown missing guard note:\n%s", text)
 	}
@@ -92,12 +92,7 @@ func TestRenderMarkdownGuardOverride(t *testing.T) {
 
 func TestRenderMarkdownApprovalCard(t *testing.T) {
 	approvalID := uint64(7)
-	text := RenderMarkdown(DiagnosisMessage{
-		IncidentID: 1, RunID: 2, Mode: "full", RCA: "rca", Confidence: "high",
-		Decision: "allow", PolicyDecision: "approval",
-		ApprovalID: &approvalID, BaseURL: "http://127.0.0.1:8080/",
-		PlanAction: "resize_pool", PlanTarget: "service/sub2api", PlanReason: "连接池不足",
-	})
+	text := RenderMarkdown(Notification{Kind: NotificationDiagnosisCompleted, IncidentID: 1, RunID: uint64Ptr(2), Summary: "rca", ApprovalID: &approvalID, Payload: map[string]any{"mode": "full", "confidence": "high", "decision": "allow", "policy_decision": "approval", "base_url": "http://127.0.0.1:8080/", "plan_action": "resize_pool", "plan_target": "service/sub2api", "plan_reason": "连接池不足"}})
 	for _, want := range []string{
 		"审批单 #7（等待审批）",
 		"http://127.0.0.1:8080/api/v1/approvals/7/approve",
@@ -109,8 +104,9 @@ func TestRenderMarkdownApprovalCard(t *testing.T) {
 			t.Fatalf("approval card missing %q:\n%s", want, text)
 		}
 	}
-	// BaseURL 尾斜杠不产生双斜杠。
 	if strings.Contains(text, "//api") {
 		t.Fatalf("double slash in card:\n%s", text)
 	}
 }
+
+func uint64Ptr(v uint64) *uint64 { return &v }

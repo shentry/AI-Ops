@@ -5,9 +5,10 @@
 ## 1. Day14 做了什么
 
 - `internal/metrics`：进程内计数器 + `/metrics`（Prometheus 文本格式，不引 client_golang）；指标名集中在 `metrics.go` 常量；
-- 埋点：webhook 接收、raw event 处理/拒绝、incident 促发/关单、agent_run 入队/成功/失败、memory hit/miss、审批创建/批准/拒绝/过期/执行成功/执行失败、verify 通过/失败、人工升级；事务内的计数只在提交后增加；
+- 埋点：webhook 接收、raw event 处理/拒绝、incident 促发/关单、agent_run 入队/成功/失败、memory hit/miss、审批创建/批准/拒绝/过期/执行成功/执行失败、verify 通过/失败/不可判定、人工升级；事务内的计数只在提交后增加；
 - README 重写为 V1 quickstart：三步跑通 + 全 API 一览 + 安全边界；
-- `config.example.yaml` 与代码校准（approval 的 auto_execute_l2/dry_run/verify_delay_seconds、tools.docker.allowed_containers、diagnose.evidence 全段）。
+- `config.example.yaml` 与代码校准（approval 的 auto_execute_l2/dry_run/verify_delay_seconds/l2_rate_window_minutes/l2_max_per_window、tools.docker 的 allowed_containers/restart_min_interval_seconds/restart_max_per_hour、diagnose.evidence 全段）。
+- Web 控制台改为公开操作面：不再依赖 OAuth、浏览器会话或 CSRF；控制台动作统一以 `anonymous` 审计，传统 Bearer API 边界保持不变。
 
 ## 2. 演练记录（本地 docker compose 环境）
 
@@ -16,8 +17,7 @@
 | 100 条告警（60% 重复） | `simulate -n 100 -dup 0.6` | 40 唯一 fingerprint → 1 incident | alerts_count=40 | 1 个 agent_run（一次有效诊断） |
 | incident 关单 | `simulate -n 40 -resolved` | 全成员 resolved → 关单 | incident resolved + incident_resolved 指标 | resolved |
 | L2 自动修复（重启） | approved 审批单 + 白名单容器 | 原子领取 → 真重启 | State.StartedAt 变化 + executed + verify step | executed |
-| L2 verify 失败 | 同上但成员不 resolved | verify passed=false → 重诊 run（retry_of） | retry run 创建 | executed + 重诊 pending |
-| L3 审批 | API approve/deny | 幂等决策 | 重复 409、无 token 401、缺 operator 400 | approved/denied |
+| L3 审批 | API approve/deny | 匿名控制台或 Bearer + X-Operator | 幂等决策、重复 409 | approved/denied |
 | L4/未注册动作 | policy 判定 | 硬拒绝 | denied，无审批单、不执行 | denied |
 | 篡改 plan_hash | 改 hash 后领取 | 执行前失配 | approval=failed，未触达 Docker | failed |
 | 通知失败 | 不可达 webhook | 3 次重试后记 step | run 终态仍 succeeded | succeeded |
@@ -29,9 +29,11 @@ Sub2API 真实故障集（/health 超时、5xx 激增、Provider 429、PG/Redis 
 
 ## 3. 安全验收
 
-- dry_run 默认开启（`approval.dry_run: true`）、L2 自动执行默认关闭（`auto_execute_l2: false`）；
+- dry_run 默认开启（`approval.dry_run: true`）、L2 自动执行默认关闭（`auto_execute_l2: false`），且启动时校验全部数值配置边界（写 0/负数直接失败，不留静默失效）；
 - L4 硬拒绝、L3 未审批不执行、过期不执行、篡改拒执均有测试；
-- LLM 工具面只有 L1；任意 shell 不存在；target 必须命中白名单。
+- LLM 工具面只有 L1；任意 shell 不存在；L2 自动执行必须同时满足七条护栏（白名单、真实 target 来源、影响范围受限、限频、全局开关、非 dry-run、可验证），任一不满足降级人工审批；docker_restart 在工具层另有独立限频；
+- 控制台公开读写，仅适用于回环或完全可信网络；公网部署不得暴露 Web 端口，Webhook、传统 Incident API 和证据调试仍要求 Bearer。
+- Verify 不可判定（取消/读库失败/无可复查成员）不算成功也不算失败：不写记忆、不重诊，要求人工核查。
 
 ## 4. 回放链
 

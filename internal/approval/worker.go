@@ -13,9 +13,9 @@ type expiryStore interface {
 	ExpireApprovals(ctx context.Context, now time.Time) (int64, error)
 }
 
-// ExpiryWorker 主动把过期 pending 审批单置为 expired。
-// 过期不能只靠 Decide 时检查 —— 没人理会的单要能被审计看到"已过期"，
-// 而不是永远 pending。
+// ExpiryWorker 主动把过期 pending/approved 审批单置为 expired。
+// 状态、approval.expired 事件和 approval_near_expiry 问题变更由 store 在同一
+// 短事务中完成；worker 只负责按周期调用这个高层 sweep。
 type ExpiryWorker struct {
 	db       expiryStore
 	interval time.Duration

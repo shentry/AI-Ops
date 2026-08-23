@@ -6,13 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
-	"time"
-
 	"gorm.io/datatypes"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	"oncall-agent/internal/eventlog"
+	"strings"
+	"time"
 )
 
 // ErrInvalidRawEvent 是"报文不是合法 JSON"的哨兵错误。HTTP 层用 errors.Is
@@ -22,6 +22,31 @@ var ErrInvalidRawEvent = errors.New("store: raw event payload must be valid JSON
 // ErrIncidentNotFound 是"incident 不存在"的哨兵错误。查询 API 用 errors.Is
 // 把它映射成 404，和真正的存储故障（503）区分开。
 var ErrIncidentNotFound = errors.New("store: incident not found")
+
+// ErrAgentRunNotFound 是"诊断 run 不存在"的哨兵错误。Run/Step API 用它区分
+// 不存在或不属于目标 Incident 的 run，避免把任意 run ID 当成授权凭据。
+var ErrAgentRunNotFound = errors.New("store: agent run not found")
+
+// ErrConversationMessageNotFound 是对话消息不存在的哨兵错误。
+var ErrConversationMessageNotFound = errors.New("store: conversation message not found")
+
+// ErrWebOAuthStateNotFound means the one-time OAuth state does not exist.
+var ErrWebOAuthStateNotFound = errors.New("store: web oauth state not found")
+
+// ErrWebOAuthStateExpired means the one-time OAuth state existed but was expired.
+var ErrWebOAuthStateExpired = errors.New("store: web oauth state expired")
+
+// ErrWebSessionNotFound means no active browser session matched the supplied token.
+var ErrWebSessionNotFound = errors.New("store: web session not found")
+
+// ErrLLMModelSelectionNotFound means the singleton model-selection row has
+// not been initialized. Startup creates it before any model is built.
+var ErrLLMModelSelectionNotFound = errors.New("store: llm model selection not found")
+
+// ErrIMBindingNotFound 是飞书消息绑定未命中的哨兵错误。
+var ErrIMBindingNotFound = errors.New("store: im binding not found")
+
+const integrationReceiptLease = 5 * time.Minute
 
 // DedupResult 是新到告警与同指纹 last_alert 比对后的三种结论，
 // 下游（worker 的 hook）按它决定建 incident 还是只续心跳。
@@ -77,10 +102,59 @@ type IncidentAssignment struct {
 	Promoted   bool
 }
 
-// IncidentTx 是事务内对 incident 的全部操作面：
-// 关联器和生命周期 hook 在 ApplyRawEvent 事务里能做的就这么多，
-// 做不了任意的库访问。和 ingest.pendingEventStore 同一手法 ——
-// 接口收窄，单测换假实现即可。
+// EventProblemWriter 是事务内写入 Incident 事实事件和当前问题读模型的窄接口。
+// IncidentTx 嵌入该接口，保证事件/问题和告警、Incident、run 同一事务提交。
+type EventProblemWriter interface {
+	AppendIncidentEvent(context.Context, IncidentEvent) (IncidentEvent, error)
+	OpenIncidentProblem(context.Context, IncidentProblem) (IncidentProblem, error)
+	ResolveIncidentProblem(context.Context, uint64, string, *uint64, time.Time) (bool, error)
+}
+
+// ProblemMutationKind 是 AppendRunStepRecord 可接受的有限问题操作。
+// 禁止通过批次接口传入任意 SQL 操作，问题只能 open 或 resolve。
+type ProblemMutationKind string
+
+const (
+	ProblemOpen            ProblemMutationKind = "open"
+	ProblemResolve         ProblemMutationKind = "resolve"
+	ProblemMutationOpen    ProblemMutationKind = ProblemOpen
+	ProblemMutationResolve ProblemMutationKind = ProblemResolve
+)
+
+// ProblemMutation 描述一次固定语义的问题读模型变更。
+// open 使用 Problem；resolve 使用 IncidentID、Code、RunID、ResolvedAt。
+type ProblemMutation struct {
+	Kind       ProblemMutationKind
+	Problem    IncidentProblem
+	IncidentID uint64
+	Code       string
+	RunID      *uint64
+	ResolvedAt time.Time
+}
+
+// RunStepRecord 是一步审计、事实事件和问题变更的一次性批次。
+// AppendRunStepRecord 会在同一短事务中写入全部内容。
+type RunStepRecord struct {
+	Step     AgentRunStep
+	Events   []IncidentEvent
+	Problems []ProblemMutation
+}
+
+// RunCompletion 原子写入一次 run 的终态和最后一批审计记录。
+// Steps、Events、Problems 会与 agent_run 终态在同一短事务提交。
+type RunCompletion struct {
+	RunID      uint64
+	RCA        string
+	PlanJSON   []byte
+	TokensIn   int
+	TokensOut  int
+	Status     string
+	FinishedAt time.Time
+	Steps      []AgentRunStep
+	Events     []IncidentEvent
+	Problems   []ProblemMutation
+}
+
 type IncidentTx interface {
 	AssignIncident(context.Context, IncidentInput, time.Duration, int) (IncidentAssignment, error)
 	TouchIncident(context.Context, uint64, time.Time, int) error
@@ -88,6 +162,7 @@ type IncidentTx interface {
 	ResolveIncident(context.Context, uint64, time.Time) (bool, error)
 	// D05：促发分流。在促发同一事务里落 agent_run 队列行，保证跨表原子性。
 	EnqueueAgentRun(context.Context, AgentRun) error
+	EventProblemWriter
 }
 
 // AlertApplyResult 是单条告警 apply 之后回给 hook 的结果：
@@ -298,6 +373,20 @@ func (t *transactionIncidentTx) ResolveIncident(ctx context.Context, id uint64, 
 // EnqueueAgentRun 在促发事务里落一行 agent_run —— 这张表就是 D05 的诊断队列。
 // 身份字段缺失直接报错，让事务回滚，不落一条永远没人消费的脏队列行。
 func (t *transactionIncidentTx) EnqueueAgentRun(ctx context.Context, run AgentRun) error {
+	return t.enqueueAgentRunWithID(ctx, &run)
+}
+
+// EnqueueAgentRunWithID is an optional concrete transaction method for callers
+// that need the auto-incremented run ID to append same-transaction events.
+// IncidentTx intentionally keeps the legacy value-based method unchanged.
+func (t *transactionIncidentTx) EnqueueAgentRunWithID(ctx context.Context, run *AgentRun) error {
+	return t.enqueueAgentRunWithID(ctx, run)
+}
+
+func (t *transactionIncidentTx) enqueueAgentRunWithID(ctx context.Context, run *AgentRun) error {
+	if run == nil {
+		return errors.New("store: agent run is required")
+	}
 	if run.IncidentID == 0 {
 		return errors.New("store: agent run incident is required")
 	}
@@ -307,10 +396,407 @@ func (t *transactionIncidentTx) EnqueueAgentRun(ctx context.Context, run AgentRu
 	if run.StartedAt.IsZero() {
 		return errors.New("store: agent run start time is required")
 	}
-	if err := t.db.WithContext(ctx).Create(&run).Error; err != nil {
+	if err := t.db.WithContext(ctx).Create(run).Error; err != nil {
 		return fmt.Errorf("store: enqueue agent run: %w", err)
 	}
 	return nil
+}
+
+// appendIncidentEvent 是 DB 与 transactionIncidentTx 共用的事件写入实现。
+// 调用方负责在进入这里前完成 Sanitization；store 只拒绝明显无效的 JSON。
+func appendIncidentEvent(ctx context.Context, q *gorm.DB, event IncidentEvent) (IncidentEvent, error) {
+	if event.IncidentID == 0 {
+		return IncidentEvent{}, errors.New("store: incident event incident is required")
+	}
+	if strings.TrimSpace(event.EventType) == "" || strings.TrimSpace(event.Phase) == "" || strings.TrimSpace(event.Status) == "" {
+		return IncidentEvent{}, errors.New("store: incident event type, phase and status are required")
+	}
+	event.Summary = truncateStoreText(event.Summary, 512)
+	if strings.TrimSpace(event.Summary) == "" {
+		return IncidentEvent{}, errors.New("store: incident event summary is required")
+	}
+	if event.CreatedAt.IsZero() {
+		return IncidentEvent{}, errors.New("store: incident event created_at is required")
+	}
+	if event.PayloadJSON != nil && len(*event.PayloadJSON) > 0 && !json.Valid(*event.PayloadJSON) {
+		return IncidentEvent{}, errors.New("store: incident event payload must be valid JSON")
+	}
+	event.CreatedAt = event.CreatedAt.UTC()
+	if err := q.WithContext(ctx).Create(&event).Error; err != nil {
+		return IncidentEvent{}, fmt.Errorf("store: append incident event: %w", err)
+	}
+	return event, nil
+}
+
+func truncateStoreText(value string, max int) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	if max <= 1 {
+		return string(runes[:max])
+	}
+	return string(runes[:max-1]) + "…"
+}
+
+func openIncidentProblem(ctx context.Context, q *gorm.DB, problem IncidentProblem) (IncidentProblem, error) {
+	if problem.IncidentID == 0 || strings.TrimSpace(problem.Code) == "" {
+		return IncidentProblem{}, errors.New("store: incident problem incident and code are required")
+	}
+	problem.Summary = truncateStoreText(problem.Summary, 512)
+	if strings.TrimSpace(problem.Summary) == "" {
+		return IncidentProblem{}, errors.New("store: incident problem summary is required")
+	}
+	if strings.TrimSpace(problem.Severity) == "" {
+		problem.Severity = "warning"
+	}
+	if problem.DetailJSON != nil && len(*problem.DetailJSON) > 0 && !json.Valid(*problem.DetailJSON) {
+		return IncidentProblem{}, errors.New("store: incident problem detail must be valid JSON")
+	}
+	if problem.LastSeenAt.IsZero() {
+		problem.LastSeenAt = problem.FirstSeenAt
+	}
+	if problem.LastSeenAt.IsZero() {
+		problem.LastSeenAt = time.Now().UTC()
+	}
+	if problem.FirstSeenAt.IsZero() {
+		problem.FirstSeenAt = problem.LastSeenAt
+	}
+	problem.FirstSeenAt = problem.FirstSeenAt.UTC()
+	problem.LastSeenAt = problem.LastSeenAt.UTC()
+	problem.Status = "open"
+	problem.ResolvedAt = nil
+
+	var current IncidentProblem
+	query := q.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).Where("incident_id = ? AND code = ?", problem.IncidentID, problem.Code).First(&current)
+	if errors.Is(query.Error, gorm.ErrRecordNotFound) {
+		if err := q.WithContext(ctx).Create(&problem).Error; err == nil {
+			return problem, nil
+		} else {
+			query = q.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).Where("incident_id = ? AND code = ?", problem.IncidentID, problem.Code).First(&current)
+			if query.Error != nil {
+				return IncidentProblem{}, fmt.Errorf("store: open incident problem: %w", err)
+			}
+		}
+	}
+	if query.Error != nil {
+		return IncidentProblem{}, fmt.Errorf("store: find incident problem: %w", query.Error)
+	}
+	updates := map[string]any{"run_id": problem.RunID, "severity": problem.Severity, "status": "open", "summary": problem.Summary, "detail_json": problem.DetailJSON, "last_seen_at": problem.LastSeenAt, "resolved_at": nil}
+	if err := q.WithContext(ctx).Model(&IncidentProblem{}).Where("id = ?", current.ID).Updates(updates).Error; err != nil {
+		return IncidentProblem{}, fmt.Errorf("store: reopen incident problem: %w", err)
+	}
+	current.RunID = problem.RunID
+	current.Severity = problem.Severity
+	current.Status = "open"
+	current.Summary = problem.Summary
+	current.DetailJSON = problem.DetailJSON
+	current.LastSeenAt = problem.LastSeenAt
+	current.ResolvedAt = nil
+	return current, nil
+}
+
+// resolveIncidentProblem 是问题 resolve 的幂等实现；不存在或已 resolved 返回 false。
+func resolveIncidentProblem(ctx context.Context, q *gorm.DB, incidentID uint64, code string, runID *uint64, resolvedAt time.Time) (bool, error) {
+	if incidentID == 0 || strings.TrimSpace(code) == "" {
+		return false, errors.New("store: incident problem incident and code are required")
+	}
+	if resolvedAt.IsZero() {
+		return false, errors.New("store: incident problem resolved_at is required")
+	}
+	resolvedAt = resolvedAt.UTC()
+	var current IncidentProblem
+	query := q.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("incident_id = ? AND code = ?", incidentID, code).First(&current)
+	if errors.Is(query.Error, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	if query.Error != nil {
+		return false, fmt.Errorf("store: find incident problem for resolve: %w", query.Error)
+	}
+	if current.Status == "resolved" {
+		return false, nil
+	}
+	updates := map[string]any{"status": "resolved", "resolved_at": resolvedAt, "last_seen_at": resolvedAt}
+	if runID != nil {
+		updates["run_id"] = runID
+	}
+	if err := q.WithContext(ctx).Model(&IncidentProblem{}).Where("id = ? AND status <> ?", current.ID, "resolved").Updates(updates).Error; err != nil {
+		return false, fmt.Errorf("store: resolve incident problem: %w", err)
+	}
+	return true, nil
+}
+
+// AppendIncidentEvent 写入非事务路径的 Incident 事件。
+func (db *DB) AppendIncidentEvent(ctx context.Context, event IncidentEvent) (IncidentEvent, error) {
+	return appendIncidentEvent(ctx, db.DB, event)
+}
+
+// OpenIncidentProblem 打开或重开一个同 incident/code 的问题。
+func (db *DB) OpenIncidentProblem(ctx context.Context, problem IncidentProblem) (IncidentProblem, error) {
+	return openIncidentProblem(ctx, db.DB, problem)
+}
+
+// ResolveIncidentProblem 幂等关闭一个 Incident 问题。
+func (db *DB) ResolveIncidentProblem(ctx context.Context, incidentID uint64, code string, runID *uint64, resolvedAt time.Time) (bool, error) {
+	return resolveIncidentProblem(ctx, db.DB, incidentID, code, runID, resolvedAt)
+}
+
+// AppendIncidentEvent 在 ApplyRawEvent 事务内追加事实事件。
+func (t *transactionIncidentTx) AppendIncidentEvent(ctx context.Context, event IncidentEvent) (IncidentEvent, error) {
+	return appendIncidentEvent(ctx, t.db, event)
+}
+
+// OpenIncidentProblem 在 ApplyRawEvent 事务内打开或重开问题。
+func (t *transactionIncidentTx) OpenIncidentProblem(ctx context.Context, problem IncidentProblem) (IncidentProblem, error) {
+	return openIncidentProblem(ctx, t.db, problem)
+}
+
+// ResolveIncidentProblem 在 ApplyRawEvent 事务内幂等关闭问题。
+func (t *transactionIncidentTx) ResolveIncidentProblem(ctx context.Context, incidentID uint64, code string, runID *uint64, resolvedAt time.Time) (bool, error) {
+	return resolveIncidentProblem(ctx, t.db, incidentID, code, runID, resolvedAt)
+}
+
+// ClaimIntegrationEventReceipt atomically claims a third-party event ID.
+// Completed receipts are immutable; a processing receipt can be reclaimed
+// only after its lease expires, recovering callbacks interrupted by a crash.
+func (db *DB) ClaimIntegrationEventReceipt(ctx context.Context, receipt IntegrationEventReceipt) (bool, error) {
+	if db == nil || db.DB == nil {
+		return false, errors.New("store: database is required")
+	}
+	receipt.EventID = strings.TrimSpace(receipt.EventID)
+	receipt.Provider = strings.TrimSpace(receipt.Provider)
+	receipt.EventType = strings.TrimSpace(receipt.EventType)
+	if receipt.EventID == "" {
+		return false, errors.New("store: integration receipt event_id is required")
+	}
+	if receipt.Provider == "" || receipt.EventType == "" {
+		return false, errors.New("store: integration receipt provider and event_type are required")
+	}
+	if len([]rune(receipt.EventID)) > 128 || len([]rune(receipt.Provider)) > 16 || len([]rune(receipt.EventType)) > 64 {
+		return false, errors.New("store: integration receipt field is too long")
+	}
+	if receipt.ProcessedAt.IsZero() {
+		receipt.ProcessedAt = time.Now().UTC()
+	} else {
+		receipt.ProcessedAt = receipt.ProcessedAt.UTC()
+	}
+	if strings.TrimSpace(receipt.Result) == "" {
+		receipt.Result = "processing"
+	}
+	if receipt.Result != "processing" || len([]rune(receipt.Result)) > 32 {
+		return false, errors.New("store: integration receipt claim must use processing result")
+	}
+	created := db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&receipt)
+	if created.Error != nil {
+		return false, fmt.Errorf("store: claim integration receipt: %w", created.Error)
+	}
+	if created.RowsAffected == 1 {
+		return true, nil
+	}
+	staleBefore := receipt.ProcessedAt.Add(-integrationReceiptLease)
+	reclaimed := db.WithContext(ctx).Model(&IntegrationEventReceipt{}).
+		Where("event_id = ? AND result = ? AND processed_at < ?", receipt.EventID, "processing", staleBefore).
+		Updates(map[string]any{"provider": receipt.Provider, "event_type": receipt.EventType, "processed_at": receipt.ProcessedAt})
+	if reclaimed.Error != nil {
+		return false, fmt.Errorf("store: reclaim integration receipt: %w", reclaimed.Error)
+	}
+	return reclaimed.RowsAffected == 1, nil
+}
+
+// CompleteIntegrationEventReceipt records the terminal handling result. It
+// intentionally does not require the row to be in a particular intermediate
+// state so recovery/replay tooling can safely finalize an older receipt.
+func (db *DB) CompleteIntegrationEventReceipt(ctx context.Context, eventID, result string, processedAt time.Time) error {
+	eventID = strings.TrimSpace(eventID)
+	result = strings.TrimSpace(result)
+	if eventID == "" {
+		return errors.New("store: integration receipt event_id is required")
+	}
+	if result == "" {
+		return errors.New("store: integration receipt result is required")
+	}
+	if len([]rune(result)) > 32 {
+		return errors.New("store: integration receipt result is too long")
+	}
+	if processedAt.IsZero() {
+		processedAt = time.Now().UTC()
+	}
+	updates := map[string]any{"result": result, "processed_at": processedAt.UTC()}
+	query := db.WithContext(ctx).Model(&IntegrationEventReceipt{}).Where("event_id = ?", eventID).Updates(updates)
+	if query.Error != nil {
+		return fmt.Errorf("store: complete integration receipt: %w", query.Error)
+	}
+	if query.RowsAffected == 0 {
+		var existing IntegrationEventReceipt
+		lookupErr := db.WithContext(ctx).Where("event_id = ?", eventID).First(&existing).Error
+		if errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+			return gorm.ErrRecordNotFound
+		}
+		if lookupErr != nil {
+			return fmt.Errorf("store: find integration receipt: %w", lookupErr)
+		}
+	}
+	return nil
+}
+
+// MarkIntegrationEventReceipt is a concise alias for callers that prefer a
+// state-transition name.
+func (db *DB) MarkIntegrationEventReceipt(ctx context.Context, eventID, result string, processedAt time.Time) error {
+	return db.CompleteIntegrationEventReceipt(ctx, eventID, result, processedAt)
+}
+
+// GetIntegrationEventReceipt reads one receipt by its globally unique event ID.
+func (db *DB) GetIntegrationEventReceipt(ctx context.Context, eventID string) (IntegrationEventReceipt, error) {
+	eventID = strings.TrimSpace(eventID)
+	if eventID == "" {
+		return IntegrationEventReceipt{}, errors.New("store: integration receipt event_id is required")
+	}
+	var receipt IntegrationEventReceipt
+	err := db.WithContext(ctx).First(&receipt, "event_id = ?", eventID).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return IntegrationEventReceipt{}, gorm.ErrRecordNotFound
+	}
+	if err != nil {
+		return IntegrationEventReceipt{}, fmt.Errorf("store: get integration receipt: %w", err)
+	}
+	return receipt, nil
+}
+
+// DeleteIntegrationEventReceipt removes a receipt only when a caller is
+// deliberately abandoning a failed claim. Normal handlers should finalize it
+// instead, keeping duplicate callbacks idempotent.
+func (db *DB) DeleteIntegrationEventReceipt(ctx context.Context, eventID string) error {
+	eventID = strings.TrimSpace(eventID)
+	if eventID == "" {
+		return errors.New("store: integration receipt event_id is required")
+	}
+	if err := db.WithContext(ctx).Where("event_id = ?", eventID).Delete(&IntegrationEventReceipt{}).Error; err != nil {
+		return fmt.Errorf("store: delete integration receipt: %w", err)
+	}
+	return nil
+}
+
+// CreateIMBinding records a Feishu message/thread binding. Insert is
+// idempotent on (provider,message_id), allowing a notification retry to reuse
+// the existing binding rather than creating ambiguous Incident associations.
+func (db *DB) CreateIMBinding(ctx context.Context, binding IMBinding) (IMBinding, error) {
+	binding.Provider = strings.TrimSpace(binding.Provider)
+	binding.ChatID = strings.TrimSpace(binding.ChatID)
+	binding.MessageID = strings.TrimSpace(binding.MessageID)
+	binding.MessageKind = strings.TrimSpace(binding.MessageKind)
+	if binding.Provider == "" || binding.ChatID == "" || binding.MessageID == "" || binding.MessageKind == "" {
+		return IMBinding{}, errors.New("store: im binding provider, chat_id, message_id and message_kind are required")
+	}
+	if binding.IncidentID == 0 {
+		return IMBinding{}, errors.New("store: im binding incident is required")
+	}
+	if len([]rune(binding.Provider)) > 16 || len([]rune(binding.ChatID)) > 128 || len([]rune(binding.MessageID)) > 128 || len([]rune(binding.MessageKind)) > 32 {
+		return IMBinding{}, errors.New("store: im binding field is too long")
+	}
+	if binding.CreatedAt.IsZero() {
+		binding.CreatedAt = time.Now().UTC()
+	} else {
+		binding.CreatedAt = binding.CreatedAt.UTC()
+	}
+	result := db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&binding)
+	if result.Error != nil {
+		return IMBinding{}, fmt.Errorf("store: create im binding: %w", result.Error)
+	}
+	if result.RowsAffected == 1 {
+		return binding, nil
+	}
+	var existing IMBinding
+	if err := db.WithContext(ctx).Where("provider = ? AND message_id = ?", binding.Provider, binding.MessageID).First(&existing).Error; err != nil {
+		return IMBinding{}, fmt.Errorf("store: find existing im binding: %w", err)
+	}
+	if existing.ChatID != binding.ChatID || existing.IncidentID != binding.IncidentID || existing.MessageKind != binding.MessageKind {
+		return IMBinding{}, errors.New("store: im binding conflicts with existing message")
+	}
+	return existing, nil
+}
+
+// GetIMBinding reads the unique provider/message binding.
+func (db *DB) GetIMBinding(ctx context.Context, provider, messageID string) (IMBinding, error) {
+	provider = strings.TrimSpace(provider)
+	messageID = strings.TrimSpace(messageID)
+	if provider == "" || messageID == "" {
+		return IMBinding{}, errors.New("store: im binding provider and message_id are required")
+	}
+	var binding IMBinding
+	err := db.WithContext(ctx).Where("provider = ? AND message_id = ?", provider, messageID).First(&binding).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return IMBinding{}, gorm.ErrRecordNotFound
+	}
+	if err != nil {
+		return IMBinding{}, fmt.Errorf("store: get im binding: %w", err)
+	}
+	return binding, nil
+}
+
+// FindIMBinding resolves a message to its Incident by exact chat and any
+// message/thread identity. Message ID is preferred over root/thread matches,
+// and newest binding wins when several messages share a thread.
+func (db *DB) FindIMBinding(ctx context.Context, provider, chatID, messageID, rootMessageID, threadID string) (IMBinding, error) {
+	provider = strings.TrimSpace(provider)
+	chatID = strings.TrimSpace(chatID)
+	messageID = strings.TrimSpace(messageID)
+	rootMessageID = strings.TrimSpace(rootMessageID)
+	threadID = strings.TrimSpace(threadID)
+	if provider == "" || chatID == "" {
+		return IMBinding{}, errors.New("store: im binding provider and chat_id are required")
+	}
+	if messageID == "" && rootMessageID == "" && threadID == "" {
+		return IMBinding{}, errors.New("store: im binding message identity is required")
+	}
+	query := db.WithContext(ctx).Where("provider = ? AND chat_id = ?", provider, chatID)
+	identities := make([]string, 0, 3)
+	args := make([]any, 0, 3)
+	if messageID != "" {
+		identities = append(identities, "message_id = ?")
+		args = append(args, messageID)
+	}
+	if rootMessageID != "" {
+		identities = append(identities, "root_message_id = ?")
+		args = append(args, rootMessageID)
+	}
+	if threadID != "" {
+		identities = append(identities, "thread_id = ?")
+		args = append(args, threadID)
+	}
+	query = query.Where("("+strings.Join(identities, " OR ")+")", args...)
+	var binding IMBinding
+	err := query.Order(gorm.Expr("CASE WHEN message_id = ? THEN 0 WHEN root_message_id = ? THEN 1 ELSE 2 END", messageID, rootMessageID)).Order("created_at DESC, id DESC").First(&binding).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return IMBinding{}, gorm.ErrRecordNotFound
+	}
+	if err != nil {
+		return IMBinding{}, fmt.Errorf("store: find im binding: %w", err)
+	}
+	return binding, nil
+}
+
+// LatestIMBinding 返回该 Incident 在指定 provider 下最新一条绑定。
+func (db *DB) LatestIMBinding(ctx context.Context, provider string, incidentID uint64, messageKind string) (IMBinding, error) {
+	provider = strings.TrimSpace(provider)
+	messageKind = strings.TrimSpace(messageKind)
+	if provider == "" || incidentID == 0 {
+		return IMBinding{}, errors.New("store: im binding lookup is incomplete")
+	}
+	query := db.WithContext(ctx).Where("provider = ? AND incident_id = ?", provider, incidentID)
+	if messageKind != "" {
+		query = query.Where("message_kind = ?", messageKind)
+	}
+	var binding IMBinding
+	err := query.Order("id DESC").First(&binding).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return IMBinding{}, ErrIMBindingNotFound
+	}
+	if err != nil {
+		return IMBinding{}, fmt.Errorf("store: latest im binding: %w", err)
+	}
+	return binding, nil
 }
 
 // DB 持有进程级 GORM 连接。D01 复用这一条；后续包不要自己再开连接池。
@@ -522,6 +1008,20 @@ func (db *DB) ListIncidents(ctx context.Context, status string) ([]Incident, err
 	return incidents, nil
 }
 
+// ListLatestIncidents 是控制室列表读模型：id DESC（最新优先）并在 SQL 侧限量，
+// 不把全表读进内存再截断。status 非空时精确过滤。
+func (db *DB) ListLatestIncidents(ctx context.Context, status string, limit int) ([]Incident, error) {
+	query := db.WithContext(ctx).Model(&Incident{})
+	if strings.TrimSpace(status) != "" {
+		query = query.Where("status = ?", status)
+	}
+	incidents := make([]Incident, 0)
+	if err := query.Order("id DESC").Limit(normalizePageLimit(limit)).Find(&incidents).Error; err != nil {
+		return nil, fmt.Errorf("store: list latest incidents: %w", err)
+	}
+	return incidents, nil
+}
+
 // GetIncident 按 id 取单条 incident，不存在返回 ErrIncidentNotFound。
 func (db *DB) GetIncident(ctx context.Context, id uint64) (Incident, error) {
 	var incident Incident
@@ -552,9 +1052,102 @@ func (db *DB) ListIncidentMembers(ctx context.Context, incidentID uint64) ([]Inc
 	return members, nil
 }
 
-// CreateAgentRun 是手动重诊的落库点：非事务路径，直接插一行 pending run。
-// 与 EnqueueAgentRun 的区别只在调用场景 —— 那里挂在促发事务里，
-// 这里是 API 入口的独立写入。
+const (
+	defaultPageLimit = 20
+	maxPageLimit     = 100
+)
+
+func normalizePageLimit(limit int) int {
+	if limit < 1 {
+		return defaultPageLimit
+	}
+	if limit > maxPageLimit {
+		return maxPageLimit
+	}
+	return limit
+}
+
+// ListIncidentEvents 按严格 id > afterID、id ASC 读取 Incident 事实事件。
+func (db *DB) ListIncidentEvents(ctx context.Context, incidentID, afterID uint64, limit int) ([]IncidentEvent, error) {
+	if incidentID == 0 {
+		return nil, errors.New("store: incident event incident is required")
+	}
+	rows := make([]IncidentEvent, 0)
+	err := db.WithContext(ctx).Where("incident_id = ? AND id > ?", incidentID, afterID).
+		Order("id ASC").Limit(normalizePageLimit(limit)).Find(&rows).Error
+	if err != nil {
+		return nil, fmt.Errorf("store: list incident events: %w", err)
+	}
+	return rows, nil
+}
+
+// ListLatestIncidentEvents 取 Incident 最新 N 条事件，仍按 id ASC 返回，
+// 供控制室首屏使用。SSE 回放继续走 ListIncidentEvents 的 afterID 游标。
+func (db *DB) ListLatestIncidentEvents(ctx context.Context, incidentID uint64, limit int) ([]IncidentEvent, error) {
+	if incidentID == 0 {
+		return nil, errors.New("store: incident event incident is required")
+	}
+	limit = normalizePageLimit(limit)
+	desc := make([]IncidentEvent, 0, limit)
+	err := db.WithContext(ctx).Where("incident_id = ?", incidentID).
+		Order("id DESC").Limit(limit).Find(&desc).Error
+	if err != nil {
+		return nil, fmt.Errorf("store: list latest incident events: %w", err)
+	}
+	for i, j := 0, len(desc)-1; i < j; i, j = i+1, j-1 {
+		desc[i], desc[j] = desc[j], desc[i]
+	}
+	return desc, nil
+}
+
+// ListIncidentProblems 按 Incident 和可选状态读取问题，默认 id ASC。
+func (db *DB) ListIncidentProblems(ctx context.Context, incidentID uint64, status string, limit int) ([]IncidentProblem, error) {
+	if incidentID == 0 {
+		return nil, errors.New("store: incident problem incident is required")
+	}
+	query := db.WithContext(ctx).Where("incident_id = ?", incidentID)
+	if strings.TrimSpace(status) != "" {
+		query = query.Where("status = ?", status)
+	}
+	rows := make([]IncidentProblem, 0)
+	if err := query.Order("id ASC").Limit(normalizePageLimit(limit)).Find(&rows).Error; err != nil {
+		return nil, fmt.Errorf("store: list incident problems: %w", err)
+	}
+	return rows, nil
+}
+
+// ListAgentRuns 按严格 id > afterID、id ASC 读取目标 Incident 的诊断 run。
+func (db *DB) ListAgentRuns(ctx context.Context, incidentID, afterID uint64, limit int) ([]AgentRun, error) {
+	if incidentID == 0 {
+		return nil, errors.New("store: agent run incident is required")
+	}
+	rows := make([]AgentRun, 0)
+	err := db.WithContext(ctx).Where("incident_id = ? AND id > ?", incidentID, afterID).
+		Order("id ASC").Limit(normalizePageLimit(limit)).Find(&rows).Error
+	if err != nil {
+		return nil, fmt.Errorf("store: list agent runs: %w", err)
+	}
+	return rows, nil
+}
+
+// ListIncidentApprovals 读取目标 Incident 的审批，最新记录优先。
+func (db *DB) ListIncidentApprovals(ctx context.Context, incidentID uint64, status string, limit int) ([]Approval, error) {
+	if incidentID == 0 {
+		return nil, errors.New("store: approval incident is required")
+	}
+	query := db.WithContext(ctx).Where("incident_id = ?", incidentID)
+	if strings.TrimSpace(status) != "" {
+		query = query.Where("status = ?", status)
+	}
+	rows := make([]Approval, 0)
+	if err := query.Order("id DESC").Limit(normalizePageLimit(limit)).Find(&rows).Error; err != nil {
+		return nil, fmt.Errorf("store: list incident approvals: %w", err)
+	}
+	return rows, nil
+}
+
+// CreateAgentRun 是独立 API 入口的落库点。pending run 与 run.queued 事件
+// 必须同一事务提交，SSE 才能把 202 入队结果作为持久化事实回放。
 func (db *DB) CreateAgentRun(ctx context.Context, run AgentRun) (AgentRun, error) {
 	if run.IncidentID == 0 {
 		return AgentRun{}, errors.New("store: agent run incident is required")
@@ -565,10 +1158,149 @@ func (db *DB) CreateAgentRun(ctx context.Context, run AgentRun) (AgentRun, error
 	if run.StartedAt.IsZero() {
 		return AgentRun{}, errors.New("store: agent run start time is required")
 	}
-	if err := db.WithContext(ctx).Create(&run).Error; err != nil {
-		return AgentRun{}, fmt.Errorf("store: create agent run: %w", err)
+	run.StartedAt = run.StartedAt.UTC()
+	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var incident Incident
+		if err := tx.WithContext(ctx).Select("id").First(&incident, run.IncidentID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrIncidentNotFound
+			}
+			return fmt.Errorf("store: find incident for agent run: %w", err)
+		}
+		if err := tx.WithContext(ctx).Create(&run).Error; err != nil {
+			return fmt.Errorf("store: create agent run: %w", err)
+		}
+		runID := run.ID
+		_, err := appendIncidentEvent(ctx, tx, IncidentEvent{IncidentID: run.IncidentID, RunID: &runID, EventType: string(eventlog.EventRunQueued), Phase: "run", Status: "pending", Summary: "diagnostic run queued", CreatedAt: run.StartedAt})
+		return err
+	})
+	if err != nil {
+		return AgentRun{}, err
 	}
 	return run, nil
+}
+
+// CreateRetryAgentRun 原子创建自动重诊 run。事务先锁住 Incident 行，
+// 再锁定同一 Incident 的 pending/running run；已有活跃 run 时不写任何行，
+// 返回 created=false。新 run、run.queued 和 retry.scheduled 必须同批提交。
+// reason 由调用方先完成脱敏；这里再限制事件摘要和 payload 的长度。
+func (db *DB) CreateRetryAgentRun(ctx context.Context, run AgentRun, reason string) (createdRun AgentRun, created bool, err error) {
+	if run.IncidentID == 0 {
+		return AgentRun{}, false, errors.New("store: retry agent run incident is required")
+	}
+	if run.Mode == "" {
+		return AgentRun{}, false, errors.New("store: retry agent run mode is required")
+	}
+	if run.Status != "pending" {
+		return AgentRun{}, false, errors.New("store: retry agent run status must be pending")
+	}
+	if run.RetryOf == nil || *run.RetryOf == 0 {
+		return AgentRun{}, false, errors.New("store: retry agent run retry_of is required")
+	}
+	if run.StartedAt.IsZero() {
+		return AgentRun{}, false, errors.New("store: retry agent run start time is required")
+	}
+
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "verification failed"
+	}
+	reason = truncateRetryEventText(reason, 1024)
+	payloadBytes, marshalErr := json.Marshal(struct {
+		Reason  string `json:"reason"`
+		RetryOf uint64 `json:"retry_of"`
+	}{Reason: reason, RetryOf: *run.RetryOf})
+	if marshalErr != nil {
+		return AgentRun{}, false, fmt.Errorf("store: marshal retry event payload: %w", marshalErr)
+	}
+
+	run.StartedAt = run.StartedAt.UTC()
+	eventTime := run.StartedAt
+	queuedSummary := truncateRetryEventText("retry run queued: "+reason, 512)
+	scheduledSummary := truncateRetryEventText("retry scheduled: "+reason, 512)
+	payload := datatypes.JSON(payloadBytes)
+
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Locking the parent Incident closes the no-active-row gap: two concurrent
+		// retries for an Incident with no active run cannot both pass the check.
+		var incident Incident
+		query := tx.WithContext(ctx).
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id").First(&incident, run.IncidentID)
+		if errors.Is(query.Error, gorm.ErrRecordNotFound) {
+			return ErrIncidentNotFound
+		}
+		if query.Error != nil {
+			return fmt.Errorf("lock retry incident: %w", query.Error)
+		}
+
+		var active AgentRun
+		query = tx.WithContext(ctx).
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("incident_id = ? AND status IN ?", run.IncidentID, []string{"pending", "running"}).
+			Order("id ASC").First(&active)
+		if query.Error == nil {
+			return nil
+		}
+		if !errors.Is(query.Error, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("lock active retry runs: %w", query.Error)
+		}
+
+		if err := tx.WithContext(ctx).Create(&run).Error; err != nil {
+			return fmt.Errorf("insert retry agent run: %w", err)
+		}
+		runID := run.ID
+		if _, err := appendIncidentEvent(ctx, tx, IncidentEvent{
+			IncidentID:  run.IncidentID,
+			RunID:       &runID,
+			EventType:   string(eventlog.EventRunQueued),
+			Phase:       "run",
+			Status:      "pending",
+			Summary:     queuedSummary,
+			PayloadJSON: &payload,
+			CreatedAt:   eventTime,
+		}); err != nil {
+			return err
+		}
+		if _, err := appendIncidentEvent(ctx, tx, IncidentEvent{
+			IncidentID:  run.IncidentID,
+			RunID:       &runID,
+			EventType:   string(eventlog.EventRetryScheduled),
+			Phase:       "retry",
+			Status:      "scheduled",
+			Summary:     scheduledSummary,
+			PayloadJSON: &payload,
+			CreatedAt:   eventTime,
+		}); err != nil {
+			return err
+		}
+		createdRun = run
+		created = true
+		return nil
+	})
+	if err != nil {
+		return AgentRun{}, false, fmt.Errorf("store: create retry agent run: %w", err)
+	}
+	if !created {
+		return AgentRun{}, false, nil
+	}
+	return createdRun, true, nil
+}
+
+func truncateRetryEventText(text string, maxRunes int) string {
+	if maxRunes < 1 {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) <= maxRunes {
+		return text
+	}
+	const suffix = "…[truncated]"
+	suffixRunes := []rune(suffix)
+	if len(suffixRunes) >= maxRunes {
+		return string(runes[:maxRunes])
+	}
+	return string(runes[:maxRunes-len(suffixRunes)]) + suffix
 }
 
 // ListIncidentAlerts 取 incident 每个成员的当前版本 alert（含 labels、
@@ -636,28 +1368,147 @@ func (db *DB) NextPendingAgentRun(ctx context.Context) (AgentRun, bool, error) {
 	return run, true, nil
 }
 
-// ClaimAgentRun 把 pending run 原子置为 running。WHERE 带状态条件：
-// 并发消费者或重启补账不会重复认领同一行。RowsAffected=0 表示被别人抢先。
-func (db *DB) ClaimAgentRun(ctx context.Context, id uint64, startedAt time.Time) (bool, error) {
-	result := db.WithContext(ctx).Model(&AgentRun{}).
-		Where("id = ? AND status = ?", id, "pending").
-		Updates(map[string]any{"status": "running", "started_at": startedAt})
-	if result.Error != nil {
-		return false, fmt.Errorf("store: claim agent run: %w", result.Error)
+// ClaimAgentRun 在短事务内锁定 pending run，读取其 Incident，完成
+// pending → running 的 CAS，并把 run.started 与状态变更一起提交。
+// 并发消费者或重启补账不会重复认领同一行；RowsAffected=0 表示已经被抢先。
+func (db *DB) ClaimAgentRun(ctx context.Context, id uint64, startedAt time.Time) (claimed bool, err error) {
+	if id == 0 {
+		return false, errors.New("store: agent run id is required")
 	}
-	return result.RowsAffected > 0, nil
+	if startedAt.IsZero() {
+		return false, errors.New("store: agent run start time is required")
+	}
+	startedAt = startedAt.UTC()
+
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var run AgentRun
+		query := tx.WithContext(ctx).
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND status = ?", id, "pending").
+			First(&run)
+		if errors.Is(query.Error, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if query.Error != nil {
+			return fmt.Errorf("lock pending agent run: %w", query.Error)
+		}
+
+		// The Incident lookup is intentionally inside the same transaction: event
+		// rows must never be emitted for a run whose parent cannot be resolved.
+		var incident Incident
+		query = tx.WithContext(ctx).Select("id").First(&incident, run.IncidentID)
+		if errors.Is(query.Error, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("agent run %d incident %d not found", run.ID, run.IncidentID)
+		}
+		if query.Error != nil {
+			return fmt.Errorf("read incident for agent run %d: %w", run.ID, query.Error)
+		}
+
+		result := tx.WithContext(ctx).Model(&AgentRun{}).
+			Where("id = ? AND status = ?", id, "pending").
+			Updates(map[string]any{"status": "running", "started_at": startedAt})
+		if result.Error != nil {
+			return fmt.Errorf("update claimed agent run: %w", result.Error)
+		}
+		if result.RowsAffected == 0 {
+			return nil
+		}
+
+		runID := run.ID
+		if _, err := appendIncidentEvent(ctx, tx, IncidentEvent{
+			IncidentID: incident.ID,
+			RunID:      &runID,
+			EventType:  string(eventlog.EventRunStarted),
+			Phase:      "run",
+			Status:     "running",
+			Summary:    "diagnostic run started",
+			CreatedAt:  startedAt,
+		}); err != nil {
+			return err
+		}
+		claimed = true
+		return nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("store: claim agent run: %w", err)
+	}
+	return claimed, nil
 }
 
-// RequeueStaleAgentRuns 把超时的 running run 放回 pending（进程死在中途的
-// 补账语义，与 raw_event 的 pending 重扫对齐）。返回重置行数。
-func (db *DB) RequeueStaleAgentRuns(ctx context.Context, staleBefore time.Time) (int64, error) {
-	result := db.WithContext(ctx).Model(&AgentRun{}).
-		Where("status = ? AND started_at < ?", "running", staleBefore).
-		Update("status", "pending")
-	if result.Error != nil {
-		return 0, fmt.Errorf("store: requeue stale agent runs: %w", result.Error)
+// RequeueStaleAgentRuns 在一个短事务内锁定超时 running 行，逐行执行
+// running → pending，并为每行写 run.stalled 与幂等的 run_stalled 问题。
+// 事务失败时状态、事件和问题全部回滚，下一轮仍可完整补账。
+func (db *DB) RequeueStaleAgentRuns(ctx context.Context, staleBefore time.Time) (requeued int64, err error) {
+	if staleBefore.IsZero() {
+		return 0, errors.New("store: stale-before time is required")
 	}
-	return result.RowsAffected, nil
+	staleBefore = staleBefore.UTC()
+
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var runs []AgentRun
+		if err := tx.WithContext(ctx).
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("status = ? AND started_at < ?", "running", staleBefore).
+			Order("id ASC").
+			Find(&runs).Error; err != nil {
+			return fmt.Errorf("lock stale agent runs: %w", err)
+		}
+		if len(runs) == 0 {
+			return nil
+		}
+		requeuedAt := time.Now().UTC()
+		for _, run := range runs {
+			var incident Incident
+			query := tx.WithContext(ctx).Select("id").First(&incident, run.IncidentID)
+			if errors.Is(query.Error, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("agent run %d incident %d not found", run.ID, run.IncidentID)
+			}
+			if query.Error != nil {
+				return fmt.Errorf("read incident for stale agent run %d: %w", run.ID, query.Error)
+			}
+
+			result := tx.WithContext(ctx).Model(&AgentRun{}).
+				Where("id = ? AND status = ?", run.ID, "running").
+				Update("status", "pending")
+			if result.Error != nil {
+				return fmt.Errorf("requeue stale agent run %d: %w", run.ID, result.Error)
+			}
+			if result.RowsAffected == 0 {
+				continue
+			}
+
+			runID := run.ID
+			if _, err := appendIncidentEvent(ctx, tx, IncidentEvent{
+				IncidentID: incident.ID,
+				RunID:      &runID,
+				EventType:  string(eventlog.EventRunStalled),
+				Phase:      "run",
+				Status:     "pending",
+				Summary:    "diagnostic run stalled and was requeued",
+				CreatedAt:  requeuedAt,
+			}); err != nil {
+				return err
+			}
+			if _, err := openIncidentProblem(ctx, tx, IncidentProblem{
+				IncidentID:  incident.ID,
+				RunID:       &runID,
+				Code:        "run_stalled",
+				Severity:    "warning",
+				Status:      "open",
+				Summary:     "diagnostic run stalled and was requeued",
+				FirstSeenAt: requeuedAt,
+				LastSeenAt:  requeuedAt,
+			}); err != nil {
+				return err
+			}
+			requeued++
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("store: requeue stale agent runs: %w", err)
+	}
+	return requeued, nil
 }
 
 // AppendRunStep 落一条流水线审计步。input/output 应在调用方截断，
@@ -675,28 +1526,742 @@ func (db *DB) AppendRunStep(ctx context.Context, step AgentRunStep) error {
 	return nil
 }
 
+// AppendRunStepRecord 在同一短事务中写入 step、事件和有限问题变更。
+// 任一写入失败都会回滚整批，旧 AppendRunStep 保持单步兼容。
+func (db *DB) AppendRunStepRecord(ctx context.Context, record RunStepRecord) error {
+	step := record.Step
+	if step.RunID == 0 || step.Name == "" || step.Kind == "" {
+		return errors.New("store: run step run_id, kind and name are required")
+	}
+	if step.StartedAt.IsZero() {
+		return errors.New("store: run step start time is required")
+	}
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.WithContext(ctx).Create(&step).Error; err != nil {
+			return fmt.Errorf("store: append run step: %w", err)
+		}
+		for _, event := range record.Events {
+			if _, err := appendIncidentEvent(ctx, tx, event); err != nil {
+				return err
+			}
+		}
+		for _, mutation := range record.Problems {
+			if err := applyProblemMutation(ctx, tx, mutation); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// AppendRunStepBatch 是 AppendRunStepRecord 的语义同义入口，便于调用方迁移。
+func (db *DB) AppendRunStepBatch(ctx context.Context, record RunStepRecord) error {
+	return db.AppendRunStepRecord(ctx, record)
+}
+
+// CompleteRun 原子更新 run 终态，并写入最后一批 Step/Event/Problem。
+// 事务锁住 run 后执行 CAS；任一审计记录失败都会回滚终态更新。
+func (db *DB) CompleteRun(ctx context.Context, completion RunCompletion) error {
+	if completion.RunID == 0 {
+		return errors.New("store: run completion run_id is required")
+	}
+	if completion.Status != "succeeded" && completion.Status != "failed" {
+		return errors.New("store: run completion status must be succeeded or failed")
+	}
+	if completion.FinishedAt.IsZero() {
+		return errors.New("store: run completion finished_at is required")
+	}
+	if len(completion.PlanJSON) > 0 && !json.Valid(completion.PlanJSON) {
+		return errors.New("store: run completion plan must be valid JSON")
+	}
+	completion.FinishedAt = completion.FinishedAt.UTC()
+	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var run AgentRun
+		query := tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).First(&run, completion.RunID)
+		if errors.Is(query.Error, gorm.ErrRecordNotFound) {
+			return ErrAgentRunNotFound
+		}
+		if query.Error != nil {
+			return fmt.Errorf("lock agent run for completion: %w", query.Error)
+		}
+		if run.Status != "pending" && run.Status != "running" {
+			return fmt.Errorf("store: agent run %d is not pending/running", completion.RunID)
+		}
+
+		updates := map[string]any{
+			"status":      completion.Status,
+			"tokens_in":   completion.TokensIn,
+			"tokens_out":  completion.TokensOut,
+			"finished_at": completion.FinishedAt,
+		}
+		if completion.RCA != "" {
+			updates["rca_text"] = completion.RCA
+		}
+		if len(completion.PlanJSON) > 0 {
+			updates["plan_json"] = datatypes.JSON(append([]byte(nil), completion.PlanJSON...))
+		}
+		result := tx.WithContext(ctx).Model(&AgentRun{}).
+			Where("id = ? AND status IN ?", completion.RunID, []string{"pending", "running"}).
+			Updates(updates)
+		if result.Error != nil {
+			return fmt.Errorf("complete agent run: %w", result.Error)
+		}
+		if result.RowsAffected == 0 {
+			return fmt.Errorf("store: agent run %d is not pending/running", completion.RunID)
+		}
+
+		for _, step := range completion.Steps {
+			if step.RunID == 0 {
+				step.RunID = run.ID
+			}
+			if step.RunID != run.ID || step.Name == "" || step.Kind == "" {
+				return errors.New("store: run completion step has invalid run_id, kind or name")
+			}
+			if step.StartedAt.IsZero() {
+				return errors.New("store: run completion step start time is required")
+			}
+			if err := tx.WithContext(ctx).Create(&step).Error; err != nil {
+				return fmt.Errorf("append completion run step: %w", err)
+			}
+		}
+		for _, event := range completion.Events {
+			if event.IncidentID == 0 {
+				event.IncidentID = run.IncidentID
+			}
+			if event.IncidentID != run.IncidentID {
+				return errors.New("store: run completion event incident does not match run")
+			}
+			if event.RunID == nil {
+				runID := run.ID
+				event.RunID = &runID
+			} else if *event.RunID != run.ID {
+				return errors.New("store: run completion event run does not match run")
+			}
+			if _, err := appendIncidentEvent(ctx, tx, event); err != nil {
+				return err
+			}
+		}
+		for _, mutation := range completion.Problems {
+			if mutation.Kind == ProblemOpen {
+				if mutation.Problem.IncidentID == 0 {
+					mutation.Problem.IncidentID = run.IncidentID
+				}
+				if mutation.Problem.IncidentID != run.IncidentID {
+					return errors.New("store: run completion problem incident does not match run")
+				}
+			} else if mutation.Kind == ProblemResolve {
+				if mutation.IncidentID == 0 {
+					mutation.IncidentID = run.IncidentID
+				}
+				if mutation.IncidentID != run.IncidentID {
+					return errors.New("store: run completion problem incident does not match run")
+				}
+			}
+			if err := applyProblemMutation(ctx, tx, mutation); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("store: complete run: %w", err)
+	}
+	return nil
+}
+func applyProblemMutation(ctx context.Context, tx *gorm.DB, mutation ProblemMutation) error {
+	switch mutation.Kind {
+	case ProblemOpen:
+		problem := mutation.Problem
+		if problem.IncidentID == 0 {
+			problem.IncidentID = mutation.IncidentID
+		}
+		if _, err := openIncidentProblem(ctx, tx, problem); err != nil {
+			return err
+		}
+		return nil
+	case ProblemResolve:
+		incidentID := mutation.IncidentID
+		if incidentID == 0 {
+			incidentID = mutation.Problem.IncidentID
+		}
+		code := mutation.Code
+		if code == "" {
+			code = mutation.Problem.Code
+		}
+		if _, err := resolveIncidentProblem(ctx, tx, incidentID, code, mutation.RunID, mutation.ResolvedAt); err != nil {
+			return err
+		}
+		return nil
+	default:
+		return fmt.Errorf("store: unsupported problem mutation kind %q", mutation.Kind)
+	}
+}
+
+// CreateConversationMessage 插入一条对话消息，供 Ask/Feishu worker 共享。
+func (db *DB) CreateConversationMessage(ctx context.Context, message ConversationMessage) (ConversationMessage, error) {
+	if message.IncidentID == 0 {
+		return ConversationMessage{}, errors.New("store: conversation message incident is required")
+	}
+	if strings.TrimSpace(message.Channel) == "" || strings.TrimSpace(message.Role) == "" || strings.TrimSpace(message.Status) == "" {
+		return ConversationMessage{}, errors.New("store: conversation message channel, role and status are required")
+	}
+	if message.Content == "" {
+		return ConversationMessage{}, errors.New("store: conversation message content is required")
+	}
+	if message.CreatedAt.IsZero() {
+		return ConversationMessage{}, errors.New("store: conversation message created_at is required")
+	}
+	if message.MetadataJSON != nil && len(*message.MetadataJSON) > 0 && !json.Valid(*message.MetadataJSON) {
+		return ConversationMessage{}, errors.New("store: conversation message metadata must be valid JSON")
+	}
+	if err := db.WithContext(ctx).Create(&message).Error; err != nil {
+		return ConversationMessage{}, fmt.Errorf("store: create conversation message: %w", err)
+	}
+	return message, nil
+}
+
+// ListConversationMessages 按严格 id > afterID、id ASC 回放对话消息。
+func (db *DB) ListConversationMessages(ctx context.Context, incidentID, afterID uint64, limit int) ([]ConversationMessage, error) {
+	if incidentID == 0 {
+		return nil, errors.New("store: conversation message incident is required")
+	}
+	rows := make([]ConversationMessage, 0)
+	err := db.WithContext(ctx).Where("incident_id = ? AND id > ?", incidentID, afterID).
+		Order("id ASC").Limit(normalizePageLimit(limit)).Find(&rows).Error
+	if err != nil {
+		return nil, fmt.Errorf("store: list conversation messages: %w", err)
+	}
+	return rows, nil
+}
+
+// ClaimConversationMessage CAS queued -> running and records the lease start.
+func (db *DB) ClaimConversationMessage(ctx context.Context, id uint64, now time.Time) (bool, error) {
+	if id == 0 {
+		return false, errors.New("store: conversation message id is required")
+	}
+	if now.IsZero() {
+		return false, errors.New("store: conversation message claim time is required")
+	}
+	result := db.WithContext(ctx).Model(&ConversationMessage{}).
+		Where("id = ? AND status = ?", id, "queued").
+		Updates(map[string]any{"status": "running", "claimed_at": now.UTC()})
+	if result.Error != nil {
+		return false, fmt.Errorf("store: claim conversation message: %w", result.Error)
+	}
+	return result.RowsAffected > 0, nil
+}
+
+// CompleteConversationMessage CAS running -> completed/failed and clears the lease.
+func (db *DB) CompleteConversationMessage(ctx context.Context, id uint64, status string, finishedAt time.Time) error {
+	if id == 0 {
+		return errors.New("store: conversation message id is required")
+	}
+	if status != "completed" && status != "failed" {
+		return errors.New("store: conversation message final status must be completed or failed")
+	}
+	if finishedAt.IsZero() {
+		return errors.New("store: conversation message finished_at is required")
+	}
+	result := db.WithContext(ctx).Model(&ConversationMessage{}).
+		Where("id = ? AND status = ?", id, "running").
+		Updates(map[string]any{"status": status, "finished_at": finishedAt.UTC(), "claimed_at": nil})
+	if result.Error != nil {
+		return fmt.Errorf("store: complete conversation message: %w", result.Error)
+	}
+	if result.RowsAffected > 0 {
+		return nil
+	}
+	var existing ConversationMessage
+	findErr := db.WithContext(ctx).First(&existing, id).Error
+	if errors.Is(findErr, gorm.ErrRecordNotFound) {
+		return ErrConversationMessageNotFound
+	}
+	if findErr != nil {
+		return fmt.Errorf("store: find conversation message: %w", findErr)
+	}
+	return fmt.Errorf("store: conversation message %d is not running", id)
+}
+
+// RequeueStaleConversationMessages recovers a question claimed by a process
+// that died before writing its terminal state. A running worker has five
+// minutes to complete the LLM call before another poller may reclaim it.
+func (db *DB) RequeueStaleConversationMessages(ctx context.Context, staleBefore time.Time) (int64, error) {
+	if staleBefore.IsZero() {
+		return 0, errors.New("store: stale conversation threshold is required")
+	}
+	result := db.WithContext(ctx).Model(&ConversationMessage{}).
+		Where("role = ? AND status = ? AND claimed_at IS NOT NULL AND claimed_at < ?", "user", "running", staleBefore.UTC()).
+		Updates(map[string]any{"status": "queued", "claimed_at": nil})
+	if result.Error != nil {
+		return 0, fmt.Errorf("store: requeue stale conversation messages: %w", result.Error)
+	}
+	return result.RowsAffected, nil
+}
+
+// NextQueuedConversationMessage returns the oldest queued message for worker polling.
+// ClaimConversationMessage performs the concurrent CAS after this best-effort read.
+func (db *DB) NextQueuedConversationMessage(ctx context.Context) (ConversationMessage, bool, error) {
+	var message ConversationMessage
+	err := db.WithContext(ctx).Where("status = ?", "queued").Order("id ASC").First(&message).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return ConversationMessage{}, false, nil
+	}
+	if err != nil {
+		return ConversationMessage{}, false, fmt.Errorf("store: get next queued conversation message: %w", err)
+	}
+	return message, true, nil
+}
+
+// CreateWebOAuthState persists a one-time OAuth state. The caller passes only
+// the hash of the browser-visible state and an encrypted PKCE verifier.
+func (db *DB) CreateWebOAuthState(ctx context.Context, state WebOAuthState) (WebOAuthState, error) {
+	if strings.TrimSpace(state.StateHash) == "" {
+		return WebOAuthState{}, errors.New("store: oauth state hash is required")
+	}
+	if strings.TrimSpace(state.CodeVerifierCiphertext) == "" {
+		return WebOAuthState{}, errors.New("store: oauth verifier ciphertext is required")
+	}
+	if strings.TrimSpace(state.RedirectURI) == "" {
+		return WebOAuthState{}, errors.New("store: oauth redirect URI is required")
+	}
+	if state.ExpiresAt.IsZero() {
+		return WebOAuthState{}, errors.New("store: oauth state expiry is required")
+	}
+	if state.CreatedAt.IsZero() {
+		state.CreatedAt = time.Now().UTC()
+	}
+	state.ExpiresAt = state.ExpiresAt.UTC()
+	state.CreatedAt = state.CreatedAt.UTC()
+	if err := db.WithContext(ctx).Create(&state).Error; err != nil {
+		return WebOAuthState{}, fmt.Errorf("store: create oauth state: %w", err)
+	}
+	return state, nil
+}
+
+// ConsumeWebOAuthState atomically reads and deletes an OAuth state. A state is
+// never reusable, including after a successful token exchange. Expired rows are
+// deleted while being observed so an abandoned login cannot accumulate rows.
+func (db *DB) ConsumeWebOAuthState(ctx context.Context, stateHash string, now time.Time) (WebOAuthState, error) {
+	stateHash = strings.TrimSpace(stateHash)
+	if stateHash == "" {
+		return WebOAuthState{}, ErrWebOAuthStateNotFound
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	var state WebOAuthState
+	expired := false
+	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		query := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("state_hash = ?", stateHash).First(&state)
+		if errors.Is(query.Error, gorm.ErrRecordNotFound) {
+			return ErrWebOAuthStateNotFound
+		}
+		if query.Error != nil {
+			return fmt.Errorf("store: get oauth state: %w", query.Error)
+		}
+		expired = !state.ExpiresAt.After(now)
+		if err := tx.Delete(&WebOAuthState{}, "state_hash = ?", stateHash).Error; err != nil {
+			if expired {
+				return fmt.Errorf("store: delete expired oauth state: %w", err)
+			}
+			return fmt.Errorf("store: consume oauth state: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return WebOAuthState{}, err
+	}
+	if expired {
+		return WebOAuthState{}, ErrWebOAuthStateExpired
+	}
+	return state, nil
+}
+
+// DeleteWebOAuthState removes an OAuth state without attempting to consume it.
+// It is useful for cleanup paths and is intentionally idempotent.
+func (db *DB) DeleteWebOAuthState(ctx context.Context, stateHash string) error {
+	stateHash = strings.TrimSpace(stateHash)
+	if stateHash == "" {
+		return nil
+	}
+	if err := db.WithContext(ctx).Delete(&WebOAuthState{}, "state_hash = ?", stateHash).Error; err != nil {
+		return fmt.Errorf("store: delete oauth state: %w", err)
+	}
+	return nil
+}
+
+// CreateWebSession stores only hashes of the session and CSRF secrets.
+func (db *DB) CreateWebSession(ctx context.Context, session WebSession) (WebSession, error) {
+	if strings.TrimSpace(session.ID) == "" {
+		return WebSession{}, errors.New("store: web session id is required")
+	}
+	if strings.TrimSpace(session.TokenHash) == "" || strings.TrimSpace(session.CSRFTokenHash) == "" {
+		return WebSession{}, errors.New("store: web session secret hashes are required")
+	}
+	if strings.TrimSpace(session.ActorID) == "" || strings.TrimSpace(session.ActorName) == "" {
+		return WebSession{}, errors.New("store: web session actor is required")
+	}
+	if session.ExpiresAt.IsZero() {
+		return WebSession{}, errors.New("store: web session expiry is required")
+	}
+	if session.CreatedAt.IsZero() {
+		session.CreatedAt = time.Now().UTC()
+	}
+	if session.LastSeenAt.IsZero() {
+		session.LastSeenAt = session.CreatedAt
+	}
+	if err := db.WithContext(ctx).Create(&session).Error; err != nil {
+		return WebSession{}, fmt.Errorf("store: create web session: %w", err)
+	}
+	return session, nil
+}
+
+// GetWebSessionByTokenHash returns only a currently valid, non-revoked session.
+func (db *DB) GetWebSessionByTokenHash(ctx context.Context, tokenHash string, now time.Time) (WebSession, error) {
+	tokenHash = strings.TrimSpace(tokenHash)
+	if tokenHash == "" {
+		return WebSession{}, ErrWebSessionNotFound
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	var session WebSession
+	query := db.WithContext(ctx).Where("token_hash = ? AND revoked_at IS NULL AND expires_at > ?", tokenHash, now.UTC()).First(&session)
+	if errors.Is(query.Error, gorm.ErrRecordNotFound) {
+		return WebSession{}, ErrWebSessionNotFound
+	}
+	if query.Error != nil {
+		return WebSession{}, fmt.Errorf("store: get web session: %w", query.Error)
+	}
+	return session, nil
+}
+
+// TouchWebSession updates activity only while the session remains valid.
+func (db *DB) TouchWebSession(ctx context.Context, tokenHash string, now time.Time) error {
+	tokenHash = strings.TrimSpace(tokenHash)
+	if tokenHash == "" {
+		return ErrWebSessionNotFound
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	result := db.WithContext(ctx).Model(&WebSession{}).
+		Where("token_hash = ? AND revoked_at IS NULL AND expires_at > ?", tokenHash, now.UTC()).
+		Update("last_seen_at", now.UTC())
+	if result.Error != nil {
+		return fmt.Errorf("store: touch web session: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return ErrWebSessionNotFound
+	}
+	return nil
+}
+
+// RevokeWebSession invalidates a session. Repeated logout is deliberately
+// idempotent, so a missing or already-revoked token is not an error.
+func (db *DB) RevokeWebSession(ctx context.Context, tokenHash string, now time.Time) error {
+	tokenHash = strings.TrimSpace(tokenHash)
+	if tokenHash == "" {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	result := db.WithContext(ctx).Model(&WebSession{}).
+		Where("token_hash = ? AND revoked_at IS NULL", tokenHash).
+		Update("revoked_at", now.UTC())
+	if result.Error != nil {
+		return fmt.Errorf("store: revoke web session: %w", result.Error)
+	}
+	return nil
+}
+
+// GetWebSession reads a session by its opaque database id. It is not used for
+// authentication; token-hash lookup above is the only browser auth path.
+func (db *DB) GetWebSession(ctx context.Context, id string) (WebSession, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return WebSession{}, ErrWebSessionNotFound
+	}
+	var session WebSession
+	query := db.WithContext(ctx).Where("id = ?", id).First(&session)
+	if errors.Is(query.Error, gorm.ErrRecordNotFound) {
+		return WebSession{}, ErrWebSessionNotFound
+	}
+	if query.Error != nil {
+		return WebSession{}, fmt.Errorf("store: get web session: %w", query.Error)
+	}
+	return session, nil
+}
+
+// GetLLMModelSelection reads the globally selected model.
+func (db *DB) GetLLMModelSelection(ctx context.Context) (LLMModelSelection, error) {
+	var selection LLMModelSelection
+	query := db.WithContext(ctx).Where("singleton_id = ?", 1).First(&selection)
+	if errors.Is(query.Error, gorm.ErrRecordNotFound) {
+		return LLMModelSelection{}, ErrLLMModelSelectionNotFound
+	}
+	if query.Error != nil {
+		return LLMModelSelection{}, fmt.Errorf("store: get llm model selection: %w", query.Error)
+	}
+	return selection, nil
+}
+
+// GetOrInitializeLLMModelSelection creates the singleton only when absent.
+// The configured default never overwrites a previously selected model.
+func (db *DB) GetOrInitializeLLMModelSelection(ctx context.Context, defaultModel string, now time.Time) (LLMModelSelection, error) {
+	defaultModel, err := normalizeLLMModelName(defaultModel)
+	if err != nil {
+		return LLMModelSelection{}, err
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	candidate := LLMModelSelection{SingletonID: 1, CurrentModel: defaultModel, UpdatedAt: now.UTC()}
+	if err := db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&candidate).Error; err != nil {
+		return LLMModelSelection{}, fmt.Errorf("store: initialize llm model selection: %w", err)
+	}
+	return db.GetLLMModelSelection(ctx)
+}
+
+// SetLLMModelSelection serializes global model changes with a row lock. The
+// caller must validate the model against its configuration allowlist first.
+func (db *DB) SetLLMModelSelection(ctx context.Context, model string, now time.Time) (LLMModelSelection, error) {
+	model, err := normalizeLLMModelName(model)
+	if err != nil {
+		return LLMModelSelection{}, err
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	var selection LLMModelSelection
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		query := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("singleton_id = ?", 1).First(&selection)
+		if errors.Is(query.Error, gorm.ErrRecordNotFound) {
+			return ErrLLMModelSelectionNotFound
+		}
+		if query.Error != nil {
+			return fmt.Errorf("store: lock llm model selection: %w", query.Error)
+		}
+		selection.CurrentModel = model
+		selection.UpdatedAt = now.UTC()
+		if err := tx.Model(&selection).Updates(map[string]any{
+			"current_model": selection.CurrentModel,
+			"updated_at":    selection.UpdatedAt,
+		}).Error; err != nil {
+			return fmt.Errorf("store: set llm model selection: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return LLMModelSelection{}, err
+	}
+	return selection, nil
+}
+
+func normalizeLLMModelName(model string) (string, error) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return "", errors.New("store: llm model is required")
+	}
+	if len([]rune(model)) > 128 {
+		return "", errors.New("store: llm model is too long")
+	}
+	return model, nil
+}
+
 // ErrApprovalNotFound / ErrApprovalConflict 是审批决策的哨兵错误：
 // 404 与 409 的 HTTP 映射靠它们。
 var ErrApprovalNotFound = errors.New("store: approval not found")
 var ErrApprovalConflict = errors.New("store: approval already decided")
 
-// CreateApproval 落一条 pending 审批单。绑定 incident/run/tool/args/plan_hash
-// 与过期时间 —— 审批通过的是"这份计划"，不是某个模糊意图（GC-13）。
-func (db *DB) CreateApproval(ctx context.Context, approval Approval) (Approval, error) {
+const approvalNearExpiryWindow = 5 * time.Minute
+
+func validateApprovalCreate(approval Approval) error {
 	if approval.IncidentID == 0 || approval.RunID == 0 {
-		return Approval{}, errors.New("store: approval incident and run are required")
+		return errors.New("store: approval incident and run are required")
 	}
 	if approval.ToolName == "" || len(approval.ArgsJSON) == 0 || approval.PlanHash == "" {
-		return Approval{}, errors.New("store: approval tool, args and plan_hash are required")
+		return errors.New("store: approval tool, args and plan_hash are required")
 	}
 	if approval.ExpiresAt.IsZero() || approval.CreatedAt.IsZero() {
-		return Approval{}, errors.New("store: approval times are required")
+		return errors.New("store: approval times are required")
 	}
-	approval.Status = "pending"
-	if err := db.WithContext(ctx).Create(&approval).Error; err != nil {
-		return Approval{}, fmt.Errorf("store: create approval: %w", err)
+	if !json.Valid(approval.ArgsJSON) {
+		return errors.New("store: approval args must be valid JSON")
+	}
+	return nil
+}
+
+func validateApprovalDecision(status, decidedBy, decisionSource string, now time.Time) error {
+	if status != "approved" && status != "denied" {
+		return errors.New("store: approval decision must be approved or denied")
+	}
+	if strings.TrimSpace(decidedBy) == "" {
+		return errors.New("store: approval decider is required")
+	}
+	if len([]rune(decidedBy)) > 64 {
+		return errors.New("store: approval decider is too long")
+	}
+	if strings.TrimSpace(decisionSource) == "" {
+		return errors.New("store: approval decision source is required")
+	}
+	if len([]rune(decisionSource)) > 16 {
+		return errors.New("store: approval decision source is too long")
+	}
+	if now.IsZero() {
+		return errors.New("store: approval decision time is required")
+	}
+	return nil
+}
+
+func appendApprovalEvent(ctx context.Context, tx *gorm.DB, approval Approval, eventType eventlog.EventType, status, summary string, createdAt time.Time) error {
+	approvalID := approval.ID
+	runID := approval.RunID
+	_, err := appendIncidentEvent(ctx, tx, IncidentEvent{
+		IncidentID: approval.IncidentID,
+		RunID:      &runID,
+		ApprovalID: &approvalID,
+		EventType:  string(eventType),
+		Phase:      "approval",
+		Status:     status,
+		Summary:    summary,
+		CreatedAt:  createdAt,
+	})
+	return err
+}
+
+func appendApprovalCreatedEvent(ctx context.Context, tx *gorm.DB, approval Approval) error {
+	return appendApprovalEvent(ctx, tx, approval, eventlog.EventApprovalCreated, "pending", "approval created", approval.CreatedAt)
+}
+
+// decideApprovalInTx 执行带行锁的 pending + expires_at CAS，并追加决定事件。
+// 调用方必须已经校验参数；所有修改和事件写入都在 tx 中完成。
+func decideApprovalInTx(ctx context.Context, tx *gorm.DB, id uint64, status, decidedBy, decisionReason, decisionSource string, now time.Time) (Approval, error) {
+	var approval Approval
+	query := tx.WithContext(ctx).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		First(&approval, id)
+	if errors.Is(query.Error, gorm.ErrRecordNotFound) {
+		return Approval{}, ErrApprovalNotFound
+	}
+	if query.Error != nil {
+		return Approval{}, fmt.Errorf("store: lock approval: %w", query.Error)
+	}
+	if approval.Status != "pending" || !approval.ExpiresAt.After(now) {
+		return Approval{}, ErrApprovalConflict
+	}
+
+	decidedAt := now.UTC()
+	var reason any
+	if decisionReason != "" {
+		reason = decisionReason
+	}
+	result := tx.WithContext(ctx).Model(&Approval{}).
+		Where("id = ? AND status = ? AND expires_at > ?", id, "pending", now).
+		Updates(map[string]any{
+			"status":          status,
+			"decided_by":      decidedBy,
+			"decided_at":      decidedAt,
+			"decision_reason": reason,
+			"decision_source": decisionSource,
+		})
+	if result.Error != nil {
+		return Approval{}, fmt.Errorf("store: decide approval: %w", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return Approval{}, ErrApprovalConflict
+	}
+
+	decidedByCopy := decidedBy
+	sourceCopy := decisionSource
+	approval.Status = status
+	approval.DecidedBy = &decidedByCopy
+	approval.DecidedAt = &decidedAt
+	approval.DecisionSource = &sourceCopy
+	if decisionReason != "" {
+		reasonCopy := decisionReason
+		approval.DecisionReason = &reasonCopy
+	} else {
+		approval.DecisionReason = nil
+	}
+	eventType := eventlog.EventApprovalDenied
+	if status == "approved" {
+		eventType = eventlog.EventApprovalApproved
+	}
+	if err := appendApprovalEvent(ctx, tx, approval, eventType, status, "approval "+status, decidedAt); err != nil {
+		return Approval{}, err
 	}
 	return approval, nil
+}
+
+// CreateApproval 落一条 pending 审批单，并在同一事务写 approval.created。
+// 绑定 incident/run/tool/args/plan_hash 与过期时间 —— 审批通过的是"这份计划"，
+// 不是某个模糊意图（GC-13）。
+func (db *DB) CreateApproval(ctx context.Context, approval Approval) (Approval, error) {
+	if err := validateApprovalCreate(approval); err != nil {
+		return Approval{}, err
+	}
+	approval.Status = "pending"
+	approval.DecidedBy = nil
+	approval.DecidedAt = nil
+	approval.DecisionReason = nil
+	approval.DecisionSource = nil
+	approval.ResultJSON = nil
+	approval.CreatedAt = approval.CreatedAt.UTC()
+	approval.ExpiresAt = approval.ExpiresAt.UTC()
+	if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.WithContext(ctx).Create(&approval).Error; err != nil {
+			return fmt.Errorf("store: create approval: %w", err)
+		}
+		if err := appendApprovalCreatedEvent(ctx, tx, approval); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		return Approval{}, err
+	}
+	return approval, nil
+}
+
+// CreateSystemApprovedApproval 原子创建并系统批准一张审批单。
+// approval.created、approval.approved 与两次状态写入必须同一事务提交。
+func (db *DB) CreateSystemApprovedApproval(ctx context.Context, approval Approval, decidedBy, decisionReason, decisionSource string, now time.Time) (Approval, error) {
+	if err := validateApprovalCreate(approval); err != nil {
+		return Approval{}, err
+	}
+	now = now.UTC()
+	if err := validateApprovalDecision("approved", decidedBy, decisionSource, now); err != nil {
+		return Approval{}, err
+	}
+	approval.Status = "pending"
+	approval.DecidedBy = nil
+	approval.DecidedAt = nil
+	approval.DecisionReason = nil
+	approval.DecisionSource = nil
+	approval.ResultJSON = nil
+	approval.CreatedAt = approval.CreatedAt.UTC()
+	approval.ExpiresAt = approval.ExpiresAt.UTC()
+	var decided Approval
+	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.WithContext(ctx).Create(&approval).Error; err != nil {
+			return fmt.Errorf("store: create system approval: %w", err)
+		}
+		if err := appendApprovalCreatedEvent(ctx, tx, approval); err != nil {
+			return err
+		}
+		var err error
+		decided, err = decideApprovalInTx(ctx, tx, approval.ID, "approved", decidedBy, decisionReason, decisionSource, now)
+		return err
+	})
+	if err != nil {
+		if errors.Is(err, ErrApprovalNotFound) || errors.Is(err, ErrApprovalConflict) {
+			return Approval{}, err
+		}
+		return Approval{}, fmt.Errorf("store: create system approval: %w", err)
+	}
+	return decided, nil
 }
 
 // GetApproval 按 id 取审批单。
@@ -712,45 +2277,93 @@ func (db *DB) GetApproval(ctx context.Context, id uint64) (Approval, error) {
 	return approval, nil
 }
 
-// DecideApproval 把 pending 审批单置为终态（approved/denied）。
-// WHERE 同时带状态和过期时间：重复决策返回 ErrApprovalConflict，
-// 过期单不能再被批准。
-func (db *DB) DecideApproval(ctx context.Context, id uint64, status, decidedBy string, now time.Time) error {
-	if status != "approved" && status != "denied" {
-		return errors.New("store: approval decision must be approved or denied")
+// DecideApproval 以 pending + expires_at 为 CAS 条件决定审批，并在同一事务
+// 写入 decided_at/reason/source 与 approval.approved/denied 事件。冲突不会覆盖
+// 原操作者、时间或原因。
+func (db *DB) DecideApproval(ctx context.Context, id uint64, status, decidedBy, decisionReason, decisionSource string, now time.Time) (Approval, error) {
+	if err := validateApprovalDecision(status, decidedBy, decisionSource, now); err != nil {
+		return Approval{}, err
 	}
-	if decidedBy == "" {
-		return errors.New("store: approval decider is required")
-	}
-	result := db.WithContext(ctx).Model(&Approval{}).
-		Where("id = ? AND status = ? AND expires_at > ?", id, "pending", now).
-		Updates(map[string]any{"status": status, "decided_by": decidedBy})
-	if result.Error != nil {
-		return fmt.Errorf("store: decide approval: %w", result.Error)
-	}
-	if result.RowsAffected == 0 {
-		// 区分"不存在"和"已决/已过期"：前者 404，后者 409。
-		var existing Approval
-		findErr := db.WithContext(ctx).First(&existing, id).Error
-		if errors.Is(findErr, gorm.ErrRecordNotFound) {
-			return ErrApprovalNotFound
+	now = now.UTC()
+	var decided Approval
+	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var err error
+		decided, err = decideApprovalInTx(ctx, tx, id, status, decidedBy, decisionReason, decisionSource, now)
+		return err
+	})
+	if err != nil {
+		if errors.Is(err, ErrApprovalNotFound) || errors.Is(err, ErrApprovalConflict) {
+			return Approval{}, err
 		}
-		return ErrApprovalConflict
+		return Approval{}, fmt.Errorf("store: decide approval: %w", err)
 	}
-	return nil
+	return decided, nil
 }
 
-// ExpireApprovals 把过期的 pending/approved 单批量置为 expired。
-// approved 也会过期：批准了但一直没执行的动作不该永久有效（GC-13）。
-// executing/终态不动。返回过期行数。
+// ExpireApprovals 在短事务内逐行锁定过期 pending/approved 审批，转为
+// expired，并为每行写 approval.expired；near-expiry 问题同步 resolve/open。
+// executing 与其它终态不会被触碰。
 func (db *DB) ExpireApprovals(ctx context.Context, now time.Time) (int64, error) {
-	result := db.WithContext(ctx).Model(&Approval{}).
-		Where("status IN ? AND expires_at <= ?", []string{"pending", "approved"}, now).
-		Update("status", "expired")
-	if result.Error != nil {
-		return 0, fmt.Errorf("store: expire approvals: %w", result.Error)
+	if now.IsZero() {
+		return 0, errors.New("store: approval expiry time is required")
 	}
-	return result.RowsAffected, nil
+	now = now.UTC()
+	var expired int64
+	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var approvals []Approval
+		if err := tx.WithContext(ctx).
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("status IN ? AND expires_at <= ?", []string{"pending", "approved"}, now).
+			Order("id ASC").Find(&approvals).Error; err != nil {
+			return fmt.Errorf("store: lock expired approvals: %w", err)
+		}
+		for _, approval := range approvals {
+			result := tx.WithContext(ctx).Model(&Approval{}).
+				Where("id = ? AND status IN ? AND expires_at <= ?", approval.ID, []string{"pending", "approved"}, now).
+				Update("status", "expired")
+			if result.Error != nil {
+				return fmt.Errorf("store: expire approval %d: %w", approval.ID, result.Error)
+			}
+			if result.RowsAffected != 1 {
+				continue
+			}
+			if err := appendApprovalEvent(ctx, tx, approval, eventlog.EventApprovalExpired, "expired", "approval expired", now); err != nil {
+				return err
+			}
+			runID := approval.RunID
+			if _, err := resolveIncidentProblem(ctx, tx, approval.IncidentID, "approval_near_expiry", &runID, now); err != nil {
+				return err
+			}
+			expired++
+		}
+
+		var nearExpiry []Approval
+		if err := tx.WithContext(ctx).
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("status IN ? AND expires_at > ? AND expires_at <= ?", []string{"pending", "approved"}, now, now.Add(approvalNearExpiryWindow)).
+			Order("id ASC").Find(&nearExpiry).Error; err != nil {
+			return fmt.Errorf("store: lock near-expiry approvals: %w", err)
+		}
+		for _, approval := range nearExpiry {
+			runID := approval.RunID
+			if _, err := openIncidentProblem(ctx, tx, IncidentProblem{
+				IncidentID:  approval.IncidentID,
+				RunID:       &runID,
+				Code:        "approval_near_expiry",
+				Severity:    "warning",
+				Summary:     "approval is nearing expiration",
+				FirstSeenAt: now,
+				LastSeenAt:  now,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("store: expire approvals: %w", err)
+	}
+	return expired, nil
 }
 
 // ListApprovals 按状态过滤列出审批单，id 倒序稳定排序。
@@ -762,6 +2375,19 @@ func (db *DB) ListApprovals(ctx context.Context, status string) ([]Approval, err
 	approvals := make([]Approval, 0)
 	if err := query.Order("id DESC").Find(&approvals).Error; err != nil {
 		return nil, fmt.Errorf("store: list approvals: %w", err)
+	}
+	return approvals, nil
+}
+
+// ListApprovalsPage 是审批列表的分页入口，缺省 20，最大 100。
+func (db *DB) ListApprovalsPage(ctx context.Context, status string, limit int) ([]Approval, error) {
+	query := db.WithContext(ctx).Model(&Approval{})
+	if status != "" {
+		query = query.Where("status = ?", status)
+	}
+	approvals := make([]Approval, 0)
+	if err := query.Order("id DESC").Limit(normalizePageLimit(limit)).Find(&approvals).Error; err != nil {
+		return nil, fmt.Errorf("store: list approvals page: %w", err)
 	}
 	return approvals, nil
 }
@@ -780,51 +2406,235 @@ func (db *DB) NextApprovedApproval(ctx context.Context, now time.Time) (Approval
 	return approval, true, nil
 }
 
-// ClaimApprovalExecution 把 approved 原子置为 executing。
-// 重复领取返回 claimed=false —— 同一审批单不会产生两次执行（验收清单）。
-// 过期单不许进入执行：approved 的 TTL 语义和 pending 一样硬（GC-13）。
-func (db *DB) ClaimApprovalExecution(ctx context.Context, id uint64, now time.Time) (bool, error) {
-	result := db.WithContext(ctx).Model(&Approval{}).
-		Where("id = ? AND status = ? AND expires_at > ?", id, "approved", now).
-		Update("status", "executing")
-	if result.Error != nil {
-		return false, fmt.Errorf("store: claim approval execution: %w", result.Error)
+// ClaimApprovalExecution 把 approved 原子置为 executing，并与 execution.started
+// 事实事件同一短事务提交。重复领取或过期审批返回 claimed=false。
+func (db *DB) ClaimApprovalExecution(ctx context.Context, id uint64, now time.Time) (claimed bool, err error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
 	}
-	return result.RowsAffected > 0, nil
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var approval Approval
+		query := tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ?", id).First(&approval)
+		if errors.Is(query.Error, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if query.Error != nil {
+			return fmt.Errorf("store: lock approval for execution: %w", query.Error)
+		}
+		if approval.Status != "approved" || !approval.ExpiresAt.After(now) {
+			return nil
+		}
+		result := tx.WithContext(ctx).Model(&Approval{}).
+			Where("id = ? AND status = ? AND expires_at > ?", id, "approved", now).
+			Update("status", "executing")
+		if result.Error != nil {
+			return fmt.Errorf("store: claim approval execution: %w", result.Error)
+		}
+		if result.RowsAffected != 1 {
+			return nil
+		}
+		runID, approvalID := approval.RunID, approval.ID
+		if _, eventErr := appendIncidentEvent(ctx, tx, IncidentEvent{
+			IncidentID:  approval.IncidentID,
+			RunID:       &runID,
+			ApprovalID:  &approvalID,
+			EventType:   string(eventlog.EventExecutionStarted),
+			Phase:       "execution",
+			Status:      "executing",
+			Summary:     "approval execution started",
+			PayloadJSON: executionStatusPayload("executing"),
+			CreatedAt:   now,
+		}); eventErr != nil {
+			return eventErr
+		}
+		claimed = true
+		return nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("store: claim approval execution transaction: %w", err)
+	}
+	return claimed, nil
 }
 
-// FinishApprovalExecution 写回执行结果：executed/failed + result_json。
-// 只允许 executing → 终态，终态不可覆盖。
+// FinishApprovalExecution 在一笔短事务中完成 executing→executed/failed 的 CAS，
+// 保存有界结果，并追加 execution 事件及 execution_failed 问题变更。
 func (db *DB) FinishApprovalExecution(ctx context.Context, id uint64, status string, resultJSON []byte) error {
 	if status != "executed" && status != "failed" {
 		return errors.New("store: approval execution status must be executed or failed")
 	}
-	updates := map[string]any{"status": status}
-	if len(resultJSON) > 0 {
-		updates["result_json"] = datatypes.JSON(resultJSON)
-	}
-	result := db.WithContext(ctx).Model(&Approval{}).
-		Where("id = ? AND status = ?", id, "executing").
-		Updates(updates)
-	if result.Error != nil {
-		return fmt.Errorf("store: finish approval execution: %w", result.Error)
-	}
-	if result.RowsAffected == 0 {
-		return fmt.Errorf("store: approval %d is not executing", id)
+	now := time.Now().UTC()
+	boundedResult := boundedExecutionResult(resultJSON)
+	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var approval Approval
+		query := tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ?", id).First(&approval)
+		if errors.Is(query.Error, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("store: approval %d not found", id)
+		}
+		if query.Error != nil {
+			return fmt.Errorf("store: lock approval for finish: %w", query.Error)
+		}
+		if approval.Status != "executing" {
+			return fmt.Errorf("store: approval %d is not executing", id)
+		}
+		updates := map[string]any{"status": status}
+		if boundedResult != nil {
+			updates["result_json"] = boundedResult
+		}
+		result := tx.WithContext(ctx).Model(&Approval{}).
+			Where("id = ? AND status = ?", id, "executing").Updates(updates)
+		if result.Error != nil {
+			return fmt.Errorf("store: finish approval execution: %w", result.Error)
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("store: approval %d is not executing", id)
+		}
+		runID, approvalID := approval.RunID, approval.ID
+		eventType := eventlog.EventExecutionCompleted
+		summary := "approval execution completed"
+		if status == "failed" {
+			eventType = eventlog.EventExecutionFailed
+			summary = "approval execution failed"
+		}
+		if _, eventErr := appendIncidentEvent(ctx, tx, IncidentEvent{
+			IncidentID:  approval.IncidentID,
+			RunID:       &runID,
+			ApprovalID:  &approvalID,
+			EventType:   string(eventType),
+			Phase:       "execution",
+			Status:      status,
+			Summary:     summary,
+			PayloadJSON: executionStatusPayload(status),
+			CreatedAt:   now,
+		}); eventErr != nil {
+			return eventErr
+		}
+		if status == "failed" {
+			if _, problemErr := openIncidentProblem(ctx, tx, IncidentProblem{
+				IncidentID:  approval.IncidentID,
+				RunID:       &runID,
+				Code:        "execution_failed",
+				Severity:    "error",
+				Status:      "open",
+				Summary:     "approval execution failed",
+				FirstSeenAt: now,
+				LastSeenAt:  now,
+			}); problemErr != nil {
+				return problemErr
+			}
+		} else if _, problemErr := resolveIncidentProblem(ctx, tx, approval.IncidentID, "execution_failed", &runID, now); problemErr != nil {
+			return problemErr
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("store: finish approval execution transaction: %w", err)
 	}
 	return nil
 }
 
-// RecoverExecutingApprovals 将进程重启前遗留的 executing 审批标记为 failed。
-// executing 表示动作可能已经触达外部系统，不能自动重放；失败原因要求人工核查。
-func (db *DB) RecoverExecutingApprovals(ctx context.Context, now time.Time) (int64, error) {
-	result := db.WithContext(ctx).Model(&Approval{}).
-		Where("status = ?", "executing").
-		Updates(map[string]any{"status": "failed", "result_json": datatypes.JSON([]byte(`{"error":"executor interrupted; manual verification required"}`))})
-	if result.Error != nil {
-		return 0, fmt.Errorf("store: recover executing approvals: %w", result.Error)
+// RecoverExecutingApprovals 逐行锁定 executing 审批并标记 failed。
+// executing 可能已经触达外部系统，恢复阶段绝不自动重放，只写人工核查问题。
+func (db *DB) RecoverExecutingApprovals(ctx context.Context, now time.Time) (recovered int64, err error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
 	}
-	return result.RowsAffected, nil
+	interrupted := []byte(`{"error":"executor interrupted; manual verification required","manual_check":true}`)
+	b := boundedExecutionResult(interrupted)
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var approvals []Approval
+		query := tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("status = ?", "executing").Order("id ASC").Find(&approvals)
+		if query.Error != nil {
+			return fmt.Errorf("store: lock executing approvals: %w", query.Error)
+		}
+		for _, approval := range approvals {
+			result := tx.WithContext(ctx).Model(&Approval{}).
+				Where("id = ? AND status = ?", approval.ID, "executing").
+				Updates(map[string]any{"status": "failed", "result_json": b})
+			if result.Error != nil {
+				return fmt.Errorf("store: recover approval %d: %w", approval.ID, result.Error)
+			}
+			if result.RowsAffected != 1 {
+				continue
+			}
+			runID, approvalID := approval.RunID, approval.ID
+			if _, eventErr := appendIncidentEvent(ctx, tx, IncidentEvent{
+				IncidentID:  approval.IncidentID,
+				RunID:       &runID,
+				ApprovalID:  &approvalID,
+				EventType:   string(eventlog.EventExecutionFailed),
+				Phase:       "execution",
+				Status:      "failed",
+				Summary:     "approval execution interrupted; manual verification required",
+				PayloadJSON: executionManualPayload(),
+				CreatedAt:   now,
+			}); eventErr != nil {
+				return eventErr
+			}
+			for _, problem := range []IncidentProblem{
+				{IncidentID: approval.IncidentID, RunID: &runID, Code: "manual_check", Severity: "critical", Status: "open", Summary: "manual verification required after interrupted execution", FirstSeenAt: now, LastSeenAt: now},
+				{IncidentID: approval.IncidentID, RunID: &runID, Code: "execution_failed", Severity: "error", Status: "open", Summary: "approval execution interrupted", FirstSeenAt: now, LastSeenAt: now},
+			} {
+				if _, problemErr := openIncidentProblem(ctx, tx, problem); problemErr != nil {
+					return problemErr
+				}
+			}
+			recovered++
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("store: recover executing approvals transaction: %w", err)
+	}
+	return recovered, nil
+}
+
+const maxExecutionResultBytes = 8192
+
+// boundedExecutionResult keeps result_json valid JSON and below the audit budget.
+// Oversized or malformed external output is represented by a fixed safe marker.
+func boundedExecutionResult(result []byte) datatypes.JSON {
+	if len(result) == 0 {
+		return nil
+	}
+	if len(result) <= maxExecutionResultBytes && json.Valid(result) {
+		return datatypes.JSON(append([]byte(nil), result...))
+	}
+	return datatypes.JSON([]byte(`{"truncated":true,"reason":"execution result omitted"}`))
+}
+
+func executionStatusPayload(status string) *datatypes.JSON {
+	payload := datatypes.JSON([]byte(fmt.Sprintf(`{"status":%q}`, status)))
+	return &payload
+}
+
+func executionManualPayload() *datatypes.JSON {
+	payload := datatypes.JSON([]byte(`{"manual_check":true}`))
+	return &payload
+}
+
+// CountRecentExecutions 数同一 plan_hash（同 tool + 同 target）在 since 之后
+// 进入过执行的审批单。L2 限频护栏用它判断"这个动作最近做过几次"。
+// 统计包含 failed：反复失败的重复动作正是限频要拦的（配置错/凭据错重启无救）。
+func (db *DB) CountRecentExecutions(ctx context.Context, planHash string, since time.Time) (int, error) {
+	if strings.TrimSpace(planHash) == "" {
+		return 0, errors.New("store: plan hash is required")
+	}
+	var count int64
+	err := db.WithContext(ctx).Model(&Approval{}).
+		Where("plan_hash = ? AND status IN ? AND created_at >= ?",
+			planHash, []string{"executing", "executed", "failed"}, since).
+		Count(&count).Error
+	if err != nil {
+		return 0, fmt.Errorf("store: count recent executions: %w", err)
+	}
+	return int(count), nil
 }
 
 // InsertFaultCmdHistory 记录一次已审批动作的执行结果（D13 的诊断注入源）。
@@ -846,7 +2656,7 @@ func (db *DB) GetAgentRun(ctx context.Context, id uint64) (AgentRun, error) {
 	var run AgentRun
 	err := db.WithContext(ctx).First(&run, id).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return AgentRun{}, fmt.Errorf("store: agent run %d not found", id)
+		return AgentRun{}, ErrAgentRunNotFound
 	}
 	if err != nil {
 		return AgentRun{}, fmt.Errorf("store: get agent run: %w", err)
@@ -861,18 +2671,6 @@ func (db *DB) CountIncidentRuns(ctx context.Context, incidentID uint64) (int64, 
 		return 0, fmt.Errorf("store: count incident runs: %w", err)
 	}
 	return count, nil
-}
-
-// HasActiveRun 判断 incident 是否已有 pending/running 的 run。
-// 同一 incident 的重诊不能并发（D12）——创建前查这个。
-func (db *DB) HasActiveRun(ctx context.Context, incidentID uint64) (bool, error) {
-	var count int64
-	if err := db.WithContext(ctx).Model(&AgentRun{}).
-		Where("incident_id = ? AND status IN ?", incidentID, []string{"pending", "running"}).
-		Count(&count).Error; err != nil {
-		return false, fmt.Errorf("store: count active runs: %w", err)
-	}
-	return count > 0, nil
 }
 
 // ListIncidentRunIDs 按 id 升序列出 incident 的全部 run id（升级通知的 run 链）。
@@ -893,6 +2691,29 @@ func (db *DB) ListRunSteps(ctx context.Context, runID uint64) ([]AgentRunStep, e
 		return nil, fmt.Errorf("store: list run steps: %w", err)
 	}
 	return steps, nil
+}
+func (db *DB) ListRunStepsForIncident(ctx context.Context, incidentID, runID, afterID uint64, limit int) ([]AgentRunStep, error) {
+	if incidentID == 0 || runID == 0 {
+		return nil, ErrAgentRunNotFound
+	}
+	run, err := db.GetAgentRun(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	if run.IncidentID != incidentID {
+		return nil, ErrAgentRunNotFound
+	}
+	steps := make([]AgentRunStep, 0)
+	err = db.WithContext(ctx).Where("run_id = ? AND id > ?", runID, afterID).Order("id ASC").Limit(normalizePageLimit(limit)).Find(&steps).Error
+	if err != nil {
+		return nil, fmt.Errorf("store: list incident run steps: %w", err)
+	}
+	return steps, nil
+}
+
+// ListIncidentRunSteps is a descriptive alias for ListRunStepsForIncident.
+func (db *DB) ListIncidentRunSteps(ctx context.Context, incidentID, runID, afterID uint64, limit int) ([]AgentRunStep, error) {
+	return db.ListRunStepsForIncident(ctx, incidentID, runID, afterID, limit)
 }
 
 // ErrMemoryNotFound 是故障记忆未命中的哨兵错误。

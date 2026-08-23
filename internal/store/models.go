@@ -113,18 +113,21 @@ func (FaultCmdHistory) TableName() string { return "fault_cmd_history" }
 
 // Approval 是 D10 的 L3 变更动作状态机。
 type Approval struct {
-	ID         uint64          `gorm:"column:id;primaryKey;autoIncrement"`
-	IncidentID uint64          `gorm:"column:incident_id;not null"`
-	RunID      uint64          `gorm:"column:run_id;not null"`
-	ToolName   string          `gorm:"column:tool_name;size:128;not null"`
-	ArgsJSON   datatypes.JSON  `gorm:"column:args_json;type:json;not null"`
-	Reason     string          `gorm:"column:reason;type:text;not null"`
-	PlanHash   string          `gorm:"column:plan_hash;size:64;not null"`
-	Status     string          `gorm:"column:status;size:9;not null"`
-	ExpiresAt  time.Time       `gorm:"column:expires_at;not null"`
-	DecidedBy  *string         `gorm:"column:decided_by;size:64"`
-	ResultJSON *datatypes.JSON `gorm:"column:result_json;type:json"`
-	CreatedAt  time.Time       `gorm:"column:created_at;not null"`
+	ID             uint64          `gorm:"column:id;primaryKey;autoIncrement"`
+	IncidentID     uint64          `gorm:"column:incident_id;not null"`
+	RunID          uint64          `gorm:"column:run_id;not null"`
+	ToolName       string          `gorm:"column:tool_name;size:128;not null"`
+	ArgsJSON       datatypes.JSON  `gorm:"column:args_json;type:json;not null"`
+	Reason         string          `gorm:"column:reason;type:text;not null"`
+	PlanHash       string          `gorm:"column:plan_hash;size:64;not null"`
+	Status         string          `gorm:"column:status;size:9;not null"`
+	ExpiresAt      time.Time       `gorm:"column:expires_at;not null"`
+	DecidedBy      *string         `gorm:"column:decided_by;size:64"`
+	DecidedAt      *time.Time      `gorm:"column:decided_at"`
+	DecisionReason *string         `gorm:"column:decision_reason;type:text"`
+	DecisionSource *string         `gorm:"column:decision_source;size:16"`
+	ResultJSON     *datatypes.JSON `gorm:"column:result_json;type:json"`
+	CreatedAt      time.Time       `gorm:"column:created_at;not null"`
 }
 
 func (Approval) TableName() string { return "approval" }
@@ -161,3 +164,121 @@ type AgentRunStep struct {
 }
 
 func (AgentRunStep) TableName() string { return "agent_run_step" }
+
+// IncidentEvent 是 Incident 的持久化事实事件，只保存脱敏摘要和有限 payload。
+type IncidentEvent struct {
+	ID          uint64          `gorm:"column:id;primaryKey;autoIncrement"`
+	IncidentID  uint64          `gorm:"column:incident_id;not null"`
+	RunID       *uint64         `gorm:"column:run_id"`
+	ApprovalID  *uint64         `gorm:"column:approval_id"`
+	EventType   string          `gorm:"column:event_type;size:64;not null"`
+	Phase       string          `gorm:"column:phase;size:32;not null"`
+	Status      string          `gorm:"column:status;size:32;not null"`
+	Summary     string          `gorm:"column:summary;size:512;not null"`
+	PayloadJSON *datatypes.JSON `gorm:"column:payload_json;type:json"`
+	CreatedAt   time.Time       `gorm:"column:created_at;not null"`
+}
+
+func (IncidentEvent) TableName() string { return "incident_event" }
+
+// IncidentProblem 是 Incident 当前问题读模型。incident_id/code 唯一，重现问题只更新同一行。
+type IncidentProblem struct {
+	ID          uint64          `gorm:"column:id;primaryKey;autoIncrement"`
+	IncidentID  uint64          `gorm:"column:incident_id;not null"`
+	RunID       *uint64         `gorm:"column:run_id"`
+	Code        string          `gorm:"column:code;size:64;not null"`
+	Severity    string          `gorm:"column:severity;size:16;not null"`
+	Status      string          `gorm:"column:status;size:16;not null"`
+	Summary     string          `gorm:"column:summary;size:512;not null"`
+	DetailJSON  *datatypes.JSON `gorm:"column:detail_json;type:json"`
+	FirstSeenAt time.Time       `gorm:"column:first_seen_at;not null"`
+	LastSeenAt  time.Time       `gorm:"column:last_seen_at;not null"`
+	ResolvedAt  *time.Time      `gorm:"column:resolved_at"`
+}
+
+func (IncidentProblem) TableName() string { return "incident_problem" }
+
+// ConversationMessage 是 Incident 绑定的 Web/Feishu 对话消息。
+type ConversationMessage struct {
+	ID           uint64          `gorm:"column:id;primaryKey;autoIncrement"`
+	IncidentID   uint64          `gorm:"column:incident_id;not null"`
+	RunID        *uint64         `gorm:"column:run_id"`
+	ReplyToID    *uint64         `gorm:"column:reply_to_id"`
+	Channel      string          `gorm:"column:channel;size:16;not null"`
+	Role         string          `gorm:"column:role;size:16;not null"`
+	ActorID      *string         `gorm:"column:actor_id;size:128"`
+	ActorName    *string         `gorm:"column:actor_name;size:128"`
+	Content      string          `gorm:"column:content;type:text;not null"`
+	ToolName     *string         `gorm:"column:tool_name;size:128"`
+	ToolCallID   *string         `gorm:"column:tool_call_id;size:128"`
+	Status       string          `gorm:"column:status;size:16;not null"`
+	MetadataJSON *datatypes.JSON `gorm:"column:metadata_json;type:json"`
+	CreatedAt    time.Time       `gorm:"column:created_at;not null"`
+	ClaimedAt    *time.Time      `gorm:"column:claimed_at"`
+	FinishedAt   *time.Time      `gorm:"column:finished_at"`
+}
+
+func (ConversationMessage) TableName() string { return "conversation_message" }
+
+// IMBinding 将飞书消息/线程绑定到 Incident、Run 或 Approval。
+type IMBinding struct {
+	ID            uint64    `gorm:"column:id;primaryKey;autoIncrement"`
+	Provider      string    `gorm:"column:provider;size:16;not null"`
+	ChatID        string    `gorm:"column:chat_id;size:128;not null"`
+	MessageID     string    `gorm:"column:message_id;size:128;not null"`
+	RootMessageID *string   `gorm:"column:root_message_id;size:128"`
+	ThreadID      *string   `gorm:"column:thread_id;size:128"`
+	IncidentID    uint64    `gorm:"column:incident_id;not null"`
+	RunID         *uint64   `gorm:"column:run_id"`
+	ApprovalID    *uint64   `gorm:"column:approval_id"`
+	MessageKind   string    `gorm:"column:message_kind;size:32;not null"`
+	CreatedAt     time.Time `gorm:"column:created_at;not null"`
+}
+
+func (IMBinding) TableName() string { return "im_binding" }
+
+// IntegrationEventReceipt 用于第三方回调 event_id 去重。
+type IntegrationEventReceipt struct {
+	EventID     string    `gorm:"column:event_id;primaryKey;size:128"`
+	Provider    string    `gorm:"column:provider;size:16;not null"`
+	EventType   string    `gorm:"column:event_type;size:64;not null"`
+	ProcessedAt time.Time `gorm:"column:processed_at;not null"`
+	Result      string    `gorm:"column:result;size:32;not null"`
+}
+
+// WebOAuthState 是一次性 OAuth state/PKCE 存储，不保存明文 verifier。
+type WebOAuthState struct {
+	StateHash              string    `gorm:"column:state_hash;primaryKey;size:128"`
+	CodeVerifierCiphertext string    `gorm:"column:code_verifier_ciphertext;type:text;not null"`
+	RedirectURI            string    `gorm:"column:redirect_uri;size:512;not null"`
+	ExpiresAt              time.Time `gorm:"column:expires_at;not null"`
+	CreatedAt              time.Time `gorm:"column:created_at;not null"`
+}
+
+func (WebOAuthState) TableName() string { return "web_oauth_state" }
+
+// WebSession 是浏览器会话；数据库只存 token/csrf 的哈希。
+type WebSession struct {
+	ID            string     `gorm:"column:id;primaryKey;size:64"`
+	TokenHash     string     `gorm:"column:token_hash;size:128;uniqueIndex;not null"`
+	ActorID       string     `gorm:"column:actor_id;size:128;not null"`
+	ActorName     string     `gorm:"column:actor_name;size:128;not null"`
+	TenantKey     *string    `gorm:"column:tenant_key;size:128"`
+	CSRFTokenHash string     `gorm:"column:csrf_token_hash;size:128;not null"`
+	ExpiresAt     time.Time  `gorm:"column:expires_at;not null"`
+	CreatedAt     time.Time  `gorm:"column:created_at;not null"`
+	LastSeenAt    time.Time  `gorm:"column:last_seen_at;not null"`
+	RevokedAt     *time.Time `gorm:"column:revoked_at"`
+}
+
+func (WebSession) TableName() string { return "web_session" }
+
+// LLMModelSelection 是唯一的全局当前模型记录。模型 allowlist、端点和
+// 凭据始终留在配置文件；此表只保存已选择的安全模型 ID。
+type LLMModelSelection struct {
+	SingletonID  uint8     `gorm:"column:singleton_id;primaryKey;not null"`
+	CurrentModel string    `gorm:"column:current_model;size:128;not null"`
+	UpdatedAt    time.Time `gorm:"column:updated_at;not null"`
+}
+
+func (LLMModelSelection) TableName() string { return "llm_model_selection" }

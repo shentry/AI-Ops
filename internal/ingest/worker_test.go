@@ -29,13 +29,14 @@ type fakeIncidentTx struct {
 	touches     []uint64
 	resolutions []uint64
 	runs        []store.AgentRun
+	events      []store.IncidentEvent
 }
 
 func (f *fakeIncidentTx) AssignIncident(_ context.Context, input store.IncidentInput, _ time.Duration, _ int) (store.IncidentAssignment, error) {
 	f.mu.Lock()
 	f.assignments = append(f.assignments, input)
 	f.mu.Unlock()
-	return store.IncidentAssignment{IncidentID: 1, Status: "firing", Severity: input.Severity, Promoted: true}, nil
+	return store.IncidentAssignment{IncidentID: 1, Status: "firing", Severity: input.Severity, Created: true, Promoted: true}, nil
 }
 
 func (f *fakeIncidentTx) TouchIncident(_ context.Context, id uint64, _ time.Time, _ int) error {
@@ -57,6 +58,21 @@ func (f *fakeIncidentTx) EnqueueAgentRun(_ context.Context, run store.AgentRun) 
 	defer f.mu.Unlock()
 	f.runs = append(f.runs, run)
 	return nil
+}
+
+func (f *fakeIncidentTx) AppendIncidentEvent(_ context.Context, event store.IncidentEvent) (store.IncidentEvent, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = append(f.events, event)
+	return event, nil
+}
+
+func (f *fakeIncidentTx) OpenIncidentProblem(_ context.Context, problem store.IncidentProblem) (store.IncidentProblem, error) {
+	return problem, nil
+}
+
+func (f *fakeIncidentTx) ResolveIncidentProblem(_ context.Context, _ uint64, _ string, _ *uint64, _ time.Time) (bool, error) {
+	return true, nil
 }
 
 type fakePendingEventStore struct {

@@ -59,6 +59,12 @@ type Registry struct {
 	tools map[string]ToolSpec
 }
 
+// ExecutionMetadata records invocation facts that cannot be safely inferred
+// from returned text.
+type ExecutionMetadata struct {
+	Truncated bool
+}
+
 func NewRegistry() *Registry {
 	return &Registry{tools: make(map[string]ToolSpec)}
 }
@@ -116,21 +122,27 @@ func (r *Registry) ForLLM() []ToolSpec {
 // Execute 是工具的统一入口：套超时、截输出。任何调用方（LLM 工具循环、
 // 审批执行器）都走这里，保证超时和截断纪律只有一份实现。
 func (r *Registry) Execute(ctx context.Context, name string, args json.RawMessage) (string, error) {
+	output, _, err := r.ExecuteWithMetadata(ctx, name, args)
+	return output, err
+}
+
+// ExecuteWithMetadata is Execute's metadata-bearing form.
+func (r *Registry) ExecuteWithMetadata(ctx context.Context, name string, args json.RawMessage) (string, ExecutionMetadata, error) {
 	spec, ok := r.tools[name]
 	if !ok {
-		return "", ErrToolNotRegistered
+		return "", ExecutionMetadata{}, ErrToolNotRegistered
 	}
 	ctx, cancel := context.WithTimeout(ctx, spec.Timeout)
 	defer cancel()
 	output, err := spec.Handler(ctx, args)
 	if err != nil {
-		// 超时单独标注，审计时能分清"工具坏了"和"工具太慢"。
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return "", fmt.Errorf("tools: %s timed out after %s", name, spec.Timeout)
+			return "", ExecutionMetadata{}, fmt.Errorf("tools: %s timed out after %s", name, spec.Timeout)
 		}
-		return "", fmt.Errorf("tools: %s failed: %w", name, err)
+		return "", ExecutionMetadata{}, fmt.Errorf("tools: %s failed: %w", name, err)
 	}
-	return Truncate(output, spec.MaxOutput), nil
+	truncated := Truncate(output, spec.MaxOutput)
+	return truncated, ExecutionMetadata{Truncated: truncated != output}, nil
 }
 
 // Truncate 按 rune 截断，避免把 UTF-8 字符切成两半。

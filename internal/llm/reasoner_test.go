@@ -90,6 +90,15 @@ func toolCallResponse(callID, toolName, argsJSON string) map[string]any {
 	}
 }
 
+func toolCallResponseWithThinking(callID, toolName, argsJSON, thinking string) map[string]any {
+	resp := toolCallResponse(callID, toolName, argsJSON)
+	choices := resp["choices"].([]map[string]any)
+	message := choices[0]["message"].(map[string]any)
+	message["reasoning_content"] = thinking
+	message["content"] = []map[string]any{{"type": "thinking", "thinking": thinking}}
+	return resp
+}
+
 const validPlanJSON = `{
   "rca": "Sub2API 网关进程退出，容器状态为 stopped（见 docker 段）",
   "confidence": "high",
@@ -219,6 +228,55 @@ func TestReasonerToolCallWithinBudget(t *testing.T) {
 	if result.TokensIn <= 0 {
 		t.Fatalf("tokens_in = %d, want > 0", result.TokensIn)
 	}
+}
+
+func TestReasonerEchoesThinkingOnToolFollowUp(t *testing.T) {
+	fake := newFakeOpenAIServer(t, func(call int, body map[string]any) map[string]any {
+		if call == 1 {
+			return toolCallResponseWithThinking("call1", tools.ToolPromSeriesMeta, `{"match":"up"}`, "check series first")
+		}
+		if !assistantEchoedThinking(body, "check series first") {
+			t.Fatalf("second request missing thinking echo: %#v", body["messages"])
+		}
+		return chatResponse(validPlanJSON, 10, 5)
+	})
+	factory := NewFactory(config.LLMConfig{Roles: config.LLMRoles{
+		Reasoner: config.RoleConfig{
+			BaseURL: fake.server.URL, APIKey: "fake-key", Model: "fake-model", MaxTokens: 1024,
+			Thinking: config.ThinkingConfig{Enabled: true, Effort: "medium"},
+		},
+	}})
+	reasoner := NewReasoner(factory, stubLLMRegistry(t), config.DiagnoseBudget{FullSteps: 8, LightSteps: 3})
+	if _, err := reasoner.Diagnose(context.Background(), "evidence", "light"); err != nil {
+		t.Fatalf("Diagnose() error = %v", err)
+	}
+	if got := fake.requests.Load(); got != 2 {
+		t.Fatalf("requests = %d, want 2", got)
+	}
+}
+
+func assistantEchoedThinking(body map[string]any, want string) bool {
+	messages, ok := body["messages"].([]any)
+	if !ok {
+		return false
+	}
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]any)
+		if !ok || msg["role"] != "assistant" || msg["reasoning_content"] != want {
+			continue
+		}
+		parts, ok := msg["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, part := range parts {
+			item, ok := part.(map[string]any)
+			if ok && item["type"] == "thinking" && item["thinking"] == want {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func TestReasonerRejectsInvalidJSONAfterOneRetry(t *testing.T) {
@@ -380,5 +438,47 @@ func TestReasonerToolErrorRecordedInSteps(t *testing.T) {
 	}
 	if result.Confidence != "high" {
 		t.Fatalf("confidence = %q", result.Confidence)
+	}
+}
+
+func TestReasonerNormalizesEmptyToolArgumentPlaceholder(t *testing.T) {
+	var received string
+	fake := newFakeOpenAIServer(t, func(call int, body map[string]any) map[string]any {
+		if call == 1 {
+			return toolCallResponse("call-placeholder", tools.ToolPromSeriesMeta, `{}{"match":"up"}`)
+		}
+		return chatResponse(validPlanJSON, 30, 12)
+	})
+	registry := tools.NewRegistry()
+	if err := registry.Register(tools.ToolSpec{
+		Name: tools.ToolPromSeriesMeta, Description: "stub", Level: tools.L1ReadOnly,
+		Timeout: 5 * time.Second, MaxOutput: 512,
+		Params: []tools.ParamSpec{{Name: "match", Description: "selector", Required: true}},
+		Handler: func(_ context.Context, raw json.RawMessage) (string, error) {
+			received = string(raw)
+			var args struct {
+				Match string `json:"match"`
+			}
+			if err := json.Unmarshal(raw, &args); err != nil {
+				return "", err
+			}
+			if args.Match != "up" {
+				return "", fmt.Errorf("unexpected match %q", args.Match)
+			}
+			return `{"series":[]}`, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reasoner := testReasoner(t, fake.server.URL, registry)
+	result, err := reasoner.Diagnose(context.Background(), "evidence", "light")
+	if err != nil {
+		t.Fatalf("Diagnose() error = %v", err)
+	}
+	if received != `{"match":"up"}` {
+		t.Fatalf("normalized tool args = %q", received)
+	}
+	if len(result.Steps) != 1 || result.Steps[0].Err != "" {
+		t.Fatalf("steps = %+v", result.Steps)
 	}
 }

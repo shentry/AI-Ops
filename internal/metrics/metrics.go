@@ -76,6 +76,7 @@ const (
 	ApprovalFailedExec = "approval_failed_execution"
 	VerifyPassed       = "verify_passed"
 	VerifyFailed       = "verify_failed"
+	VerifyInconclusive = "verify_inconclusive"
 	EscalationSent     = "escalation_sent"
 	DedupFull          = "dedup_full"
 	MemoryExpired      = "memory_expired"

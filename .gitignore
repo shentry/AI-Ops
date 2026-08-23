@@ -4,9 +4,13 @@ config.yaml
 *.log
 *.out
 *.test
+node_modules/
+/server
 bin/
 dist/
 data/
+!web/dist/
+!web/dist/index.html
 tmp/
 .DS_Store
 refs/

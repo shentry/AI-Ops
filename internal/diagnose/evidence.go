@@ -140,3 +140,13 @@ func missingItem(name, source, reason string) EvidenceItem {
 		Err:         reason,
 	}
 }
+
+// degradedItem 记录"采到了，但数据源本身不健康"：状态是 error，正文保留。
+// finishItem 在有 error 时丢正文，这里不能丢 —— 500 的 /health 响应体和
+// 旁边的指标正是诊断要看的东西，只是状态不能报成 ok。
+func degradedItem(name, source, body string, err error) EvidenceItem {
+	item := finishItem(name, source, body, nil)
+	item.Status = ItemError
+	item.Err = err.Error()
+	return item
+}

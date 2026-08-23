@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
@@ -45,11 +46,16 @@ type DiagnoseResult struct {
 }
 
 // StepLog 记录一次工具调用，供审计回放（GC-18）。
+// 带起止时刻：回放要能回答"这次诊断调了几次工具、每次多久"。
 type StepLog struct {
 	Name   string
 	Input  string
 	Output string
-	Err    string
+	// Truncated is set by the Registry when output was bounded.
+	Truncated  bool
+	Err        string
+	StartedAt  time.Time
+	FinishedAt time.Time
 }
 
 // diagnoseContract 是 LLM 输出 JSON 的解析目标。
@@ -83,6 +89,8 @@ func (r *Reasoner) maxSteps(mode string) int {
 
 // Diagnose 执行一次推理。输出不是合法 JSON 时重试一次，仍失败返回错误；
 // 任何失败都不会产生 Plan 副作用 —— Plan 只是数据，执行决策在 D09+。
+// 失败时返回的 *DiagnoseResult 可能非空（只带 Steps/token，供审计），
+// 调用方必须先判 error 再看内容。
 func (r *Reasoner) Diagnose(ctx context.Context, evidence string, mode string) (*DiagnoseResult, error) {
 	if strings.TrimSpace(evidence) == "" {
 		return nil, errors.New("llm: evidence is empty")
@@ -117,7 +125,7 @@ func (r *Reasoner) Diagnose(ctx context.Context, evidence string, mode string) (
 	}
 	var parseErr *contractError
 	if !errors.As(err, &parseErr) {
-		return nil, err
+		return partialResult(recorder, counter), err
 	}
 	// 解析失败重试一次：明确告诉模型上次输出的问题，仍失败则放弃。
 	// 计数器跨重试累计 —— 第一次烧掉的 token 也是成本。
@@ -127,10 +135,20 @@ func (r *Reasoner) Diagnose(ctx context.Context, evidence string, mode string) (
 	)
 	result, err = r.runOnce(ctx, agent, retryMessages, recorder)
 	if err != nil {
-		return nil, err
+		return partialResult(recorder, counter), err
 	}
 	result.TokensIn, result.TokensOut = counter.in, counter.out
 	return result, nil
+}
+
+// partialResult 是失败时的审计残骸：只有 Steps 和 token 用量有意义，
+// RCA/Plan 一律空。调用方必须先看 error —— 有 error 时这份结果不是结论，
+// 只是"这次失败前调了哪些工具、烧了多少 token"的账（GC-18 要求失败也可回放）。
+func partialResult(recorder *stepRecorder, counter *usageCounter) *DiagnoseResult {
+	if recorder == nil || len(recorder.steps) == 0 {
+		return nil
+	}
+	return &DiagnoseResult{Steps: recorder.steps, TokensIn: counter.in, TokensOut: counter.out}
 }
 
 // runOnce 跑一轮 ReAct 并解析最终输出。
@@ -157,6 +175,9 @@ func (r *Reasoner) runOnce(ctx context.Context, agent *react.Agent, messages []*
 	}, nil
 }
 
+// ErrContractParse classifies model output that violates the response contract.
+var ErrContractParse = errors.New("llm: contract parse failure")
+
 // contractError 是"输出不是合法契约"的错误类型，带原文供重试时回放。
 type contractError struct {
 	raw string
@@ -164,6 +185,7 @@ type contractError struct {
 }
 
 func (e *contractError) Error() string { return e.err.Error() }
+func (e *contractError) Unwrap() error { return ErrContractParse }
 
 // parseContract 剥离 markdown 围栏后按契约解析。字段校验：
 // rca 非空；confidence 限定三档，非法值视为解析失败（宁可重试）。
@@ -246,8 +268,9 @@ func (t *registryTool) Info(_ context.Context) (*schema.ToolInfo, error) {
 }
 
 func (t *registryTool) InvokableRun(ctx context.Context, argumentsInJSON string, _ ...tool.Option) (string, error) {
-	output, err := t.registry.Execute(ctx, t.spec.Name, json.RawMessage(argumentsInJSON))
-	entry := StepLog{Name: t.spec.Name, Input: argumentsInJSON}
+	started := time.Now().UTC()
+	output, metadata, err := executeLLMTool(ctx, t.registry, t.spec.Name, argumentsInJSON)
+	entry := StepLog{Name: t.spec.Name, Input: argumentsInJSON, Truncated: metadata.Truncated, StartedAt: started, FinishedAt: time.Now().UTC()}
 	if err != nil {
 		// 工具失败以观测文本喂回模型，而不是炸掉整个 ReAct 循环：
 		// Prometheus 抖一下不该让这次诊断归零，模型看到失败后

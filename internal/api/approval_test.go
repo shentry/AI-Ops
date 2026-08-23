@@ -5,31 +5,49 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"oncall-agent/internal/store"
 )
 
 type fakeApprovalService struct {
-	decideErr  error
-	decidedIDs []uint64
-	approver   bool
-	operator   string
-	listStatus string
+	decideErr      error
+	decidedIDs     []uint64
+	approver       bool
+	operator       string
+	decisionReason string
+	decisionSource string
+	listStatus     string
+	getID          uint64
+	getErr         error
 }
 
-func (f *fakeApprovalService) Decide(_ context.Context, id uint64, approve bool, decidedBy string) error {
+func (f *fakeApprovalService) Decide(_ context.Context, id uint64, approve bool, decidedBy, decisionReason, decisionSource string) (store.Approval, error) {
 	f.decidedIDs = append(f.decidedIDs, id)
 	f.approver = approve
 	f.operator = decidedBy
-	return f.decideErr
+	f.decisionReason = decisionReason
+	f.decisionSource = decisionSource
+	status := "denied"
+	if approve {
+		status = "approved"
+	}
+	return store.Approval{ID: id, Status: status}, f.decideErr
+}
+
+func (f *fakeApprovalService) Get(_ context.Context, id uint64) (store.Approval, error) {
+	f.getID = id
+	if f.getErr != nil {
+		return store.Approval{}, f.getErr
+	}
+	return store.Approval{ID: id, Status: "pending"}, nil
 }
 
 func (f *fakeApprovalService) List(_ context.Context, status string) ([]store.Approval, error) {
 	f.listStatus = status
 	return []store.Approval{{ID: 1, Status: "pending"}}, nil
 }
-
 func approvalRequest(t *testing.T, api *ApprovalAPI, method, path, token, operator string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(method, path, nil)
@@ -73,7 +91,7 @@ func TestApprovalAPIDecide(t *testing.T) {
 	if resp.Code != http.StatusOK {
 		t.Fatalf("approve = %d, want 200", resp.Code)
 	}
-	if len(svc.decidedIDs) != 1 || svc.decidedIDs[0] != 7 || !svc.approver || svc.operator != "ops-li" {
+	if len(svc.decidedIDs) != 1 || svc.decidedIDs[0] != 7 || !svc.approver || svc.operator != "ops-li" || svc.decisionReason != "" || svc.decisionSource != "api" {
 		t.Fatalf("svc state = %+v", svc)
 	}
 
@@ -110,5 +128,20 @@ func TestApprovalAPIList(t *testing.T) {
 	resp := approvalRequest(t, api, http.MethodGet, "/api/v1/approvals?status=pending", "Bearer secret", "")
 	if resp.Code != http.StatusOK || svc.listStatus != "pending" {
 		t.Fatalf("list = %d, status = %q", resp.Code, svc.listStatus)
+	}
+}
+
+func TestApprovalAPIAllowsAnonymousConsoleDecision(t *testing.T) {
+	svc := &fakeApprovalService{}
+	api := NewApprovalAPI(svc, "secret", NewAnonymousConsoleAuthenticator())
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/approvals/11/approve", strings.NewReader(`{"reason":"public console"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	api.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("anonymous approve = %d body=%s", resp.Code, resp.Body.String())
+	}
+	if svc.operator != "anonymous" || svc.decisionSource != "web" || svc.decisionReason != "public console" {
+		t.Fatalf("anonymous decision = %+v", svc)
 	}
 }

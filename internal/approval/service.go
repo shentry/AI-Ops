@@ -16,8 +16,9 @@ import (
 // approvalStore 是 Service 对存储层的收窄接口。
 type approvalStore interface {
 	CreateApproval(ctx context.Context, approval store.Approval) (store.Approval, error)
+	CreateSystemApprovedApproval(ctx context.Context, approval store.Approval, decidedBy, decisionReason, decisionSource string, now time.Time) (store.Approval, error)
 	GetApproval(ctx context.Context, id uint64) (store.Approval, error)
-	DecideApproval(ctx context.Context, id uint64, status, decidedBy string, now time.Time) error
+	DecideApproval(ctx context.Context, id uint64, status, decidedBy, decisionReason, decisionSource string, now time.Time) (store.Approval, error)
 	ListApprovals(ctx context.Context, status string) ([]store.Approval, error)
 }
 
@@ -48,13 +49,13 @@ func (s *Service) Create(ctx context.Context, incidentID, runID uint64, decision
 }
 
 // Decide 审批或拒绝。幂等语义：已决/已过期 → ErrApprovalConflict；
-// 不存在 → ErrApprovalNotFound。
-func (s *Service) Decide(ctx context.Context, id uint64, approve bool, decidedBy string) error {
+// 不存在 → ErrApprovalNotFound。返回数据库中的审批快照，供 Web/飞书复用。
+func (s *Service) Decide(ctx context.Context, id uint64, approve bool, decidedBy, decisionReason, decisionSource string) (store.Approval, error) {
 	status := "denied"
 	if approve {
 		status = "approved"
 	}
-	return s.db.DecideApproval(ctx, id, status, decidedBy, time.Now().UTC())
+	return s.db.DecideApproval(ctx, id, status, decidedBy, decisionReason, decisionSource, time.Now().UTC())
 }
 
 // ValidateExecution 是执行前的最终闸（GC-13）：
@@ -84,17 +85,22 @@ func (s *Service) List(ctx context.Context, status string) ([]store.Approval, er
 	return s.db.ListApprovals(ctx, status)
 }
 
-// CreateSystemApproved 为自动 L2 路径落"系统批准"的审批单：
-// 执行面只认 approved 单，自动路径也走同一通道，审计链完整。
-// 两步非原子：中间崩溃留下一张 pending 单，由人工兜底，语义安全。
+func (s *Service) Get(ctx context.Context, id uint64) (store.Approval, error) {
+	return s.db.GetApproval(ctx, id)
+}
+
+// CreateSystemApproved 为自动 L2 路径原子落"系统批准"的审批单：
+// 创建、approval.created 和 approval.approved 必须同一事务提交。
 func (s *Service) CreateSystemApproved(ctx context.Context, incidentID, runID uint64, decision Decision, reason string) (store.Approval, error) {
-	created, err := s.Create(ctx, incidentID, runID, decision, reason)
-	if err != nil {
-		return store.Approval{}, err
-	}
-	if err := s.db.DecideApproval(ctx, created.ID, "approved", "system:auto_l2", time.Now().UTC()); err != nil {
-		return store.Approval{}, fmt.Errorf("system approve: %w", err)
-	}
-	created.Status = "approved"
-	return created, nil
+	now := time.Now().UTC()
+	return s.db.CreateSystemApprovedApproval(ctx, store.Approval{
+		IncidentID: incidentID,
+		RunID:      runID,
+		ToolName:   decision.ToolName,
+		ArgsJSON:   datatypes.JSON(decision.Args),
+		Reason:     reason,
+		PlanHash:   decision.PlanHash,
+		ExpiresAt:  now.Add(time.Duration(s.ttlMinutes) * time.Minute),
+		CreatedAt:  now,
+	}, "system:auto_l2", reason, "system", now)
 }

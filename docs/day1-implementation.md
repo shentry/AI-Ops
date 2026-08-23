@@ -136,10 +136,10 @@ func Load(path string) (Config, error)
 4. 递归遍历 YAML 节点中的字符串标量；
 5. 把 `${ENV_NAME}` 替换为环境变量；
 6. 将展开后的节点 decode 到带默认值的 `Config`；
-7. 校验 `mysql.dsn`；
+7. 校验 `mysql.dsn` 与全部数值字段边界；
 8. 返回 `Config` 或错误。
 
-`expandEnvironment()` 在 decode 和 `validate()` 之前执行，因此配置文件中出现的每一个 `${ENV_NAME}` 都必须能由 `os.LookupEnv` 找到；`validate()` 只是在此之后额外校验 `mysql.dsn` 非空。
+`expandEnvironment()` 在 decode 和 `validate()` 之前执行，因此配置文件中出现的每一个 `${ENV_NAME}` 都必须能由 `os.LookupEnv` 找到；`validate()` 在此之后校验 `mysql.dsn` 非空，并逐项校验数值边界（见 5.3）。
 
 使用 YAML 节点而不是直接对整个文件做字符串替换，有两个好处：
 
@@ -204,7 +204,11 @@ notify:
 
 `expandEnvironment()` 会在 `validate()` 之前遍历所有 YAML 字符串，并对每个占位符调用 `os.LookupEnv`。因此直接加载完整的 `config.example.yaml` 时，以下变量都必须存在：`AUTH_TOKEN`、`MYSQL_DSN`、`ARK_KEY`、`CLS_TOPIC`、`MYSQL_RO_DSN`、`IM_WEBHOOK`。任一变量未设置，`Load` 就会返回环境变量错误。
 
-`validate()` 的职责更窄：环境变量展开成功后，它只额外要求 `mysql.dsn` 非空；当前实现不会检查其他字段展开后的内容是否为空。若使用只包含 `mysql.dsn: ${MYSQL_DSN}` 的 D01 最小配置，则只需要提供 `MYSQL_DSN`；这和直接加载包含全部占位符的完整示例不是同一场景。
+`validate()` 的职责：环境变量展开成功后，它要求 `mysql.dsn` 非空，并校验全部数值字段的边界。若使用只包含 `mysql.dsn: ${MYSQL_DSN}` 的 D01 最小配置，则只需要提供 `MYSQL_DSN`；这和直接加载包含全部占位符的完整示例不是同一场景。
+
+数值边界覆盖（写 0 或负数一律启动失败）：`server.port`（1–65535）、`correlate.window_minutes`/`min_alerts`、`diagnose.budget.full_steps`/`light_steps`、`diagnose.evidence.timeout_seconds`/`log_max_lines`、`memory.ttl_seconds`（`cmd_history_inject` 允许 0，不允许负）、`approval.ttl_minutes`/`l2_rate_window_minutes`/`l2_max_per_window`（`verify_delay_seconds` 允许 0，不允许负）、`tools.prometheus.range_minutes`/`max_points`、`tools.docker.restart_max_per_hour`（`restart_min_interval_seconds` 允许 0）、`llm.roles.*.max_tokens`。时长类字段另有上限，防止换算成 `time.Duration` 溢出。
+
+这条边界是后补的：这些字段最初只有默认值没有校验，配置写 0 时的运行时表现是"立即超时 / 审批立即过期 / 跳过 Verify / 诊断没有预算"——全都是静默失效，看日志也看不出是配置写错了。
 
 ### 5.4 配置测试学什么
 
@@ -540,7 +544,7 @@ Docker live 验收已验证：
 - `Config` 结构如何对应 `config.example.yaml`；
 - `defaultConfig()` 为什么在 `Decode` 之前调用；
 - `expandEnvironment()` 如何递归遍历 YAML 节点，并在 `validate()` 前要求所有出现的 `${ENV}` 都能找到；
-- `validate()` 为什么只额外校验 `mysql.dsn` 非空，以及它和完整示例占位符要求的区别。
+- `validate()` 为什么把"密钥必填"交给 `${ENV}` 展开，自己只管 `mysql.dsn` 非空和数值边界。
 
 ### 第三步：从 SQL 反推 Go struct
 

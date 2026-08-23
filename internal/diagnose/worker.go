@@ -52,6 +52,16 @@ func (w *Worker) Start(ctx context.Context) error {
 	if _, _, err := w.db.NextPendingAgentRun(ctx); err != nil {
 		return err
 	}
+	// Reconcile stale runs before the goroutine starts so a restart does not
+	// wait for the first poll cycle (and startup still fails on DB errors).
+	staleBefore := time.Now().UTC().Add(-runningStaleAfter)
+	requeued, err := w.db.RequeueStaleAgentRuns(ctx, staleBefore)
+	if err != nil {
+		return err
+	}
+	if requeued > 0 {
+		w.logger.Printf("diagnose: requeued %d stale running runs", requeued)
+	}
 	go w.consume(ctx)
 	return nil
 }

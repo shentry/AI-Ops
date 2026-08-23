@@ -312,6 +312,40 @@ func (failingVerifier) VerifyAfterExecution(context.Context, uint64, uint64, tim
 	return VerifyOutcome{Passed: false, Detail: "still firing"}
 }
 
+// inconclusiveVerifier 模拟"没能判定"：进程正在关闭、读库失败、
+// 或 incident 没有可复查的成员。
+type inconclusiveVerifier struct{}
+
+func (inconclusiveVerifier) VerifyAfterExecution(context.Context, uint64, uint64, time.Duration) VerifyOutcome {
+	return VerifyOutcome{Inconclusive: true, Detail: "verify canceled before recheck"}
+}
+
+// 不可判定的验证不能被当成失败：既不重诊也不降级记忆，
+// 更不能当成成功写进故障记忆。动作本身已执行，审批仍落 executed。
+func TestExecutorInconclusiveVerifySkipsRetryAndMemory(t *testing.T) {
+	executions := 0
+	fake := newFakeExecStore()
+	fake.add(approvedApproval(1, ""))
+	planJSON := datatypes.JSON([]byte(`{"action":"docker_restart","confidence":"high"}`))
+	fake.runs[2] = store.AgentRun{ID: 2, Mode: "memory_hit", PlanJSON: &planJSON}
+	mem := &fakeMemoryWriter{}
+	retry := &fakeRetry{created: true}
+	executor := NewExecutor(fake, executorTestRegistry(t, &executions), false, 0, inconclusiveVerifier{}, retry, mem, nil)
+	executor.drain(context.Background())
+	if executions != 1 {
+		t.Fatalf("executions = %d, want 1", executions)
+	}
+	if fake.finished[1] != "executed" {
+		t.Fatalf("status = %q, want executed", fake.finished[1])
+	}
+	if len(retry.calls) != 0 {
+		t.Fatalf("retry scheduled on inconclusive verify: %v", retry.calls)
+	}
+	if len(mem.demoted) != 0 || len(mem.committed) != 0 {
+		t.Fatalf("memory touched on inconclusive verify: committed=%v demoted=%v", mem.committed, mem.demoted)
+	}
+}
+
 func TestExecutorToolFailureMarksFailed(t *testing.T) {
 	// target 消失：容器已被删，docker_restart 返回 container not found。
 	// 必须 approval=failed、executed=false、且不触发重诊（执行失败 ≠ verify 失败）。

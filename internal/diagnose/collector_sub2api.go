@@ -40,11 +40,18 @@ func (c *sub2apiCollector) Collect(ctx context.Context, _ Target) EvidenceItem {
 	}
 	var body strings.Builder
 	body.WriteString("health:\n")
-	if err := c.collectHealth(ctx, &body); err != nil {
-		fmt.Fprintf(&body, "  error: %s\n", err)
+	healthErr := c.collectHealth(ctx, &body)
+	if healthErr != nil {
+		fmt.Fprintf(&body, "  error: %s\n", healthErr)
 	}
 	body.WriteString("metrics:\n")
 	c.collectMetrics(ctx, &body)
+	if healthErr != nil {
+		// 采集状态必须跟真实健康状态一致：/health 返回 5xx 或请求失败时
+		// 报 ok 会让下游把故障证据当正常证据读（"网关是好的"），
+		// 那正是诊断最不该有的误导。正文照样保留。
+		return degradedItem(c.Name(), "sub2api:/health + prometheus", body.String(), healthErr)
+	}
 	return finishItem(c.Name(), "sub2api:/health + prometheus", body.String(), nil)
 }
 
@@ -68,6 +75,10 @@ func (c *sub2apiCollector) collectHealth(ctx context.Context, body *strings.Buil
 	excerpt, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 	fmt.Fprintf(body, "  status=%d latency_ms=%d body=%q\n",
 		resp.StatusCode, time.Since(started).Milliseconds(), ToSafeText(string(excerpt)))
+	// 非 2xx 是网关不健康的直接结论，不只是正文里的一个数字。
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("health returned HTTP %d", resp.StatusCode)
+	}
 	return nil
 }
 

@@ -8,12 +8,12 @@ import (
 	"oncall-agent/internal/notify"
 )
 
-// NotifyReporter 把诊断报告适配到 notify.Notifier，并带有限独立重试：
-// 通知失败重试 3 次，仍失败把错误交还 pipeline 记进 step，
-// 但绝不能反过来改变 run 的终态。
+// NotifyReporter adapts a diagnosis report to the provider-neutral notifier.
+// It retries delivery three times, but notification failure never changes the
+// terminal run state; the pipeline records the returned error separately.
 type NotifyReporter struct {
 	Notifier notify.Notifier
-	// BaseURL 是审批 API 的服务地址，渲染审批 curl 用。
+	// BaseURL is retained as a sanitized display field for legacy webhook cards.
 	BaseURL string
 }
 
@@ -22,26 +22,37 @@ func NewNotifyReporter(notifier notify.Notifier, baseURL string) *NotifyReporter
 }
 
 func (r *NotifyReporter) NotifyDiagnosis(ctx context.Context, report DiagnosisReport) error {
-	msg := notify.DiagnosisMessage{
-		IncidentID:     report.IncidentID,
-		RunID:          report.RunID,
-		Mode:           report.Mode,
-		RCA:            report.RCA,
-		Confidence:     report.Confidence,
-		Decision:       report.Decision,
-		Overridden:     report.Overridden,
-		GuardNote:      report.GuardNote,
-		PlanAction:     report.Plan.Action,
-		PlanTarget:     fmt.Sprintf("%s/%s", report.Plan.Target.Kind, report.Plan.Target.Name),
-		PlanReason:     report.Plan.Reason,
-		PolicyDecision: report.PolicyDecision,
-		ApprovalID:     report.ApprovalID,
-		BaseURL:        r.BaseURL,
+	runID := report.RunID
+	payload := map[string]any{
+		"mode":            report.Mode,
+		"rca":             report.RCA,
+		"confidence":      report.Confidence,
+		"decision":        report.Decision,
+		"overridden":      report.Overridden,
+		"guard_note":      report.GuardNote,
+		"plan_action":     report.Plan.Action,
+		"plan_target":     fmt.Sprintf("%s/%s", report.Plan.Target.Kind, report.Plan.Target.Name),
+		"plan_reason":     report.Plan.Reason,
+		"policy_decision": report.PolicyDecision,
+		"plan_hash":       report.PlanHash,
+		"base_url":        r.BaseURL,
+	}
+	notification := notify.Notification{
+		Kind:       notify.NotificationDiagnosisCompleted,
+		IncidentID: report.IncidentID,
+		RunID:      &runID,
+		ApprovalID: report.ApprovalID,
+		Title:      "诊断报告",
+		Summary:    report.RCA,
+		Payload:    payload,
 	}
 	var err error
 	for attempt := range 3 {
-		if err = r.Notifier.Send(ctx, msg); err == nil {
+		if _, err = r.Notifier.Send(ctx, notification); err == nil {
 			return nil
+		}
+		if attempt == 2 {
+			break
 		}
 		select {
 		case <-ctx.Done():

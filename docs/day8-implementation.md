@@ -12,6 +12,7 @@
 - 工具调用经 `registryTool` 适配器执行——仍走 `Registry.Execute`（超时、截断、未注册拒绝不变）；工具失败以 `tool error: ...` 观测文本喂回模型继续推理（不炸掉整个 ReAct 循环），同时记 `StepLog.Err` 供审计；
 - store 新增 `CompleteAgentRun`：RCA/Plan/token/终态落库，终态（succeeded/failed）不可覆盖（审计不可改写）；
 - `tools.ToolSpec` 增加 `Params` 声明，供 Eino function-calling schema；五个已注册工具补齐参数；`prom_series_meta` 的 `match` 兼容字符串与数组两种 LLM 输出。
+- 工具参数兼容：部分 OpenAI 兼容网关会把空对象占位符与真实参数拼接（`{}{...}`）；LLM 适配层只丢弃空对象并保留真实对象，多个非空参数冲突仍 fail-closed，避免误查目标。
 
 ## 2. 边界
 

@@ -6,7 +6,7 @@
 
 ## 1. Day10 做了什么
 
-- `approval.Policy`：Plan.action 必须在工具注册表注册（GC-12，不在名单即拒绝）；按工具 SafetyLevel 分级决策——L1 直接允许、L2 满足 `auto_execute_l2 && !dry_run` 才走自动路径否则降级审批、L3 一律审批、L4 硬拒绝且审批不能解除（GC-10）；
+- `approval.Policy`：Plan.action 必须在工具注册表注册（GC-12，不在名单即拒绝）；按工具 SafetyLevel 分级决策——L1 直接允许、L2 满足**全部七条护栏**才走自动路径否则降级审批、L3 一律审批、L4 硬拒绝且审批不能解除（GC-10）；
 - `plan_hash`（`migrations/003_approval_plan_hash.sql`）：审批单绑定 tool + 规范化 args（target kind/name）的 SHA-256，执行前重算比对（GC-13）；
 - `approval.Service`：Create（pending + TTL）/ Decide（approve|deny，条件更新保证幂等）/ ValidateExecution（approved + 未过期 + hash/args/tool 全等）/ List；
 - `approval.ExpiryWorker`：每分钟 sweep 过期 pending → expired（主动过期，不靠决策时顺带检查）；
@@ -22,9 +22,28 @@
 | 空 / none | — | none |
 | 未注册 | — | denied |
 | 已注册 | L1 | auto_l1（D10 不执行，D11 执行层消费） |
-| 已注册 | L2 | 开关全满足 → auto_l2；任一不满足 → approval |
+| 已注册 | L2 | 七条护栏全满足 → auto_l2；任一不满足 → approval（reason 写明是哪一条） |
 | 已注册 | L3 | approval |
 | 已注册 | L4 | denied（审批不可解除） |
+
+### 2.1 L2 自动执行的七条护栏
+
+设计文档 6.1 要求"L2 自动动作必须同时满足：白名单、真实 target、影响范围受限、限频、全局开关、非 dry-run、可验证"。`Policy.l2Guardrails` 按从便宜到贵的顺序逐条判定，第一条不满足就降级审批，并把护栏名写进 `reason`（审批单上能看出为什么没自动执行）：
+
+| 护栏 | 判定 | 数据来源 |
+|---|---|---|
+| 全局开关 | `approval.auto_execute_l2` 为真 | 配置 |
+| 非 dry-run | `approval.dry_run` 为假 | 配置 |
+| target 完整 | `target.kind` 与 `target.name` 都非空 | Plan（Guard 已先拦过空 target） |
+| 影响范围受限 | target 名不含通配/分隔符、不是 `all`；kind 不在宽范围集合（cluster/host/node/namespace/database/…） | Plan |
+| 白名单 | target 名命中 `tools.docker.allowed_containers`；名单为空则没有任何目标有自动资格（fail closed） | 配置 |
+| target 来源可信 | target 名出现在 incident 告警标签里（`diagnose.KnownTargets`：container/instance/job/pod/service 等键，支持 `host:port` 取主机段） | 告警标签 |
+| 可验证 | incident 有成员告警可复查（Verify 的判定对象） | incident 成员 |
+| 限频 | 同 `plan_hash`（= 同 tool + 同 target）在 `approval.l2_rate_window_minutes` 窗口内进入过执行的次数 < `l2_max_per_window`；计数含 failed（反复失败的重复动作正是要拦的）；计数查不到或没配限频时按超限处理 | `approval` 表 |
+
+V1 的白名单来源是 docker 容器名单——这是目前唯一的 L2 变更目标。接入非 docker 的 L2 工具时，白名单要跟着按工具拆分。
+
+工具层还有一道独立限频（`tools.docker.restart_min_interval_seconds` / `restart_max_per_hour`），即使决策放行或人工审批通过，同一容器的高频重启也会在 handler 里被拒——见 day11。
 
 ## 3. 与 SPEC 的一处偏差
 
@@ -32,7 +51,7 @@ SPEC 写"curl 自带 Bearer token"。实际渲染 `Bearer ${AUTH_TOKEN}` 环境�
 
 ## 4. 测试覆盖
 
-- Policy：九个分支（none/未注册/L1/L2 开关组合/L3/L4）；plan_hash 稳定性与 target 敏感性；
+- Policy：分级分支（none/未注册/L1/L3/L4）、L2 七条护栏各自单独失守都降级审批（含限频到顶、限频查不到 fail closed、没配限频数据源）、`host:port` 来源匹配；plan_hash 稳定性与 target 敏感性；
 - Service：创建 pending + TTL；approve → 重复 409 → deny 已决 409 → 不存在 404；ValidateExecution 全等校验（篡改 hash/args/tool 全拒）、过期拒执；
 - store 集成：条件更新幂等、过期窗口外拒绝、ExpireApprovals sweep（过期 pending 化、已批准不动）、列表过滤；
 - API：401/400（缺 X-Operator）/400（非法 id）/405/approve/deny/409/404/503/列表过滤；

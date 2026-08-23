@@ -1,0 +1,47 @@
+groups:
+  - name: sub2api
+    interval: 10s
+    rules:
+      - alert: Sub2APIDown
+        expr: probe_success{job="sub2api-health"} == 0
+        for: 30s
+        labels:
+          severity: critical
+          service: sub2api
+          container: sub2api
+        annotations:
+          summary: Sub2API health probe failed
+          description: GET {{ $labels.instance }} did not return a healthy status.
+
+      - alert: Sub2APISlow
+        expr: probe_duration_seconds{job="sub2api-health"} > 2
+        for: 1m
+        labels:
+          severity: warning
+          service: sub2api
+          container: sub2api
+        annotations:
+          summary: Sub2API health probe is slow
+          description: Probe duration is {{ $value }}s (threshold 2s).
+
+      - alert: Sub2APIPostgresUnreachable
+        expr: probe_success{job="sub2api-deps",component="postgres"} == 0
+        for: 1m
+        labels:
+          severity: warning
+          service: sub2api
+          component: postgres
+        annotations:
+          summary: Sub2API Postgres probe failed
+          description: TCP probe of {{ $labels.instance }} failed (SSH tunnel or database).
+
+      - alert: Sub2APIRedisUnreachable
+        expr: probe_success{job="sub2api-deps",component="redis"} == 0
+        for: 1m
+        labels:
+          severity: warning
+          service: sub2api
+          component: redis
+        annotations:
+          summary: Sub2API Redis probe failed
+          description: TCP probe of {{ $labels.instance }} failed (SSH tunnel or redis).

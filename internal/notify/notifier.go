@@ -1,5 +1,4 @@
-// Package notify 是通知抽象层（D09）：上层只拼报告内容，
-// provider 差异（wecom/feishu）在实现里各自消化。
+// Package notify defines the provider-neutral notification boundary.
 package notify
 
 import (
@@ -10,113 +9,112 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"oncall-agent/internal/config"
 )
 
-// DiagnosisMessage 是跨 provider 的通知内容载体。
-// 与 diagnose.DiagnosisReport 解耦：notify 不 import diagnose，
-// 避免 diagnose → notify → diagnose 的环。
-type DiagnosisMessage struct {
+// NotificationKind identifies a business notification without exposing a
+// provider-specific rendering contract to callers.
+type NotificationKind string
+
+const (
+	NotificationIncidentFired      NotificationKind = "incident_fired"
+	NotificationDiagnosisCompleted NotificationKind = "diagnosis_completed"
+	NotificationApprovalRequired   NotificationKind = "approval_required"
+	NotificationApprovalDecided    NotificationKind = "approval_decided"
+	NotificationExecutionCompleted NotificationKind = "execution_completed"
+	NotificationVerifyCompleted    NotificationKind = "verify_completed"
+	NotificationEscalationRequired NotificationKind = "escalation_required"
+	NotificationProblemDetected    NotificationKind = "problem_detected"
+)
+
+// Notification is the common fact passed to every delivery provider.
+// Payload contains only kind-specific, already-sanitized display fields.
+type Notification struct {
+	Kind       NotificationKind
 	IncidentID uint64
-	RunID      uint64
-	Mode       string
-	RCA        string
-	Confidence string
-	Decision   string
-	Overridden bool
-	GuardNote  string
-	PlanAction string
-	PlanTarget string
-	PlanReason string
-	// D10：policy 结论与审批单。ApprovalID 非空时卡片附审批 curl。
-	PolicyDecision string
-	ApprovalID     *uint64
-	// BaseURL 是审批 API 的服务地址，由组装层注入。
-	BaseURL string
+	RunID      *uint64
+	ApprovalID *uint64
+	Severity   string
+	Title      string
+	Summary    string
+	Payload    map[string]any
 }
 
-// Notifier 是通知出口。发送失败返回 error，由调用方决定记日志还是重试；
-// 通知永远不能反过来改变诊断终态。
+// Delivery is the stable provider reference returned after a successful send.
+// Webhook providers cannot return a message ID, so MessageID may be empty.
+type Delivery struct {
+	Provider  string
+	MessageID string
+}
+
+// Notifier is the single notification exit. Delivery failures are reported to
+// callers but must never change the terminal state of a diagnosis or action.
 type Notifier interface {
-	Send(ctx context.Context, msg DiagnosisMessage) error
-	// SendEscalation 发高优先级人工升级通知（D12：自动处理失败）。
-	SendEscalation(ctx context.Context, msg EscalationMessage) error
+	Send(context.Context, Notification) (Delivery, error)
 }
 
-// EscalationMessage 是人工升级通知：失败原因 + 完整 run 链。
-type EscalationMessage struct {
-	IncidentID uint64
-	RunIDs     []uint64
-	Reason     string
-}
-
-// NoopNotifier 在 webhook 未配置时使用：记日志，不发外部请求。
+// NoopNotifier is used when no provider is configured.
 type NoopNotifier struct {
 	Logf func(format string, args ...any)
 }
 
-func (n NoopNotifier) Send(_ context.Context, msg DiagnosisMessage) error {
+func (n NoopNotifier) Send(_ context.Context, notification Notification) (Delivery, error) {
 	if n.Logf != nil {
-		n.Logf("notify: webhook not configured, skip incident %d run %d", msg.IncidentID, msg.RunID)
+		n.Logf("notify: provider not configured, skip kind %s incident %d", notification.Kind, notification.IncidentID)
 	}
-	return nil
+	return Delivery{Provider: "noop"}, nil
 }
 
-func (n NoopNotifier) SendEscalation(_ context.Context, msg EscalationMessage) error {
-	if n.Logf != nil {
-		n.Logf("notify: webhook not configured, skip escalation incident %d runs %v", msg.IncidentID, msg.RunIDs)
-	}
-	return nil
-}
-
-// SendEscalation 复用 webhook 通道，升级文案前缀区别于普通报告。
-func (n *WebhookNotifier) SendEscalation(ctx context.Context, msg EscalationMessage) error {
-	return n.sendText(ctx, RenderEscalation(msg))
-}
-
-// RenderEscalation 是人工升级卡片：失败原因 + 完整 run 链。
-func RenderEscalation(msg EscalationMessage) string {
-	var out strings.Builder
-	fmt.Fprintf(&out, "**[AI-Opus][紧急] Incident #%d 需要人工介入**\n", msg.IncidentID)
-	fmt.Fprintf(&out, "> 自动处理失败：%s\n", msg.Reason)
-	fmt.Fprintf(&out, "> 诊断 run 链：%v\n", msg.RunIDs)
-	return out.String()
-}
-
-// WebhookNotifier 通过 IM webhook 发送。进程级复用 HTTP client。
+// WebhookNotifier sends the provider-neutral notification through a legacy
+// WeCom or Feishu custom-bot webhook. The HTTP client is reused process-wide.
 type WebhookNotifier struct {
 	webhook    string
 	provider   string
 	httpClient *http.Client
 }
 
-// NewWebhookNotifier 按 provider 构造。webhook 为空返回错误 ——
-// 调用方应改用 NoopNotifier，不允许"空地址静默发不出去"。
+// NewWebhookNotifier constructs a legacy webhook provider. A blank provider
+// with a non-empty webhook keeps the original WeCom-default configuration
+// compatible. Validation errors never echo a webhook URL or embedded key.
 func NewWebhookNotifier(cfg config.IMConfig) (*WebhookNotifier, error) {
-	if strings.TrimSpace(cfg.Webhook) == "" {
+	webhook := strings.TrimSpace(cfg.Webhook)
+	if webhook == "" {
 		return nil, errors.New("notify: webhook is required")
 	}
-	switch cfg.Provider {
+	provider := strings.ToLower(strings.TrimSpace(cfg.Provider))
+	if provider == "" {
+		provider = "wecom"
+	}
+	switch provider {
 	case "wecom", "feishu":
 	default:
 		return nil, fmt.Errorf("notify: unsupported provider %q", cfg.Provider)
 	}
+	parsed, err := url.ParseRequestURI(webhook)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return nil, errors.New("notify: webhook is invalid")
+	}
 	return &WebhookNotifier{
-		webhook:    cfg.Webhook,
-		provider:   cfg.Provider,
+		webhook:    webhook,
+		provider:   provider,
 		httpClient: &http.Client{Timeout: 10 * time.Second},
 	}, nil
 }
 
-// Send 拼文本并发 webhook。webhook URL 可能含 key，错误文本不回显 URL。
-func (n *WebhookNotifier) Send(ctx context.Context, msg DiagnosisMessage) error {
-	return n.sendText(ctx, RenderMarkdown(msg))
+// Send renders the established Markdown fallback and posts it to the webhook.
+// Webhook URLs frequently contain secret keys, so request errors are reduced to
+// a safe classification instead of wrapping net/http's URL-bearing error.
+func (n *WebhookNotifier) Send(ctx context.Context, notification Notification) (Delivery, error) {
+	if err := n.sendText(ctx, RenderMarkdown(notification)); err != nil {
+		return Delivery{}, err
+	}
+	return Delivery{Provider: n.provider}, nil
 }
 
-// sendText 是两类消息共用的发送路径。
 func (n *WebhookNotifier) sendText(ctx context.Context, markdown string) error {
 	payload, err := n.payload(markdown)
 	if err != nil {
@@ -124,22 +122,25 @@ func (n *WebhookNotifier) sendText(ctx context.Context, markdown string) error {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.webhook, bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("notify: build request: %w", err)
+		return errors.New("notify: build request failed")
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := n.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("notify: send failed: %w", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("notify: send failed: %w", ctxErr)
+		}
+		return errors.New("notify: send failed")
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("notify: webhook returned HTTP %d", resp.StatusCode)
 	}
-	// wecom/feishu 都用 {"errcode":0} 表示成功；非 0 是业务失败。
+	// Legacy WeCom/Feishu webhook acknowledgements use errcode=0. Do not
+	// include errmsg because providers may echo sensitive request material.
 	var ack struct {
-		ErrCode int    `json:"errcode"`
-		ErrMsg  string `json:"errmsg"`
+		ErrCode int `json:"errcode"`
 	}
 	if err := json.Unmarshal(body, &ack); err == nil && ack.ErrCode != 0 {
 		return fmt.Errorf("notify: webhook rejected: errcode=%d", ack.ErrCode)
@@ -147,7 +148,6 @@ func (n *WebhookNotifier) sendText(ctx context.Context, markdown string) error {
 	return nil
 }
 
-// payload 按 provider 拼请求体。wecom 支持 markdown，feishu 用纯文本。
 func (n *WebhookNotifier) payload(markdown string) ([]byte, error) {
 	var body any
 	switch n.provider {
@@ -155,6 +155,8 @@ func (n *WebhookNotifier) payload(markdown string) ([]byte, error) {
 		body = map[string]any{"msgtype": "markdown", "markdown": map[string]any{"content": markdown}}
 	case "feishu":
 		body = map[string]any{"msg_type": "text", "content": map[string]any{"text": markdown}}
+	default:
+		return nil, errors.New("notify: unsupported webhook provider")
 	}
 	encoded, err := json.Marshal(body)
 	if err != nil {
@@ -163,29 +165,132 @@ func (n *WebhookNotifier) payload(markdown string) ([]byte, error) {
 	return encoded, nil
 }
 
-// RenderMarkdown 是诊断报告的卡片文案模板（A8 模板直译的 Go 版）。
-func RenderMarkdown(msg DiagnosisMessage) string {
+// RenderMarkdown preserves the established legacy webhook diagnosis card and
+// supplies a compact fallback for every other notification kind.
+func RenderMarkdown(notification Notification) string {
+	switch notification.Kind {
+	case NotificationDiagnosisCompleted:
+		return renderDiagnosis(notification)
+	case NotificationEscalationRequired:
+		return RenderEscalation(notification)
+	default:
+		return renderGeneric(notification)
+	}
+}
+
+func renderDiagnosis(notification Notification) string {
 	var out strings.Builder
-	fmt.Fprintf(&out, "**[AI-Opus] Incident #%d 诊断报告**\n", msg.IncidentID)
-	fmt.Fprintf(&out, "> run: %d（mode: %s）\n", msg.RunID, msg.Mode)
-	fmt.Fprintf(&out, "> RCA（置信度 %s）：%s\n", msg.Confidence, msg.RCA)
-	if msg.Overridden {
-		fmt.Fprintf(&out, "> ⚠️ Guard 改写了计划：%s\n", msg.GuardNote)
+	fmt.Fprintf(&out, "**[AI-Opus] Incident #%d 诊断报告**\n", notification.IncidentID)
+	runID := uint64(0)
+	if notification.RunID != nil {
+		runID = *notification.RunID
 	}
-	fmt.Fprintf(&out, "> 决策：%s\n", msg.Decision)
-	if msg.PolicyDecision != "" {
-		fmt.Fprintf(&out, "> 执行决策：%s\n", msg.PolicyDecision)
+	mode := payloadString(notification.Payload, "mode")
+	fmt.Fprintf(&out, "> run: %d（mode: %s）\n", runID, mode)
+	rca := payloadString(notification.Payload, "rca")
+	if rca == "" {
+		rca = notification.Summary
 	}
-	if msg.PlanAction != "" && msg.PlanAction != "none" {
-		fmt.Fprintf(&out, "> 建议动作：%s → %s（%s）\n", msg.PlanAction, msg.PlanTarget, msg.PlanReason)
+	fmt.Fprintf(&out, "> RCA（置信度 %s）：%s\n", payloadString(notification.Payload, "confidence"), rca)
+	if payloadBool(notification.Payload, "overridden") {
+		fmt.Fprintf(&out, "> ⚠️ Guard 改写了计划：%s\n", payloadString(notification.Payload, "guard_note"))
 	}
-	// L3 审批卡片：附 approve/deny curl。token 用环境变量占位 ——
-	// 真实凭据不进 IM 通道（GC-19 优先于"自带 token"的便利性）。
-	if msg.ApprovalID != nil {
-		base := strings.TrimRight(msg.BaseURL, "/")
-		fmt.Fprintf(&out, "\n**审批单 #%d（等待审批）**\n", *msg.ApprovalID)
-		fmt.Fprintf(&out, "批准：\n```\ncurl -X POST %s/api/v1/approvals/%d/approve -H 'Authorization: Bearer ${AUTH_TOKEN}' -H 'X-Operator: <你的工号>'\n```\n", base, *msg.ApprovalID)
-		fmt.Fprintf(&out, "拒绝：\n```\ncurl -X POST %s/api/v1/approvals/%d/deny -H 'Authorization: Bearer ${AUTH_TOKEN}' -H 'X-Operator: <你的工号>'\n```\n", base, *msg.ApprovalID)
+	fmt.Fprintf(&out, "> 决策：%s\n", payloadString(notification.Payload, "decision"))
+	if policyDecision := payloadString(notification.Payload, "policy_decision"); policyDecision != "" {
+		fmt.Fprintf(&out, "> 执行决策：%s\n", policyDecision)
+	}
+	planAction := payloadString(notification.Payload, "plan_action")
+	if planAction != "" && planAction != "none" {
+		fmt.Fprintf(&out, "> 建议动作：%s → %s（%s）\n", planAction, payloadString(notification.Payload, "plan_target"), payloadString(notification.Payload, "plan_reason"))
+	}
+	if notification.ApprovalID != nil {
+		base := strings.TrimRight(payloadString(notification.Payload, "base_url"), "/")
+		fmt.Fprintf(&out, "\n**审批单 #%d（等待审批）**\n", *notification.ApprovalID)
+		fmt.Fprintf(&out, "批准：\n```\ncurl -X POST %s/api/v1/approvals/%d/approve -H 'Authorization: Bearer ${AUTH_TOKEN}' -H 'X-Operator: <你的工号>'\n```\n", base, *notification.ApprovalID)
+		fmt.Fprintf(&out, "拒绝：\n```\ncurl -X POST %s/api/v1/approvals/%d/deny -H 'Authorization: Bearer ${AUTH_TOKEN}' -H 'X-Operator: <你的工号>'\n```\n", base, *notification.ApprovalID)
 	}
 	return out.String()
+}
+
+// RenderEscalation is the high-priority legacy webhook card.
+func RenderEscalation(notification Notification) string {
+	var out strings.Builder
+	fmt.Fprintf(&out, "**[AI-Opus][紧急] Incident #%d 需要人工介入**\n", notification.IncidentID)
+	reason := notification.Summary
+	if reason == "" {
+		reason = payloadString(notification.Payload, "reason")
+	}
+	fmt.Fprintf(&out, "> 自动处理失败：%s\n", reason)
+	fmt.Fprintf(&out, "> 诊断 run 链：%v\n", payloadRunIDs(notification.Payload))
+	return out.String()
+}
+
+func renderGeneric(notification Notification) string {
+	var out strings.Builder
+	title := strings.TrimSpace(notification.Title)
+	if title == "" {
+		title = strings.ReplaceAll(string(notification.Kind), "_", " ")
+	}
+	fmt.Fprintf(&out, "**[AI-Opus] %s**\n", title)
+	if notification.IncidentID != 0 {
+		fmt.Fprintf(&out, "> Incident #%d\n", notification.IncidentID)
+	}
+	if notification.RunID != nil {
+		fmt.Fprintf(&out, "> run: %d\n", *notification.RunID)
+	}
+	if notification.ApprovalID != nil {
+		fmt.Fprintf(&out, "> approval: %d\n", *notification.ApprovalID)
+	}
+	if notification.Severity != "" {
+		fmt.Fprintf(&out, "> severity: %s\n", notification.Severity)
+	}
+	if notification.Summary != "" {
+		fmt.Fprintf(&out, "> %s\n", notification.Summary)
+	}
+	return out.String()
+}
+
+func payloadString(payload map[string]any, key string) string {
+	if payload == nil {
+		return ""
+	}
+	value, _ := payload[key].(string)
+	return value
+}
+
+func payloadBool(payload map[string]any, key string) bool {
+	if payload == nil {
+		return false
+	}
+	value, _ := payload[key].(bool)
+	return value
+}
+
+func payloadRunIDs(payload map[string]any) []uint64 {
+	if payload == nil {
+		return nil
+	}
+	if ids, ok := payload["run_ids"].([]uint64); ok {
+		return ids
+	}
+	values, ok := payload["run_ids"].([]any)
+	if !ok {
+		return nil
+	}
+	ids := make([]uint64, 0, len(values))
+	for _, value := range values {
+		switch id := value.(type) {
+		case uint64:
+			ids = append(ids, id)
+		case int:
+			if id >= 0 {
+				ids = append(ids, uint64(id))
+			}
+		case float64:
+			if id >= 0 {
+				ids = append(ids, uint64(id))
+			}
+		}
+	}
+	return ids
 }

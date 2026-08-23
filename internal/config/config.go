@@ -19,7 +19,12 @@ var (
 	unresolvedPattern   = regexp.MustCompile(`\$\{[^}]+\}`)
 )
 
-const maxCorrelateWindowMinutes = (1<<63 - 1) / int64(time.Minute)
+// 时长类配置的上限：换算成 time.Duration 不能溢出 int64 纳秒。
+const (
+	maxCorrelateWindowMinutes = (1<<63 - 1) / int64(time.Minute)
+	maxConfigMinutes          = maxCorrelateWindowMinutes
+	maxConfigSeconds          = (1<<63 - 1) / int64(time.Second)
+)
 
 // Config 对应 config.example.yaml。运行时校验数据库连接和功能参数边界。
 type Config struct {
@@ -33,6 +38,7 @@ type Config struct {
 	Approval  ApprovalConfig  `yaml:"approval"`
 	Tools     ToolsConfig     `yaml:"tools"`
 	Notify    NotifyConfig    `yaml:"notify"`
+	Web       WebConfig       `yaml:"web"`
 }
 
 type ServerConfig struct {
@@ -45,7 +51,15 @@ type MySQLConfig struct {
 }
 
 type LLMConfig struct {
-	Roles LLMRoles `yaml:"roles"`
+	Roles  LLMRoles       `yaml:"roles"`
+	Models []ModelProfile `yaml:"models"`
+}
+
+// ModelProfile is one selectable model from the server-owned allowlist. The
+// endpoint and API key remain role configuration, never browser input.
+type ModelProfile struct {
+	ID       string         `yaml:"id"`
+	Thinking ThinkingConfig `yaml:"thinking"`
 }
 
 type LLMRoles struct {
@@ -54,10 +68,18 @@ type LLMRoles struct {
 }
 
 type RoleConfig struct {
-	BaseURL   string `yaml:"base_url"`
-	APIKey    string `yaml:"api_key"`
-	Model     string `yaml:"model"`
-	MaxTokens int    `yaml:"max_tokens"`
+	BaseURL   string         `yaml:"base_url"`
+	APIKey    string         `yaml:"api_key"`
+	Model     string         `yaml:"model"`
+	MaxTokens int            `yaml:"max_tokens"`
+	Thinking  ThinkingConfig `yaml:"thinking"`
+}
+
+// ThinkingConfig 控制该角色是否向 provider 声明思考模式。
+// 未写 thinking 时 Enabled=false，Factory 会显式发送 thinking.type=disabled。
+type ThinkingConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Effort  string `yaml:"effort"` // 空 | none | low | medium | high
 }
 
 // IngestConfig 给 D03 用。D02 的 ParseWebhook 不读配置，
@@ -113,6 +135,11 @@ type ApprovalConfig struct {
 	DryRun bool `yaml:"dry_run"`
 	// VerifyDelaySeconds 是执行后 Verify 的复查延迟。
 	VerifyDelaySeconds int `yaml:"verify_delay_seconds"`
+	// L2RateWindowMinutes / L2MaxPerWindow 是 L2 自动路径的限频护栏：
+	// 同一 target+action（同 plan_hash）在窗口内最多执行 L2MaxPerWindow 次，
+	// 超限降级审批 —— 自动路径不许无限重复同一个动作。
+	L2RateWindowMinutes int `yaml:"l2_rate_window_minutes"`
+	L2MaxPerWindow      int `yaml:"l2_max_per_window"`
 }
 
 type ToolsConfig struct {
@@ -125,8 +152,12 @@ type ToolsConfig struct {
 // DockerToolsConfig 是 Docker 变更动作的配置。
 // AllowedContainers 是 docker_restart 的目标白名单（GC-11/GC-12）：
 // 空列表 = 没有可重启目标，一切重启请求被拒。
+// 两个限频字段是工具层的兜底护栏：即使上游决策放行，同一容器也不能
+// 被高频重启（对应设计"同一 target/action 在时间窗口内限制执行次数"）。
 type DockerToolsConfig struct {
-	AllowedContainers []string `yaml:"allowed_containers"`
+	AllowedContainers         []string `yaml:"allowed_containers"`
+	RestartMinIntervalSeconds int      `yaml:"restart_min_interval_seconds"`
+	RestartMaxPerHour         int      `yaml:"restart_max_per_hour"`
 }
 
 type PrometheusConfig struct {
@@ -151,8 +182,35 @@ type NotifyConfig struct {
 }
 
 type IMConfig struct {
-	Provider string `yaml:"provider"`
-	Webhook  string `yaml:"webhook"`
+	Provider string       `yaml:"provider"`
+	Webhook  string       `yaml:"webhook"`
+	Feishu   FeishuConfig `yaml:"feishu"`
+}
+
+// FeishuConfig contains enterprise-app credentials and callback settings.
+// Secret values are supplied through environment expansion, never defaults.
+type FeishuConfig struct {
+	AppID             string `yaml:"app_id"`
+	AppSecret         string `yaml:"app_secret"`
+	VerificationToken string `yaml:"verification_token"`
+	EncryptKey        string `yaml:"encrypt_key"`
+	ChatID            string `yaml:"chat_id"`
+	WebBaseURL        string `yaml:"web_base_url"`
+}
+
+// WebConfig controls the browser control-room surface. The console is public
+// when base_url, a legacy session/trusted field, or feishu_app enables it;
+// session fields are retained for compatible configuration files but are not
+// required by the anonymous console.
+type WebConfig struct {
+	BaseURL           string   `yaml:"base_url"`
+	SessionSecret     string   `yaml:"session_secret"`
+	SessionTTLMinutes int      `yaml:"session_ttl_minutes"`
+	CookieSecure      bool     `yaml:"cookie_secure"`
+	OperatorAllowlist []string `yaml:"operator_allowlist"`
+	// TrustedOperator remains an opt-in switch for deployments that already use
+	// this field. Its value is not used as an authenticated identity anymore.
+	TrustedOperator string `yaml:"trusted_operator"`
 }
 
 // Load 读 YAML、展开 ${ENV}、套上非敏感默认值，再校验必填项和数值边界。
@@ -178,6 +236,7 @@ func Load(path string) (Config, error) {
 	if err := document.Decode(&cfg); err != nil {
 		return Config{}, fmt.Errorf("config: decode YAML: %w", err)
 	}
+	normalizeLLMModels(&cfg)
 	if err := validate(cfg); err != nil {
 		return Config{}, err
 	}
@@ -223,16 +282,42 @@ func defaultConfig() Config {
 			OnlyHighConfidence: true,
 			CmdHistoryInject:   5,
 		},
-		Approval: ApprovalConfig{TTLMinutes: 30, DryRun: true, VerifyDelaySeconds: 30},
+		Approval: ApprovalConfig{
+			TTLMinutes: 30, DryRun: true, VerifyDelaySeconds: 30,
+			L2RateWindowMinutes: 60, L2MaxPerWindow: 1,
+		},
 		Tools: ToolsConfig{
 			Prometheus: PrometheusConfig{
-				BaseURL:      "http://127.0.0.1:9090",
+				BaseURL: "http://127.0.0.1:9090",
+
 				RangeMinutes: 15,
 				MaxPoints:    300,
 			},
-			Logs: LogsConfig{Provider: "cls"},
+			Logs:   LogsConfig{Provider: "cls"},
+			Docker: DockerToolsConfig{RestartMinIntervalSeconds: 60, RestartMaxPerHour: 3},
 		},
+		Web: WebConfig{SessionTTLMinutes: 480, CookieSecure: true},
 	}
+}
+
+func normalizeLLMModels(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	for index := range cfg.LLM.Models {
+		cfg.LLM.Models[index].ID = strings.TrimSpace(cfg.LLM.Models[index].ID)
+	}
+	if len(cfg.LLM.Models) != 0 {
+		return
+	}
+	defaultModel := strings.TrimSpace(cfg.LLM.Roles.Reasoner.Model)
+	if defaultModel == "" {
+		return
+	}
+	cfg.LLM.Models = []ModelProfile{{
+		ID:       defaultModel,
+		Thinking: cfg.LLM.Roles.Reasoner.Thinking,
+	}}
 }
 
 // expandEnvironment 只走 YAML 字符串标量，注释和类型值不动。
@@ -267,9 +352,14 @@ func expandEnvironment(node *yaml.Node) error {
 }
 
 // validate 是启动前的 fail-fast 关口。
+// 数值边界一律在这里挡住：0 或负数会在运行时变成"立即超时"、"审批立即过期"、
+// "跳过 Verify"这类静默失效行为 —— 那时候没人看得出是配置写错了。
 func validate(cfg Config) error {
 	if strings.TrimSpace(cfg.MySQL.DSN) == "" {
 		return fmt.Errorf("config: mysql.dsn is required; set MYSQL_DSN or mysql.dsn")
+	}
+	if cfg.Server.Port < 1 || cfg.Server.Port > 65535 {
+		return fmt.Errorf("config: server.port must be between 1 and 65535")
 	}
 	if cfg.Correlate.WindowMinutes <= 0 {
 		return fmt.Errorf("config: correlate.window_minutes must be greater than zero")
@@ -279,6 +369,188 @@ func validate(cfg Config) error {
 	}
 	if cfg.Correlate.MinAlerts < 1 {
 		return fmt.Errorf("config: correlate.min_alerts must be at least 1")
+	}
+	if err := validatePositiveMinutes("approval.ttl_minutes", cfg.Approval.TTLMinutes); err != nil {
+		return err
+	}
+	// Verify 延迟允许 0（立即复查，单测和演示用），负数不允许 —— 负延迟会
+	// 静默跳过"给系统留出自愈时间"这一步。
+	if err := validateNonNegativeSeconds("approval.verify_delay_seconds", cfg.Approval.VerifyDelaySeconds); err != nil {
+		return err
+	}
+	if err := validatePositiveMinutes("approval.l2_rate_window_minutes", cfg.Approval.L2RateWindowMinutes); err != nil {
+		return err
+	}
+	if cfg.Approval.L2MaxPerWindow < 1 {
+		return fmt.Errorf("config: approval.l2_max_per_window must be at least 1")
+	}
+	if err := validatePositiveSeconds("diagnose.evidence.timeout_seconds", cfg.Diagnose.Evidence.TimeoutSeconds); err != nil {
+		return err
+	}
+	if cfg.Diagnose.Evidence.LogMaxLines < 1 {
+		return fmt.Errorf("config: diagnose.evidence.log_max_lines must be at least 1")
+	}
+	if cfg.Diagnose.Budget.FullSteps < 1 {
+		return fmt.Errorf("config: diagnose.budget.full_steps must be at least 1")
+	}
+	if cfg.Diagnose.Budget.LightSteps < 1 {
+		return fmt.Errorf("config: diagnose.budget.light_steps must be at least 1")
+	}
+	if err := validatePositiveSeconds("memory.ttl_seconds", cfg.Memory.TTLSeconds); err != nil {
+		return err
+	}
+	if cfg.Memory.CmdHistoryInject < 0 {
+		return fmt.Errorf("config: memory.cmd_history_inject must not be negative")
+	}
+	if cfg.Tools.Prometheus.RangeMinutes < 1 {
+		return fmt.Errorf("config: tools.prometheus.range_minutes must be at least 1")
+	}
+	if cfg.Tools.Prometheus.MaxPoints < 1 {
+		return fmt.Errorf("config: tools.prometheus.max_points must be at least 1")
+	}
+	if err := validateNonNegativeSeconds("tools.docker.restart_min_interval_seconds", cfg.Tools.Docker.RestartMinIntervalSeconds); err != nil {
+		return err
+	}
+	if cfg.Tools.Docker.RestartMaxPerHour < 1 {
+		return fmt.Errorf("config: tools.docker.restart_max_per_hour must be at least 1")
+	}
+	if cfg.LLM.Roles.Reasoner.MaxTokens < 1 {
+		return fmt.Errorf("config: llm.roles.reasoner.max_tokens must be at least 1")
+	}
+	if cfg.LLM.Roles.Summarizer.MaxTokens < 1 {
+		return fmt.Errorf("config: llm.roles.summarizer.max_tokens must be at least 1")
+	}
+	if err := validateThinking("reasoner", cfg.LLM.Roles.Reasoner.Thinking); err != nil {
+		return err
+	}
+	if err := validateThinking("summarizer", cfg.LLM.Roles.Summarizer.Thinking); err != nil {
+		return err
+	}
+	if err := validateModelProfiles(cfg.LLM); err != nil {
+		return err
+	}
+	provider := strings.ToLower(strings.TrimSpace(cfg.Notify.IM.Provider))
+	switch provider {
+	case "", "wecom", "feishu":
+		// Empty provider and legacy webhook providers remain compatible.
+	case "feishu_app":
+		f := cfg.Notify.IM.Feishu
+		missing := make([]string, 0, 6)
+		if strings.TrimSpace(f.AppID) == "" {
+			missing = append(missing, "app_id")
+		}
+		if strings.TrimSpace(f.AppSecret) == "" {
+			missing = append(missing, "app_secret")
+		}
+		if strings.TrimSpace(f.VerificationToken) == "" {
+			missing = append(missing, "verification_token")
+		}
+		if strings.TrimSpace(f.EncryptKey) == "" {
+			missing = append(missing, "encrypt_key")
+		}
+		if strings.TrimSpace(f.ChatID) == "" {
+			missing = append(missing, "chat_id")
+		}
+		if strings.TrimSpace(f.WebBaseURL) == "" {
+			missing = append(missing, "web_base_url")
+		}
+		if len(missing) != 0 {
+			return fmt.Errorf("config: notify.im.feishu_app requires %s", strings.Join(missing, ", "))
+		}
+	default:
+		return fmt.Errorf("config: notify.im.provider %q is unsupported", cfg.Notify.IM.Provider)
+	}
+
+	// The Web console is anonymous; session fields remain accepted only for
+	// compatibility with older configurations and are no longer required.
+	if strings.TrimSpace(cfg.Web.SessionSecret) != "" {
+		if len([]byte(cfg.Web.SessionSecret)) < 32 {
+			return fmt.Errorf("config: web.session_secret must be at least 32 bytes")
+		}
+		if err := validatePositiveMinutes("web.session_ttl_minutes", cfg.Web.SessionTTLMinutes); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateThinking(role string, cfg ThinkingConfig) error {
+	return validateThinkingField("llm.roles."+role+".thinking", cfg)
+}
+
+func validateModelProfiles(cfg LLMConfig) error {
+	selected := strings.TrimSpace(cfg.Roles.Reasoner.Model)
+	seen := make(map[string]struct{}, len(cfg.Models))
+	selectedAllowed := selected == ""
+	for index, profile := range cfg.Models {
+		id := strings.TrimSpace(profile.ID)
+		if id == "" {
+			return fmt.Errorf("config: llm.models[%d].id is required", index)
+		}
+		if len([]rune(id)) > 128 {
+			return fmt.Errorf("config: llm.models[%d].id is too long", index)
+		}
+		if _, exists := seen[id]; exists {
+			return fmt.Errorf("config: llm.models contains duplicate id %q", id)
+		}
+		seen[id] = struct{}{}
+		if id == selected {
+			selectedAllowed = true
+		}
+		if err := validateThinkingField(fmt.Sprintf("llm.models[%d].thinking", index), profile.Thinking); err != nil {
+			return err
+		}
+	}
+	if !selectedAllowed {
+		return fmt.Errorf("config: llm.roles.reasoner.model %q is not in llm.models", selected)
+	}
+	return nil
+}
+
+func validateThinkingField(field string, cfg ThinkingConfig) error {
+	effort := strings.ToLower(strings.TrimSpace(cfg.Effort))
+	switch effort {
+	case "", "none", "low", "medium", "high":
+	default:
+		return fmt.Errorf("config: %s.effort must be none, low, medium, or high", field)
+	}
+	if cfg.Enabled && effort == "none" {
+		return fmt.Errorf("config: %s.effort cannot be none when thinking is enabled", field)
+	}
+	if !cfg.Enabled && effort != "" && effort != "none" {
+		return fmt.Errorf("config: %s.effort must be none, low, medium, or high", field)
+	}
+	return nil
+}
+
+// validatePositiveMinutes / validatePositiveSeconds / validateNonNegativeSeconds
+// 是时长类字段的统一边界：既挡 0 和负数，也挡换算成 Duration 会溢出的巨值。
+func validatePositiveMinutes(field string, minutes int) error {
+	if minutes < 1 {
+		return fmt.Errorf("config: %s must be greater than zero", field)
+	}
+	if int64(minutes) > maxConfigMinutes {
+		return fmt.Errorf("config: %s is too large", field)
+	}
+	return nil
+}
+
+func validatePositiveSeconds(field string, seconds int) error {
+	if seconds < 1 {
+		return fmt.Errorf("config: %s must be greater than zero", field)
+	}
+	if int64(seconds) > maxConfigSeconds {
+		return fmt.Errorf("config: %s is too large", field)
+	}
+	return nil
+}
+
+func validateNonNegativeSeconds(field string, seconds int) error {
+	if seconds < 0 {
+		return fmt.Errorf("config: %s must not be negative", field)
+	}
+	if int64(seconds) > maxConfigSeconds {
+		return fmt.Errorf("config: %s is too large", field)
 	}
 	return nil
 }

@@ -34,15 +34,14 @@ func (f *fakeRetryStore) GetAgentRun(_ context.Context, id uint64) (store.AgentR
 	return store.AgentRun{}, fmt.Errorf("store: agent run %d not found", id)
 }
 
-func (f *fakeRetryStore) HasActiveRun(context.Context, uint64) (bool, error) {
-	return f.hasActive, nil
-}
-
-func (f *fakeRetryStore) CreateAgentRun(_ context.Context, run store.AgentRun) (store.AgentRun, error) {
+func (f *fakeRetryStore) CreateRetryAgentRun(_ context.Context, run store.AgentRun, _ string) (store.AgentRun, bool, error) {
+	if f.hasActive {
+		return store.AgentRun{}, false, nil
+	}
 	run.ID = uint64(len(f.runs) + len(f.created) + 1)
 	f.created = append(f.created, run)
 	f.runs[run.ID] = run
-	return run, nil
+	return run, true, nil
 }
 
 func (f *fakeRetryStore) ListIncidentRunIDs(context.Context, uint64) ([]uint64, error) {
@@ -55,13 +54,13 @@ func (f *fakeRetryStore) ListIncidentRunIDs(context.Context, uint64) ([]uint64, 
 
 type fakeEscalationNotifier struct {
 	calls    int
-	messages []notify.EscalationMessage
+	messages []notify.Notification
 }
 
-func (f *fakeEscalationNotifier) SendEscalation(_ context.Context, msg notify.EscalationMessage) error {
+func (f *fakeEscalationNotifier) Send(_ context.Context, msg notify.Notification) (notify.Delivery, error) {
 	f.calls++
 	f.messages = append(f.messages, msg)
-	return nil
+	return notify.Delivery{Provider: "fake"}, nil
 }
 
 func TestScheduleRetryCreatesRetryOfRun(t *testing.T) {
@@ -118,7 +117,8 @@ func TestScheduleRetryEscalatesAfterChainBudget(t *testing.T) {
 		t.Fatalf("escalations = %d, want 1", notifier.calls)
 	}
 	msg := notifier.messages[0]
-	if msg.IncidentID != 7 || len(msg.RunIDs) != 3 || msg.Reason == "" {
+	runIDs, _ := msg.Payload["run_ids"].([]uint64)
+	if msg.IncidentID != 7 || len(runIDs) != 3 || msg.Summary == "" || msg.Kind != notify.NotificationEscalationRequired {
 		t.Fatalf("escalation = %+v", msg)
 	}
 }
@@ -151,7 +151,7 @@ func TestPipelineInjectsRetryContext(t *testing.T) {
 	verifyOutput := datatypes.JSON(`"passed=false detail=1/2 members still firing"`)
 	db.steps = append(db.steps, store.AgentRunStep{RunID: 10, Seq: 90, Kind: "verify", Name: "last_alert_recheck", OutputJSON: &verifyOutput})
 	reasoner := &fakeReasoner{result: &llm.DiagnoseResult{RCA: "新结论", Confidence: "medium"}}
-	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, reasoner, allowPolicy, &fakeApprovals{}, &fakeReporter{}, nil, 0)
+	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, reasoner, allowPolicy(), &fakeApprovals{}, &fakeReporter{}, nil, 0)
 	retryOf := uint64(10)
 	run := store.AgentRun{ID: 11, IncidentID: 7, Mode: "full", Status: "running", RetryOf: &retryOf}
 	if err := pipeline.Run(context.Background(), run); err != nil {

@@ -1,5 +1,5 @@
-# D01 本地依赖。server 不进 Compose，跑在宿主机上，通过 localhost:3306 连 MySQL。
-# Alertmanager 往 host.docker.internal:8080 推 webhook。
+# 本地依赖。server 跑在宿主机上，通过 localhost:3306 连 MySQL。
+# Alertmanager 往 host.docker.internal:18080 推 webhook（与 config.yaml server.port 一致）。
 services:
   mysql:
     image: mysql:8.0
@@ -22,20 +22,47 @@ services:
     image: prom/prometheus:v2.54.1
     ports:
       - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+      - --web.console.templates=/usr/share/prometheus/consoles
+      - --web.external-url=http://127.0.0.1:9090
+      - --web.enable-lifecycle
+    depends_on:
+      - alertmanager
+      - blackbox
 
   alertmanager:
     image: prom/alertmanager:v0.27.0
     ports:
       - "9093:9093"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
       - alertmanager-data:/alertmanager
     command:
       - --config.file=/etc/alertmanager/alertmanager.yml
       - --storage.path=/alertmanager
+      - --web.external-url=http://127.0.0.1:9093
+
+  blackbox:
+    image: prom/blackbox-exporter:v0.25.0
+    ports:
+      - "9115:9115"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./blackbox.yml:/config/blackbox.yml:ro
+    command:
+      - --config.file=/config/blackbox.yml
 
   node-exporter:
     image: prom/node-exporter:v1.8.2

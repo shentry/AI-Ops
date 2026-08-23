@@ -13,6 +13,8 @@ import (
 	"time"
 )
 
+const executionResultMaxRunes = 4096
+
 // execStore 是执行器对存储层的收窄接口。
 type execStore interface {
 	NextApprovedApproval(ctx context.Context, now time.Time) (store.Approval, bool, error)
@@ -43,9 +45,12 @@ type memoryWriter interface {
 }
 
 // VerifyOutcome 与 diagnose.VerifyResult 同构，避免 approval → diagnose 依赖。
+// Inconclusive = 没能判定（取消、读库失败、无可复查对象）：既不算成功也不算失败，
+// 不触发记忆提交/降级和重诊，只记录并等人工核查。
 type VerifyOutcome struct {
-	Passed bool
-	Detail string
+	Passed       bool
+	Inconclusive bool
+	Detail       string
 }
 
 // Executor 消费 approved 审批单：领取 → 校验 → 执行 → 回写 → 记忆 → 验证。
@@ -138,8 +143,11 @@ func (e *Executor) executeOne(ctx context.Context, approval store.Approval) {
 		output, execErr = e.registry.Execute(ctx, approval.ToolName, json.RawMessage(approval.ArgsJSON))
 	}
 
+	// Registry.Execute normally enforces each tool's MaxOutput. Keep the
+	// approval result bounded as a second boundary before it reaches the store,
+	// including dry-run and custom registry implementations.
 	resultJSON, _ := json.Marshal(map[string]any{
-		"output":   output,
+		"output":   tools.Truncate(output, executionResultMaxRunes),
 		"dry_run":  e.dryRun,
 		"tool":     approval.ToolName,
 		"executed": execErr == nil,
@@ -152,12 +160,20 @@ func (e *Executor) executeOne(ctx context.Context, approval store.Approval) {
 	// 独立验证（GC-15）。dry_run 没有真实变更，跳过验证。
 	if !e.dryRun && e.verify != nil {
 		result := e.verify.VerifyAfterExecution(ctx, approval.RunID, approval.IncidentID, e.verifyDelay)
-		e.logger.Printf("executor: verify approval %d: passed=%v %s", approval.ID, result.Passed, result.Detail)
-		metrics.Inc(map[bool]string{true: metrics.VerifyPassed, false: metrics.VerifyFailed}[result.Passed])
-		if result.Passed {
+		e.logger.Printf("executor: verify approval %d: passed=%v inconclusive=%v %s",
+			approval.ID, result.Passed, result.Inconclusive, result.Detail)
+		switch {
+		case result.Inconclusive:
+			// 不可判定不进记忆、不重诊：动作已经执行，恢复情况未知，
+			// 只能留痕等人工核查（step 由 Verifier 落库）。
+			metrics.Inc(metrics.VerifyInconclusive)
+			e.logger.Printf("executor: approval %d executed but verification is inconclusive; manual check required", approval.ID)
+		case result.Passed:
+			metrics.Inc(metrics.VerifyPassed)
 			// D13：验证成功且够格的案例写入故障记忆。
 			e.maybeCommitMemory(ctx, approval)
-		} else {
+		default:
+			metrics.Inc(metrics.VerifyFailed)
 			// D13：memory_hit 验证失败 → 记忆降级拉黑（防循环命中）。
 			e.demoteMemoryIfHit(ctx, approval)
 			// D12：Verify 失败 → 有限重诊或升级人工。
@@ -257,7 +273,7 @@ func (e *Executor) demoteMemoryIfHit(ctx context.Context, approval store.Approva
 
 func (e *Executor) finishWithError(ctx context.Context, approval store.Approval, resultJSON []byte, message string) {
 	if len(resultJSON) == 0 {
-		resultJSON, _ = json.Marshal(map[string]any{"error": message})
+		resultJSON, _ = json.Marshal(map[string]any{"error": tools.Truncate(message, executionResultMaxRunes)})
 	}
 	if err := e.db.FinishApprovalExecution(ctx, approval.ID, "failed", resultJSON); err != nil {
 		e.logger.Printf("executor: mark %d failed: %v (cause: %s)", approval.ID, err, message)

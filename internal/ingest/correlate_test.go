@@ -59,6 +59,18 @@ func (r *recordingIncidentTx) EnqueueAgentRun(context.Context, store.AgentRun) e
 	return nil
 }
 
+func (r *recordingIncidentTx) AppendIncidentEvent(_ context.Context, event store.IncidentEvent) (store.IncidentEvent, error) {
+	return event, nil
+}
+
+func (r *recordingIncidentTx) OpenIncidentProblem(_ context.Context, problem store.IncidentProblem) (store.IncidentProblem, error) {
+	return problem, nil
+}
+
+func (r *recordingIncidentTx) ResolveIncidentProblem(context.Context, uint64, string, *uint64, time.Time) (bool, error) {
+	return false, nil
+}
+
 func TestCorrelatorAssignForwardsNormalizedAlert(t *testing.T) {
 	observedAt := time.Date(2026, 8, 18, 10, 0, 0, 0, time.UTC)
 	tx := &recordingIncidentTx{}

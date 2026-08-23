@@ -1,7 +1,8 @@
-# D01 示例。占位符是必填环境变量引用，不是可选项。
-# 加载整份文件需要 AUTH_TOKEN、MYSQL_DSN、ARK_KEY、CLS_TOPIC、MYSQL_RO_DSN、IM_WEBHOOK。
-# 最小配置只写 mysql.dsn 时，只需 MYSQL_DSN。
-# D01 的 validate() 只在展开后 mysql.dsn 仍为空时启动失败。
+# D01 示例。敏感值使用 ${ENV} 占位符；IM webhook 可选，Web 控制台为公开操作面。
+# 最小配置只写 mysql.dsn 时只需 MYSQL_DSN；配置 web.base_url 后启用匿名控制台。
+# validate() 除了要求 mysql.dsn 非空，还会校验全部数值字段的边界。
+# （超时、TTL、Verify 延迟、诊断预算、限频等）：写 0 或负数直接启动失败，
+# 不留"立即超时 / 审批立即过期 / 跳过 Verify"这类静默失效。
 server:
   port: 8080
   auth_token: "${AUTH_TOKEN}"
@@ -12,13 +13,22 @@ llm:
     reasoner:
       base_url: "https://api.delean.ai/v1"
       api_key: "${ARK_KEY}"
-      model: "deepseek-v4-pro"
-      max_tokens: 2048
+      model: "glm-5"
+      max_tokens: 8192
+      thinking:
+        enabled: false
     summarizer:
       base_url: "https://api.delean.ai/v1"
       api_key: "${ARK_KEY}"
-      model: "deepseek-v4-pro"
-      max_tokens: 1024
+      model: "glm-5"
+      max_tokens: 4096
+      thinking:
+        enabled: false
+  # 运行时切换只能从此 allowlist 选择；不要加入未获账号组授权的模型。
+  models:
+    - id: "glm-5"
+      thinking:
+        enabled: false
 ingest:
   fingerprint_fields: []
   severity_label: severity
@@ -56,9 +66,16 @@ approval:
   auto_execute_l2: false
   dry_run: true
   verify_delay_seconds: 30
+  # L2 自动路径限频：同一 target+action 在窗口内最多自动执行 l2_max_per_window 次，
+  # 超限降级为人工审批。
+  l2_rate_window_minutes: 60
+  l2_max_per_window: 1
 tools:
   docker:
     allowed_containers: [sub2api]
+    # 工具层兜底限频：即使决策放行，同一容器也不能被高频重启。
+    restart_min_interval_seconds: 60
+    restart_max_per_hour: 3
   prometheus:
     base_url: "http://127.0.0.1:9090"
     range_minutes: 15
@@ -72,5 +89,23 @@ tools:
     dsn: "${MYSQL_RO_DSN}"
 notify:
   im:
-    provider: wecom
-    webhook: "${IM_WEBHOOK}"
+    # Supported: "" (disabled), wecom/feishu webhook, or feishu_app.
+    provider: ""
+    # Optional legacy webhook; leave empty unless provider is enabled.
+    webhook: ""
+    # feishu_app configuration (all fields are required when selected):
+    # feishu:
+    #   app_id: "${FEISHU_APP_ID}"
+    #   app_secret: "${FEISHU_APP_SECRET}"
+    #   verification_token: "${FEISHU_VERIFICATION_TOKEN}"
+    #   encrypt_key: "${FEISHU_ENCRYPT_KEY}"
+    #   chat_id: "${FEISHU_CHAT_ID}"
+    #   web_base_url: "https://oncall.example.com"
+web:
+  base_url: "http://127.0.0.1:8080"  # 非空即启用公开控制台
+  # 以下字段仅为旧配置兼容，不再参与控制台登录或写操作鉴权。
+  session_secret: ""
+  session_ttl_minutes: 480
+  cookie_secure: false
+  operator_allowlist: []
+  trusted_operator: "oncall"

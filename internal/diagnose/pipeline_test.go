@@ -36,6 +36,10 @@ func (f *fakeRunStore) AppendRunStep(_ context.Context, step store.AgentRunStep)
 	return nil
 }
 
+func (f *fakeRunStore) AppendRunStepRecord(ctx context.Context, record store.RunStepRecord) error {
+	return f.AppendRunStep(ctx, record.Step)
+}
+
 func (f *fakeRunStore) CompleteAgentRun(_ context.Context, id uint64, rca string, _ []byte, tokensIn, _ int, status string, _ time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -43,6 +47,14 @@ func (f *fakeRunStore) CompleteAgentRun(_ context.Context, id uint64, rca string
 	f.completeRCA[id] = rca
 	f.tokensIn[id] = tokensIn
 	return nil
+}
+
+func (f *fakeRunStore) CompleteRun(ctx context.Context, completion store.RunCompletion) error {
+	return f.CompleteAgentRun(ctx, completion.RunID, completion.RCA, completion.PlanJSON, completion.TokensIn, completion.TokensOut, completion.Status, completion.FinishedAt)
+}
+
+func (f *fakeRunStore) AppendIncidentEvent(_ context.Context, event store.IncidentEvent) (store.IncidentEvent, error) {
+	return event, nil
 }
 
 func (f *fakeRunStore) GetAgentRun(_ context.Context, id uint64) (store.AgentRun, error) {
@@ -112,12 +124,16 @@ func (f *fakeReporter) NotifyDiagnosis(context.Context, DiagnosisReport) error {
 	return f.err
 }
 
-// fakePolicy 固定返回一个决策；fakeApprovals 记录创建的审批单。
+// fakePolicy 固定返回一个决策，并记下收到的 PolicyInput（护栏事实输入）。
 type fakePolicy struct {
-	decision approval.Decision
+	decision  approval.Decision
+	lastInput *approval.PolicyInput
 }
 
-func (f fakePolicy) Decide(llm.Plan) approval.Decision { return f.decision }
+func (f *fakePolicy) Decide(_ context.Context, _ llm.Plan, input approval.PolicyInput) approval.Decision {
+	f.lastInput = &input
+	return f.decision
+}
 
 type fakeApprovals struct {
 	created []store.Approval
@@ -144,7 +160,9 @@ func (f *fakeApprovals) CreateSystemApproved(ctx context.Context, incidentID, ru
 }
 
 // allowPolicy 是默认策略桩：全部放行（决策 none）。
-var allowPolicy = fakePolicy{decision: approval.Decision{Kind: approval.DecisionNone, Reason: "no action"}}
+func allowPolicy() *fakePolicy {
+	return &fakePolicy{decision: approval.Decision{Kind: approval.DecisionNone, Reason: "no action"}}
+}
 
 func testEvidence() Evidence {
 	return Evidence{IncidentID: 7, Items: []EvidenceItem{{Name: "snapshot", Source: "mysql", Status: ItemOK, Body: "data"}}}
@@ -157,7 +175,7 @@ func TestPipelineRunSucceedsWithSteps(t *testing.T) {
 		Plan: llm.Plan{Action: "restart_container", Target: llm.PlanTarget{Kind: "container", Name: "sub2api"}},
 	}}
 	reporter := &fakeReporter{}
-	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, reasoner, allowPolicy, &fakeApprovals{}, reporter, nil, 0)
+	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, reasoner, allowPolicy(), &fakeApprovals{}, reporter, nil, 0)
 	run := store.AgentRun{ID: 11, IncidentID: 7, Mode: "full", Status: "running"}
 
 	if err := pipeline.Run(context.Background(), run); err != nil {
@@ -187,13 +205,131 @@ func TestPipelineRunSucceedsWithSteps(t *testing.T) {
 	}
 }
 
+// Reasoner 的每次工具调用都要落 agent_run_step：只有一条 RCA 摘要的话，
+// 回放看不到模型实际查了什么，"工具调用次数"也没法断言。
+func TestPipelineRecordsReasonerToolSteps(t *testing.T) {
+	db := newFakeRunStore()
+	reasoner := &fakeReasoner{result: &llm.DiagnoseResult{
+		RCA: "容器退出", Confidence: "high",
+		Plan: llm.Plan{Action: "restart_container", Target: llm.PlanTarget{Kind: "container", Name: "sub2api"}},
+		Steps: []llm.StepLog{
+			{Name: "prom_instant_query", Input: `{"query":"up"}`, Output: `{"result":[]}`,
+				StartedAt:  time.Date(2026, 8, 20, 9, 0, 0, 0, time.UTC),
+				FinishedAt: time.Date(2026, 8, 20, 9, 0, 1, 0, time.UTC)},
+			{Name: "docker_logs", Input: `{"name":"sub2api"}`, Err: "container not found"},
+		},
+	}}
+	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, reasoner, allowPolicy(), &fakeApprovals{}, &fakeReporter{}, nil, 0)
+	if err := pipeline.Run(context.Background(), store.AgentRun{ID: 21, IncidentID: 7, Mode: "full", Status: "running"}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	toolCalls := map[string]store.AgentRunStep{}
+	for _, step := range db.steps {
+		if step.Kind == "tool" && step.Name != "notify" {
+			toolCalls[step.Name] = step
+		}
+	}
+	if len(toolCalls) != 2 {
+		t.Fatalf("recorded tool steps = %d, want 2: %+v", len(toolCalls), db.steps)
+	}
+	prom, ok := toolCalls["prom_instant_query"]
+	if !ok || prom.InputJSON == nil || prom.OutputJSON == nil {
+		t.Fatalf("prom step = %+v", prom)
+	}
+	if prom.Seq < 30 || prom.Seq >= 90 {
+		t.Fatalf("tool step seq = %d, want the 30..89 band (clear of the main chain and verify)", prom.Seq)
+	}
+	if !prom.StartedAt.Equal(time.Date(2026, 8, 20, 9, 0, 0, 0, time.UTC)) {
+		t.Fatalf("tool step started_at = %s, want the recorded call time", prom.StartedAt)
+	}
+	// 失败的工具调用也要留痕，错误进 error 列。
+	failed, ok := toolCalls["docker_logs"]
+	if !ok || failed.Error == nil || !strings.Contains(*failed.Error, "container not found") {
+		t.Fatalf("failed tool step = %+v", failed)
+	}
+	// llm 摘要里带调用次数，回放时先看摘要就知道该找几条。
+	for _, step := range db.steps {
+		if step.Kind == "llm" && !strings.Contains(string(*step.OutputJSON), "tool_calls=2") {
+			t.Fatalf("llm step output = %s", *step.OutputJSON)
+		}
+	}
+}
+
+// 诊断失败时的工具调用同样要落库：失败的 run 也要能回放。
+func TestPipelineRecordsToolStepsOnReasonFailure(t *testing.T) {
+	db := newFakeRunStore()
+	reasoner := &fakeReasoner{
+		result: &llm.DiagnoseResult{Steps: []llm.StepLog{{Name: "prom_instant_query", Input: `{"query":"up"}`}}},
+		err:    errors.New("model output is not valid JSON"),
+	}
+	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, reasoner, allowPolicy(), &fakeApprovals{}, &fakeReporter{}, nil, 0)
+	if err := pipeline.Run(context.Background(), store.AgentRun{ID: 22, IncidentID: 7, Mode: "full", Status: "running"}); err == nil {
+		t.Fatal("Run() error = nil, want reason failure")
+	}
+	if db.completed[22] != "failed" {
+		t.Fatalf("final status = %q, want failed", db.completed[22])
+	}
+	found := false
+	for _, step := range db.steps {
+		if step.Kind == "tool" && step.Name == "prom_instant_query" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("failed run lost its tool steps: %+v", db.steps)
+	}
+}
+
+// Policy 收到的护栏输入必须来自 incident 上下文：可信 target 来自告警标签，
+// 可验证性来自"有成员告警可复查"。
+func TestPipelinePassesPolicyGuardrailInput(t *testing.T) {
+	db := newFakeRunStore()
+	reasoner := &fakeReasoner{result: &llm.DiagnoseResult{
+		RCA: "容器退出", Confidence: "high",
+		Plan: llm.Plan{Action: "restart_container", Target: llm.PlanTarget{Kind: "container", Name: "sub2api"}},
+	}}
+	builder := fakeEvidenceBuilder{evidence: testEvidence(), target: Target{
+		Incident: store.Incident{ID: 7, GroupKey: "payments"},
+		Members:  []store.IncidentMember{{Fingerprint: "fp1", Name: "HighCPU", Status: "firing"}},
+		Alerts:   []store.Alert{{Name: "HighCPU", Labels: []byte(`{"alertname":"HighCPU","container":"sub2api"}`)}},
+	}}
+	policy := allowPolicy()
+	pipeline := NewPipeline(db, builder, reasoner, policy, &fakeApprovals{}, &fakeReporter{}, nil, 0)
+	if err := pipeline.Run(context.Background(), store.AgentRun{ID: 23, IncidentID: 7, Mode: "full", Status: "running"}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if policy.lastInput == nil {
+		t.Fatal("policy did not receive guardrail input")
+	}
+	if !policy.lastInput.Verifiable {
+		t.Fatal("Verifiable = false, want true for an incident with members")
+	}
+	if len(policy.lastInput.KnownTargets) != 1 || policy.lastInput.KnownTargets[0] != "sub2api" {
+		t.Fatalf("KnownTargets = %v, want [sub2api] from the alert labels", policy.lastInput.KnownTargets)
+	}
+}
+
+// 没有成员的 incident 不可验证：Policy 会据此拒绝自动执行。
+func TestPipelineMarksUnverifiableWithoutMembers(t *testing.T) {
+	db := newFakeRunStore()
+	reasoner := &fakeReasoner{result: &llm.DiagnoseResult{RCA: "x", Confidence: "low"}}
+	policy := allowPolicy()
+	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, reasoner, policy, &fakeApprovals{}, &fakeReporter{}, nil, 0)
+	if err := pipeline.Run(context.Background(), store.AgentRun{ID: 24, IncidentID: 7, Mode: "full", Status: "running"}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if policy.lastInput == nil || policy.lastInput.Verifiable {
+		t.Fatalf("input = %+v, want Verifiable=false", policy.lastInput)
+	}
+}
+
 func TestPipelineGuardHitRecorded(t *testing.T) {
 	db := newFakeRunStore()
 	reasoner := &fakeReasoner{result: &llm.DiagnoseResult{
 		RCA: "配置错误导致启动失败", Confidence: "medium",
 		Plan: llm.Plan{Action: "restart_container", Target: llm.PlanTarget{Kind: "container", Name: "sub2api"}},
 	}}
-	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, reasoner, allowPolicy, &fakeApprovals{}, &fakeReporter{}, nil, 0)
+	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, reasoner, allowPolicy(), &fakeApprovals{}, &fakeReporter{}, nil, 0)
 	run := store.AgentRun{ID: 12, IncidentID: 7, Mode: "full", Status: "running"}
 	if err := pipeline.Run(context.Background(), run); err != nil {
 		t.Fatalf("Run() error = %v", err)
@@ -216,7 +352,7 @@ func TestPipelineFailureMarksRunFailed(t *testing.T) {
 	db := newFakeRunStore()
 	// 证据阶段失败 → run failed，不进入 LLM。
 	reasoner := &fakeReasoner{}
-	pipeline := NewPipeline(db, fakeEvidenceBuilder{err: errors.New("incident gone")}, reasoner, allowPolicy, &fakeApprovals{}, &fakeReporter{}, nil, 0)
+	pipeline := NewPipeline(db, fakeEvidenceBuilder{err: errors.New("incident gone")}, reasoner, allowPolicy(), &fakeApprovals{}, &fakeReporter{}, nil, 0)
 	run := store.AgentRun{ID: 13, IncidentID: 99, Mode: "full", Status: "running"}
 	err := pipeline.Run(context.Background(), run)
 	if err == nil {
@@ -233,7 +369,7 @@ func TestPipelineFailureMarksRunFailed(t *testing.T) {
 func TestPipelineNotifyFailureKeepsRunSucceeded(t *testing.T) {
 	db := newFakeRunStore()
 	reasoner := &fakeReasoner{result: &llm.DiagnoseResult{RCA: "ok", Confidence: "low"}}
-	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, reasoner, allowPolicy, &fakeApprovals{}, &fakeReporter{err: errors.New("webhook down")}, nil, 0)
+	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, reasoner, allowPolicy(), &fakeApprovals{}, &fakeReporter{err: errors.New("webhook down")}, nil, 0)
 	run := store.AgentRun{ID: 14, IncidentID: 7, Mode: "light", Status: "running"}
 	if err := pipeline.Run(context.Background(), run); err != nil {
 		t.Fatalf("Run() error = %v, want nil (notify failure is independent)", err)
@@ -267,7 +403,7 @@ func TestPipelineL3CreatesApproval(t *testing.T) {
 		Plan: llm.Plan{Action: "pool_resize", Target: llm.PlanTarget{Kind: "service", Name: "sub2api"}},
 	}}
 	approvals := &fakeApprovals{}
-	policy := fakePolicy{decision: approval.Decision{Kind: approval.DecisionApproval, ToolName: "pool_resize", PlanHash: "abc"}}
+	policy := &fakePolicy{decision: approval.Decision{Kind: approval.DecisionApproval, ToolName: "pool_resize", PlanHash: "abc"}}
 	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, reasoner, policy, approvals, &fakeReporter{}, nil, 0)
 	run := store.AgentRun{ID: 15, IncidentID: 7, Mode: "full", Status: "running"}
 	if err := pipeline.Run(context.Background(), run); err != nil {
@@ -297,7 +433,7 @@ func TestPipelineApprovalCreateFailureFailsRun(t *testing.T) {
 		RCA: "x", Confidence: "high",
 		Plan: llm.Plan{Action: "pool_resize", Target: llm.PlanTarget{Kind: "service", Name: "sub2api"}},
 	}}
-	policy := fakePolicy{decision: approval.Decision{Kind: approval.DecisionApproval, ToolName: "pool_resize", PlanHash: "abc"}}
+	policy := &fakePolicy{decision: approval.Decision{Kind: approval.DecisionApproval, ToolName: "pool_resize", PlanHash: "abc"}}
 	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, reasoner, policy, &fakeApprovals{err: errors.New("db down")}, &fakeReporter{}, nil, 0)
 	run := store.AgentRun{ID: 16, IncidentID: 7, Mode: "full", Status: "running"}
 	// 审批单落不了 = 执行许可拿不到，run 必须 failed（不能假装已审批）。
@@ -342,7 +478,7 @@ func TestPipelineMemoryHitSkipsLLM(t *testing.T) {
 		Incident: store.Incident{ID: 7, GroupKey: "payments"},
 		Alerts:   []store.Alert{{Name: "HighCPU"}},
 	}}
-	pipeline := NewPipeline(db, builder, reasoner, allowPolicy, &fakeApprovals{}, &fakeReporter{}, mem, 5)
+	pipeline := NewPipeline(db, builder, reasoner, allowPolicy(), &fakeApprovals{}, &fakeReporter{}, mem, 5)
 	run := store.AgentRun{ID: 20, IncidentID: 7, Mode: "full", Status: "running"}
 	if err := pipeline.Run(context.Background(), run); err != nil {
 		t.Fatalf("Run() error = %v", err)
@@ -384,7 +520,7 @@ func TestPipelineRetrySkipsMemoryLookup(t *testing.T) {
 		Incident: store.Incident{ID: 7, GroupKey: "payments"},
 		Alerts:   []store.Alert{{Name: "HighCPU"}},
 	}}
-	pipeline := NewPipeline(db, builder, reasoner, allowPolicy, &fakeApprovals{}, &fakeReporter{}, mem, 5)
+	pipeline := NewPipeline(db, builder, reasoner, allowPolicy(), &fakeApprovals{}, &fakeReporter{}, mem, 5)
 	retryOf := uint64(10)
 	db.runs[10] = store.AgentRun{ID: 10, Status: "failed"}
 	run := store.AgentRun{ID: 21, IncidentID: 7, Mode: "full", Status: "running", RetryOf: &retryOf}
@@ -411,7 +547,7 @@ func TestPipelineMissInjectsCmdHistory(t *testing.T) {
 	}}
 	// 包一层 reasoner 捕获输入。
 	capturing := &capturingReasoner{inner: reasoner, out: &gotEvidence}
-	pipeline := NewPipeline(db, builder, capturing, allowPolicy, &fakeApprovals{}, &fakeReporter{}, mem, 5)
+	pipeline := NewPipeline(db, builder, capturing, allowPolicy(), &fakeApprovals{}, &fakeReporter{}, mem, 5)
 	run := store.AgentRun{ID: 22, IncidentID: 7, Mode: "full", Status: "running"}
 	if err := pipeline.Run(context.Background(), run); err != nil {
 		t.Fatalf("Run() error = %v", err)

@@ -32,6 +32,37 @@ func NewFactory(cfg config.LLMConfig) *Factory {
 	return &Factory{cfg: cfg, cache: make(map[string]model.ToolCallingChatModel)}
 }
 
+// SelectModel applies a configured model profile to every LLM role while
+// preserving role-specific endpoint, credential and token limits. Existing
+// in-flight callers retain their model; later Build calls receive a new client.
+func (f *Factory) SelectModel(profile config.ModelProfile) error {
+	if f == nil {
+		return fmt.Errorf("llm: model factory is unavailable")
+	}
+	profile.ID = strings.TrimSpace(profile.ID)
+	if profile.ID == "" {
+		return fmt.Errorf("llm: model id is required")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cfg.Roles.Reasoner.Model = profile.ID
+	f.cfg.Roles.Reasoner.Thinking = profile.Thinking
+	f.cfg.Roles.Summarizer.Model = profile.ID
+	f.cfg.Roles.Summarizer.Thinking = profile.Thinking
+	f.cache = make(map[string]model.ToolCallingChatModel)
+	return nil
+}
+
+// CurrentModel returns the model that future Build calls will use.
+func (f *Factory) CurrentModel() string {
+	if f == nil {
+		return ""
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cfg.Roles.Reasoner.Model
+}
+
 // Validate 启动期校验：reasoner 是 D08 的硬依赖，配置不全就 fail-fast。
 // 错误文本只带角色名和缺什么字段，绝不带 api_key 的值。
 func (f *Factory) Validate() error {
@@ -64,18 +95,46 @@ func (f *Factory) Build(role string) (model.ToolCallingChatModel, error) {
 		return nil, err
 	}
 	maxTokens := roleCfg.MaxTokens
-	chatModel, err := openai.NewChatModel(context.Background(), &openai.ChatModelConfig{
+	modelCfg := &openai.ChatModelConfig{
 		BaseURL:   roleCfg.BaseURL,
 		APIKey:    roleCfg.APIKey,
 		Model:     roleCfg.Model,
 		MaxTokens: &maxTokens,
-	})
+		ExtraFields: map[string]any{
+			"thinking": map[string]any{"type": thinkingType(roleCfg.Thinking.Enabled)},
+		},
+	}
+	if roleCfg.Thinking.Enabled {
+		modelCfg.ReasoningEffort = thinkingEffort(roleCfg.Thinking.Effort)
+	}
+	chatModel, err := openai.NewChatModel(context.Background(), modelCfg)
 	if err != nil {
 		// 不把错误原文透出去：SDK 错误可能带请求头里的密钥。
 		return nil, fmt.Errorf("llm: build role %s model failed", role)
 	}
-	f.cache[role] = chatModel
-	return chatModel, nil
+	var built model.ToolCallingChatModel = chatModel
+	if roleCfg.Thinking.Enabled {
+		built = wrapThinkingModel(chatModel)
+	}
+	f.cache[role] = built
+	return built, nil
+}
+func thinkingType(enabled bool) string {
+	if enabled {
+		return "enabled"
+	}
+	return "disabled"
+}
+
+func thinkingEffort(effort string) openai.ReasoningEffortLevel {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "low":
+		return openai.ReasoningEffortLevelLow
+	case "high":
+		return openai.ReasoningEffortLevelHigh
+	default:
+		return openai.ReasoningEffortLevelMedium
+	}
 }
 
 func (f *Factory) roleConfig(role string) (config.RoleConfig, error) {

@@ -5,11 +5,13 @@ package approval
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"oncall-agent/internal/llm"
 	"oncall-agent/internal/tools"
@@ -39,6 +41,30 @@ type PolicyConfig struct {
 	AutoExecuteL2 bool
 	// DryRun 为真时 L2 只演练不执行（执行层检查）。
 	DryRun bool
+	// AllowedTargets 是 L2 自动路径的目标白名单（来自 tools.docker.allowed_containers）。
+	// 空 = 没有任何目标可自动动作，L2 全部降级审批（fail closed）。
+	AllowedTargets []string
+	// RateWindow / MaxPerWindow 是限频护栏：同一 plan_hash（= 同 tool + 同 target）
+	// 在窗口内已执行 MaxPerWindow 次后不再自动执行，降级审批。
+	RateWindow   time.Duration
+	MaxPerWindow int
+}
+
+// PolicyInput 是 Plan 之外、L2 护栏需要的事实输入。由调用方（Pipeline）
+// 从 incident 上下文装配 —— Policy 只做判定，不自己查库找证据。
+type PolicyInput struct {
+	// KnownTargets 是可信 target 来源：告警标签/服务清单/运行时查询里出现过的
+	// 真实对象名。plan.Target.Name 不在其中 = LLM 自己编的名字（GC-11）。
+	KnownTargets []string
+	// Verifiable 表示这次动作事后能被 Verify 判定（incident 有成员告警可复查）。
+	// 不可验证的动作不许自动执行：那等于"执行完没人知道有没有修好"。
+	Verifiable bool
+}
+
+// executionCounter 让 Policy 查限频窗口内的执行次数（同 plan_hash）。
+// 查不到（出错）时 Policy 按超限处理 —— 限频护栏 fail closed。
+type executionCounter interface {
+	CountRecentExecutions(ctx context.Context, planHash string, since time.Time) (int, error)
 }
 
 // Policy 把 Plan 翻译成决策。动作名必须在工具注册表里存在，
@@ -46,15 +72,26 @@ type PolicyConfig struct {
 type Policy struct {
 	registry *tools.Registry
 	cfg      PolicyConfig
+	counter  executionCounter
+	allowed  map[string]bool
+	now      func() time.Time
 }
 
-func NewPolicy(registry *tools.Registry, cfg PolicyConfig) *Policy {
-	return &Policy{registry: registry, cfg: cfg}
+// NewPolicy 装配策略。counter 为空表示没有限频数据源 —— 此时 L2 自动路径
+// 一律降级审批，而不是"没数据就放行"。
+func NewPolicy(registry *tools.Registry, cfg PolicyConfig, counter executionCounter) *Policy {
+	allowed := make(map[string]bool, len(cfg.AllowedTargets))
+	for _, name := range cfg.AllowedTargets {
+		if trimmed := strings.TrimSpace(name); trimmed != "" {
+			allowed[trimmed] = true
+		}
+	}
+	return &Policy{registry: registry, cfg: cfg, counter: counter, allowed: allowed, now: func() time.Time { return time.Now().UTC() }}
 }
 
 // Decide 判定一个 Plan 的执行路径。action=none 短路。
 // plan_hash 绑定 tool + args 的规范化内容，审批和执行前都验它。
-func (p *Policy) Decide(plan llm.Plan) Decision {
+func (p *Policy) Decide(ctx context.Context, plan llm.Plan, input PolicyInput) Decision {
 	action := strings.TrimSpace(plan.Action)
 	if action == "" || action == "none" {
 		return Decision{Kind: DecisionNone, Reason: "no action"}
@@ -73,14 +110,13 @@ func (p *Policy) Decide(plan llm.Plan) Decision {
 		base.Kind = DecisionAutoL1
 		base.Reason = "L1 read-only"
 	case tools.L2LowRisk:
-		// L2 自动路径的全部条件（GC-10/白名单/开关）；任一不满足降级审批。
-		hasTarget := strings.TrimSpace(plan.Target.Kind) != "" && strings.TrimSpace(plan.Target.Name) != ""
-		if p.cfg.AutoExecuteL2 && !p.cfg.DryRun && hasTarget {
+		// L2 自动路径必须同时满足全部护栏（GC-10）；任一不满足降级审批。
+		if blocked := p.l2Guardrails(ctx, plan, input, base.PlanHash); blocked != "" {
+			base.Kind = DecisionApproval
+			base.Reason = "L2 guardrail not satisfied (" + blocked + "), degraded to approval"
+		} else {
 			base.Kind = DecisionAutoL2
 			base.Reason = "L2 guardrails satisfied"
-		} else {
-			base.Kind = DecisionApproval
-			base.Reason = "L2 guardrails not satisfied, degraded to approval"
 		}
 	case tools.L3Approval:
 		base.Kind = DecisionApproval
@@ -91,6 +127,78 @@ func (p *Policy) Decide(plan llm.Plan) Decision {
 		base.Reason = "L4 is forbidden and cannot be approved"
 	}
 	return base
+}
+
+// broadTargetKinds 是影响面不受控的 target 类型：L2 只允许单实例受控动作，
+// 对集群/主机/命名空间/数据库这类范围的动作一律走人工审批。
+var broadTargetKinds = map[string]bool{
+	"cluster": true, "host": true, "node": true, "namespace": true,
+	"database": true, "db": true, "all": true, "group": true, "zone": true, "region": true,
+}
+
+// l2Guardrails 逐条检查设计要求的 L2 护栏，返回第一条不满足的护栏名；
+// 全部满足返回空串。顺序按"越便宜越先查"排列，限频查库放最后。
+func (p *Policy) l2Guardrails(ctx context.Context, plan llm.Plan, input PolicyInput, planHash string) string {
+	if !p.cfg.AutoExecuteL2 {
+		return "auto_execute_l2 disabled"
+	}
+	if p.cfg.DryRun {
+		return "dry_run enabled"
+	}
+	targetKind := strings.ToLower(strings.TrimSpace(plan.Target.Kind))
+	targetName := strings.TrimSpace(plan.Target.Name)
+	if targetKind == "" || targetName == "" {
+		return "target is incomplete"
+	}
+	// 影响范围：只接受单个具体对象。通配、列表分隔符、宽范围 kind 全部降级。
+	if strings.ContainsAny(targetName, "*?,; \t") || strings.EqualFold(targetName, "all") {
+		return "target is not a single concrete object"
+	}
+	if broadTargetKinds[targetKind] {
+		return fmt.Sprintf("target kind %q has unbounded blast radius", targetKind)
+	}
+	// 白名单：配置之外的目标没有自动执行资格（GC-11）。
+	if !p.allowed[targetName] {
+		return fmt.Sprintf("target %q is not in the auto-execute allowlist", targetName)
+	}
+	// target 来源：必须在告警标签/服务清单/运行时查询里出现过，不能是 LLM 编的。
+	if !matchesKnownTarget(targetName, input.KnownTargets) {
+		return fmt.Sprintf("target %q does not come from alert labels or runtime lookup", targetName)
+	}
+	// 可验证：执行完必须有东西可复查，否则"成功"无法判定。
+	if !input.Verifiable {
+		return "action outcome is not verifiable"
+	}
+	// 限频：同 target+action 在窗口内已达上限就不再自动执行。
+	if p.counter == nil || p.cfg.RateWindow <= 0 || p.cfg.MaxPerWindow < 1 {
+		return "rate limit is not configured"
+	}
+	count, err := p.counter.CountRecentExecutions(ctx, planHash, p.now().Add(-p.cfg.RateWindow))
+	if err != nil {
+		return "rate limit check failed: " + err.Error()
+	}
+	if count >= p.cfg.MaxPerWindow {
+		return fmt.Sprintf("rate limit reached (%d in %s)", count, p.cfg.RateWindow)
+	}
+	return ""
+}
+
+// matchesKnownTarget 比对 target 与可信来源。除全等（忽略大小写）外，
+// 还接受 instance 标签常见的 host:port 形态里的主机段。
+func matchesKnownTarget(name string, known []string) bool {
+	for _, candidate := range known {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if strings.EqualFold(candidate, name) {
+			return true
+		}
+		if host, _, found := strings.Cut(candidate, ":"); found && strings.EqualFold(strings.TrimSpace(host), name) {
+			return true
+		}
+	}
+	return false
 }
 
 // CanonicalArgs 从 Plan 生成规范化参数 JSON：结构固定（target kind/name），

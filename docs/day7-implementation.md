@@ -29,9 +29,9 @@
 ## 3. 各 collector 要点
 
 - **alert_snapshot**：incident 概览 + 成员表 + 每条当前告警的 labels/annotations/generatorURL。labels 原文渲染，由 finishItem 统一脱敏；
-- **prom_replay**：从成员 generatorURL 解析 `g0.expr`（只读解析 URL 查询参数），按 incident 开始时刻前后对称窗口做 range 回放；半窗口为 `min(15m, range_minutes/2)`，避免 prom_range_query 的窗口上限把告警后的半段悄悄截掉；多表达式去重后排序执行，输出稳定；
+- **prom_replay**：从成员 generatorURL 解析 `g0.expr`（只读解析 URL 查询参数），按**每条告警自己的 firing 时刻**（`alert.starts_at`）前后对称窗口做 range 回放；半窗口为 `min(15m, range_minutes/2)`，避免 prom_range_query 的窗口上限把告警后的半段悄悄截掉；多表达式去重后排序执行，同一表达式来自多条告警时取最早的 firing 时刻，输出稳定。告警没带 `starts_at` 时才退回 incident 开始时刻——用 incident 时刻给所有成员算窗口，会让晚 20 分钟才 firing 的成员完全错过触发现场；
 - **golden_metrics**：CPU/内存/磁盘/网络五条写死的 PromQL 模板（node_exporter），单条失败记正文不阻断；
-- **sub2api**：直连 `/health`（状态码、延迟、512 字节摘录）+ 请求量/5xx/p99 三条即时查询，job 名可配；
+- **sub2api**：直连 `/health`（状态码、延迟、512 字节摘录）+ 请求量/5xx/p99 三条即时查询，job 名可配。`/health` 返回非 2xx 或连不上时证据项状态是 `error`（正文保留状态码、响应体摘录和旁边的指标）——采集状态必须和真实健康状态一致，报 `ok` 会让下游把"网关挂了"的证据当成"网关正常"读；
 - **postgres**：进程级 pgxpool 复用（MaxConns=2，别压被监控库），固定两条只读 SQL（`SELECT 1`、`pg_stat_activity` 统计），无运行时输入拼接；
 - **redis**：进程级 go-redis 复用，只用 PING/INFO 只读命令，输出 used_memory、连接数；
 - **docker**：容器名来自配置（不允许外部输入拼名），inspect 只透出状态字段（不透 Env，防密钥外泄），日志窗口从 incident 开始时刻起算、行数封顶。
@@ -44,7 +44,7 @@
 
 ## 5. 测试与验收
 
-单测（`internal/diagnose`、`internal/tools`）覆盖：脱敏各形态（含 MySQL DSN）、fingerprint 不误伤、二进制安全转换、Render 结构与稳定性、围栏注入防护、截断预算、collector 失败继续、generatorURL 解析、Prom 回放窗口钳制、golden 部分失败、Sub2API missing/健康+指标、PG/Redis missing 分支、Redis INFO 解析、Docker 工具错误内联记录、日志解帧、容器名校验。
+单测（`internal/diagnose`、`internal/tools`）覆盖：脱敏各形态（含 MySQL DSN）、fingerprint 不误伤、二进制安全转换、Render 结构与稳定性、围栏注入防护、截断预算、collector 失败继续、generatorURL 解析、Prom 回放窗口钳制、按告警 firing 时刻取窗口（含同 expr 取最早）、golden 部分失败、Sub2API missing/健康+指标/5xx 与不可达标 error、PG/Redis missing 分支、Redis INFO 解析、Docker 工具错误内联记录、日志解帧、容器名校验。
 
 真实验收（本地 docker compose 环境 + 真实 Prometheus + 真实 Docker）：
 

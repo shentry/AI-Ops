@@ -14,6 +14,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -56,16 +57,81 @@ func NewDockerClient(socketPath string) (*DockerClient, error) {
 	return &DockerClient{socketPath: socketPath, httpClient: httpClient}, nil
 }
 
+// RestartLimits 是 docker_restart 的工具层限频护栏。
+// MinInterval 是同一容器两次重启的最小间隔，MaxPerHour 是滚动一小时内的次数上限。
+// 这是最后一道闸：即使上游策略或人工审批放行，反复重启同一个容器也会在这里被拒
+// （设计要求"同一 target/action 在时间窗口内限制执行次数"）。
+type RestartLimits struct {
+	MinInterval time.Duration
+	MaxPerHour  int
+}
+
+// restartLimitWindow 是次数上限的滚动窗口，与 MaxPerHour 的语义绑定。
+const restartLimitWindow = time.Hour
+
+// restartLimiter 记录每个容器最近的重启时刻。执行器可能并发消费审批单，
+// 所以这里必须带锁；now 可注入以便测试不依赖真实时钟。
+type restartLimiter struct {
+	mu      sync.Mutex
+	limits  RestartLimits
+	history map[string][]time.Time
+	now     func() time.Time
+}
+
+func newRestartLimiter(limits RestartLimits) *restartLimiter {
+	if limits.MaxPerHour < 1 {
+		limits.MaxPerHour = 1
+	}
+	if limits.MinInterval < 0 {
+		limits.MinInterval = 0
+	}
+	return &restartLimiter{limits: limits, history: make(map[string][]time.Time), now: time.Now}
+}
+
+// allow 判定并记账。尝试本身就计数 —— 失败的重启同样是对目标的一次动作，
+// 不计数就等于给"反复重启修不好的容器"开了后门。
+func (l *restartLimiter) allow(name string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	kept := make([]time.Time, 0, len(l.history[name]))
+	for _, at := range l.history[name] {
+		if now.Sub(at) < restartLimitWindow {
+			kept = append(kept, at)
+		}
+	}
+	l.history[name] = kept
+	if len(kept) > 0 && l.limits.MinInterval > 0 {
+		if since := now.Sub(kept[len(kept)-1]); since < l.limits.MinInterval {
+			return fmt.Errorf("restart of %q rate limited: last restart %s ago, minimum interval is %s",
+				name, since.Truncate(time.Second), l.limits.MinInterval)
+		}
+	}
+	if len(kept) >= l.limits.MaxPerHour {
+		return fmt.Errorf("restart of %q rate limited: %d restarts in the last hour, limit is %d",
+			name, len(kept), l.limits.MaxPerHour)
+	}
+	l.history[name] = append(kept, now)
+	return nil
+}
+
 // RegisterRestartTool 登记 docker_restart（L2）。target 必须命中白名单
 // （GC-11：只对配置允许的 Sub2API 运行对象执行），白名单为空则不注册 ——
 // 没有可重启目标的部署形态下，这个动作在系统里不存在。
-func (c *DockerClient) RegisterRestartTool(registry *Registry, allowedContainers []string) error {
+// limits 是工具层限频，配置缺省时套 60s / 3 次每小时的保守值。
+func (c *DockerClient) RegisterRestartTool(registry *Registry, allowedContainers []string, limits RestartLimits) error {
 	if len(allowedContainers) == 0 {
 		return nil
 	}
 	allowed := make(map[string]bool, len(allowedContainers))
 	for _, name := range allowedContainers {
 		allowed[name] = true
+	}
+	if limits.MinInterval <= 0 {
+		limits.MinInterval = time.Minute
+	}
+	if limits.MaxPerHour < 1 {
+		limits.MaxPerHour = 3
 	}
 	return registry.Register(ToolSpec{
 		Name:        ToolDockerRestart,
@@ -76,7 +142,7 @@ func (c *DockerClient) RegisterRestartTool(registry *Registry, allowedContainers
 		Params: []ParamSpec{
 			{Name: "name", Description: "container name from the allowlist", Required: true},
 		},
-		Handler: c.restart(allowed),
+		Handler: c.restart(allowed, newRestartLimiter(limits)),
 	})
 }
 
@@ -307,9 +373,9 @@ func (c *DockerClient) post(ctx context.Context, path string, query url.Values) 
 	return body, nil
 }
 
-// restart 是受控重启 handler：白名单 + 名字形态双重校验，
+// restart 是受控重启 handler：白名单 + 名字形态 + 限频三重校验，
 // 幂等（重启一个运行中的容器结果是确定的）。t=10 给进程 10 秒优雅退出。
-func (c *DockerClient) restart(allowed map[string]bool) Handler {
+func (c *DockerClient) restart(allowed map[string]bool, limiter *restartLimiter) Handler {
 	return func(ctx context.Context, raw json.RawMessage) (string, error) {
 		var args struct {
 			Name       string `json:"name"`
@@ -328,6 +394,10 @@ func (c *DockerClient) restart(allowed map[string]bool) Handler {
 		// 白名单是硬约束：配置之外的容器名一律拒绝（GC-11）。
 		if !allowed[name] {
 			return "", fmt.Errorf("container %q is not in the restart allowlist", name)
+		}
+		// 限频在真正发起请求之前：拒绝时容器状态没有被动过。
+		if err := limiter.allow(name); err != nil {
+			return "", err
 		}
 		if _, err := c.post(ctx, "/containers/"+name+"/restart", url.Values{"t": {"10"}}); err != nil {
 			return "", err

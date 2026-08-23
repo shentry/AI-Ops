@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"oncall-agent/internal/config"
+	"oncall-agent/internal/diagnose"
+	"oncall-agent/internal/eventlog"
 	"oncall-agent/internal/incident"
 	"oncall-agent/internal/metrics"
 	"oncall-agent/internal/store"
@@ -28,6 +30,13 @@ type pendingEventStore interface {
 	// 报文本身没救（格式错、缺必填字段）时标 failed，
 	// 否则这条坏数据会卡在队首无限重试，后面的告警全部堵死。
 	MarkRawEventFailed(context.Context, uint64, string, time.Time) error
+}
+
+// runIDEnqueuer is an optional transaction capability. The legacy enqueue
+// method accepts a value and cannot expose an auto-increment ID; production
+// stores may implement this pointer form without widening IncidentTx.
+type runIDEnqueuer interface {
+	EnqueueAgentRunWithID(context.Context, *store.AgentRun) error
 }
 
 // Worker 按 id 顺序消费 raw_event。channel 只是唤醒信号，
@@ -181,7 +190,19 @@ func (w *Worker) process(ctx context.Context, event store.RawEvent) error {
 					return err
 				}
 				if closed {
-					resolved = append(resolved, *result.Last.IncidentID)
+					incidentID := *result.Last.IncidentID
+					if _, err := tx.AppendIncidentEvent(ctx, incidentEvent(
+						incidentID,
+						eventlog.EventIncidentResolved,
+						"incident",
+						"resolved",
+						"incident resolved",
+						result.Input.ReceivedAt,
+						nil,
+					)); err != nil {
+						return err
+					}
+					resolved = append(resolved, incidentID)
 				}
 			}
 			return nil
@@ -197,6 +218,7 @@ func (w *Worker) process(ctx context.Context, event store.RawEvent) error {
 		case store.DedupFull:
 			// 内容完全没变的重复推送。已挂 incident 就续一下 last_seen_at 和级别，
 			// 让时间窗不至于在告警持续 firing 期间过期；还没挂就什么都不做。
+			// full duplicate 不产生新的 Incident/Run 诊断事件。
 			if result.Last.IncidentID == nil {
 				return nil
 			}
@@ -207,11 +229,63 @@ func (w *Worker) process(ctx context.Context, event store.RawEvent) error {
 			if err != nil {
 				return err
 			}
+			if assignment.Created {
+				if _, err := tx.AppendIncidentEvent(ctx, incidentEvent(
+					assignment.IncidentID,
+					eventlog.EventIncidentCreated,
+					"incident",
+					"created",
+					"incident created",
+					correlationInput.ObservedAt,
+					nil,
+				)); err != nil {
+					return err
+				}
+			}
 			if assignment.Promoted {
+				if _, err := tx.AppendIncidentEvent(ctx, incidentEvent(
+					assignment.IncidentID,
+					eventlog.EventIncidentPromoted,
+					"incident",
+					"promoted",
+					"incident promoted",
+					correlationInput.ObservedAt,
+					nil,
+				)); err != nil {
+					return err
+				}
 				// D05 促发分流：在促发同一事务里按 severity route 落 agent_run。
 				// skip 直接落 succeeded（可统计），full/light 落 pending 等 D09 消费。
 				mode := incident.RouteMode(assignment.Severity, w.severityRoute)
-				if err := tx.EnqueueAgentRun(ctx, incident.NewQueueRun(assignment.IncidentID, mode, time.Now().UTC())); err != nil {
+				run := incident.NewQueueRun(assignment.IncidentID, mode, time.Now().UTC())
+				var runID *uint64
+				if enqueuer, ok := tx.(runIDEnqueuer); ok {
+					if err := enqueuer.EnqueueAgentRunWithID(ctx, &run); err != nil {
+						return err
+					}
+					runID = &run.ID
+				} else {
+					if err := tx.EnqueueAgentRun(ctx, run); err != nil {
+						return err
+					}
+				}
+				eventType := eventlog.EventRunQueued
+				eventStatus := "queued"
+				eventSummary := "diagnosis run queued"
+				if run.Status == "succeeded" {
+					eventType = eventlog.EventRunSucceeded
+					eventStatus = "succeeded"
+					eventSummary = "diagnosis run succeeded"
+				}
+				if _, err := tx.AppendIncidentEvent(ctx, incidentEvent(
+					assignment.IncidentID,
+					eventType,
+					"run",
+					eventStatus,
+					eventSummary,
+					run.StartedAt,
+					runID,
+				)); err != nil {
 					return err
 				}
 				promoted = append(promoted, assignment.IncidentID)
@@ -266,4 +340,34 @@ func safeEventError(err error) string {
 		message = string(runes[:2048])
 	}
 	return message
+}
+
+const incidentEventSummaryMaxRunes = 512
+
+// incidentEvent 保持摄入事件的统一形状。事件正文来自告警标签，必须经过
+// 与诊断 prompt 相同的安全处理，并限制到 incident_event.summary 的列宽。
+func incidentEvent(incidentID uint64, eventType eventlog.EventType, phase, status, summary string, createdAt time.Time, runID *uint64) store.IncidentEvent {
+	return store.IncidentEvent{
+		IncidentID: incidentID,
+		RunID:      runID,
+		EventType:  string(eventType),
+		Phase:      phase,
+		Status:     status,
+		Summary:    safeIncidentSummary(summary),
+		CreatedAt:  createdAt.UTC(),
+	}
+}
+
+func safeIncidentSummary(summary string) string {
+	clean := diagnose.Sanitize(diagnose.ToSafeText(summary))
+	if clean == "" {
+		return "ingest event"
+	}
+	runes := []rune(clean)
+	if len(runes) <= incidentEventSummaryMaxRunes {
+		return clean
+	}
+	const suffix = "…[truncated]"
+	keep := incidentEventSummaryMaxRunes - len([]rune(suffix))
+	return string(runes[:keep]) + suffix
 }
