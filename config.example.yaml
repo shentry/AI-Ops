@@ -11,22 +11,22 @@ mysql:
 llm:
   roles:
     reasoner:
-      base_url: "https://api.delean.ai/v1"
+      base_url: "https://your-openai-compatible-endpoint"
       api_key: "${ARK_KEY}"
-      model: "glm-5"
+      model: "your-model"
       max_tokens: 8192
       thinking:
         enabled: false
     summarizer:
-      base_url: "https://api.delean.ai/v1"
+      base_url: "https://your-openai-compatible-endpoint"
       api_key: "${ARK_KEY}"
-      model: "glm-5"
+      model: "your-model"
       max_tokens: 4096
       thinking:
         enabled: false
-  # 运行时切换只能从此 allowlist 选择；不要加入未获账号组授权的模型。
+  # 运行时切换只能从此 allowlist 选择；不要加入未经授权的模型。
   models:
-    - id: "glm-5"
+    - id: "your-model"
       thinking:
         enabled: false
 ingest:

@@ -59,8 +59,7 @@ curl -H "Authorization: Bearer $AUTH_TOKEN" 'http://127.0.0.1:8080/debug/evidenc
 # 进程指标
 curl 'http://127.0.0.1:8080/metrics'
 ```
-
-本地 `config.yaml` 若把 `server.port` 设为 `18080`，Alertmanager webhook 也要指向同一端口（见 `alertmanager.yml`）。Compose 用 blackbox 探 `Sub2API /health` 以及本机 SSH 隧道上的 Postgres/Redis，Prometheus 规则在 `alerts.yml`，firing 经 Alertmanager 推入 `/webhook/alertmanager`。
+本地 `config.yaml` 若把 `server.port` 设为 `18080`，Alertmanager webhook 也要指向同一端口（见 `alertmanager.yml`）。Compose 使用本地或显式配置的依赖地址，Prometheus 规则在 `alerts.yml`，firing 经 Alertmanager 推入 `/webhook/alertmanager`。
 
 ### 诊断与审批链路（可选）
 
@@ -110,9 +109,9 @@ web:
 llm:
   roles:
     reasoner:
-      model: "glm-5"
+      model: "your-model"
   models:
-    - id: "glm-5"
+    - id: "your-model"
       thinking: { enabled: false }
 ```
 
@@ -122,7 +121,7 @@ llm:
 |---|---|---|
 | `GET /api/v1/control-room/model` | Web 启用时公开 | 当前模型与可选 ID（不含凭据） |
 | `GET /api/v1/admin/model` | Bearer | 当前模型与可选 ID |
-| `PUT /api/v1/admin/model` | Bearer | `{"model":"glm-5"}` 切换全局模型 |
+| `PUT /api/v1/admin/model` | Bearer | `{"model":"your-model"}` 切换全局模型 |
 
 ## API 一览
 

@@ -14,5 +14,7 @@ data/
 tmp/
 .DS_Store
 refs/
+keep/
+.claude/
 SuperBizAgent-release-2026-01-09/
 .ace-tool/

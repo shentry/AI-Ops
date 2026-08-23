@@ -30,9 +30,9 @@ system prompt
 1. **按头截断可能丢失关键尾部信息。** 日志最后的错误、指标窗口末端状态、JSON 后半部分可能直接消失。
 2. **缺少整份上下文预算。** 当前 7 个 collector 可以各自接近 2048 rune，单项合法不代表总量合理。
 3. **ReAct 历史线性增长。** 每轮工具结果会进入后续模型请求，长工具结果可能被重复发送多次。
-4. **思考模型还不能正确接入。** `RoleConfig` 目前只有 `base_url`、`api_key`、`model` 和 `max_tokens`。真实环境记录显示：api.delean.ai 多数模型开启 thinking 后，要求后续请求把上一轮 `content[].thinking` / `reasoning` 原样回传；当前 Eino OpenAI 适配器没有完整覆盖该协议，因此部署只能使用 glm-5。
+4. **思考模型还不能正确接入。** 部分 OpenAI 兼容网关在 thinking 模式下要求多轮对话回传 `content[].thinking` / `reasoning`；当前适配器需要显式处理该协议。
 
-真实环境已有一次诊断 `tokens_in=3768` 的记录，当前尚未触及模型窗口上限。压缩必须按阈值触发，不能让正常的小上下文经过无意义的改写。
+已有验收记录表明，正常诊断尚未触及模型窗口上限。压缩必须按阈值触发，不能让正常的小上下文经过无意义的改写。
 
 本文中的“记忆压缩”不是 `fault_memory`。两者必须分开：
 
@@ -233,9 +233,9 @@ Eino 当前依赖已经具备部分能力，但不能直接当协议完成：
 llm:
   roles:
     reasoner:
-      base_url: "https://api.delean.ai/v1"
+      base_url: "https://your-openai-compatible-endpoint"
       api_key: "${ARK_KEY}"
-      model: "deepseek-v4-pro"
+      model: "your-thinking-model"
       max_tokens: 2048
       thinking:
         enabled: true
@@ -245,9 +245,9 @@ llm:
         echo_required: true     # 后续请求必须回传上一轮 thinking
         budget_tokens: 4096     # 可选；provider 不支持则忽略
     summarizer:
-      base_url: "https://api.delean.ai/v1"
+      base_url: "https://your-openai-compatible-endpoint"
       api_key: "${ARK_KEY}"
-      model: "deepseek-v4-pro"
+      model: "your-model"
       max_tokens: 1024
       thinking:
         enabled: false
