@@ -32,13 +32,6 @@ type pendingEventStore interface {
 	MarkRawEventFailed(context.Context, uint64, string, time.Time) error
 }
 
-// runIDEnqueuer is an optional transaction capability. The legacy enqueue
-// method accepts a value and cannot expose an auto-increment ID; production
-// stores may implement this pointer form without widening IncidentTx.
-type runIDEnqueuer interface {
-	EnqueueAgentRunWithID(context.Context, *store.AgentRun) error
-}
-
 // Worker 按 id 顺序消费 raw_event。channel 只是唤醒信号，
 // 持久队列和顺序来源都是 MySQL —— 所以进程重启不丢事件。
 type Worker struct {
@@ -258,17 +251,10 @@ func (w *Worker) process(ctx context.Context, event store.RawEvent) error {
 				// skip 直接落 succeeded（可统计），full/light 落 pending 等 D09 消费。
 				mode := incident.RouteMode(assignment.Severity, w.severityRoute)
 				run := incident.NewQueueRun(assignment.IncidentID, mode, time.Now().UTC())
-				var runID *uint64
-				if enqueuer, ok := tx.(runIDEnqueuer); ok {
-					if err := enqueuer.EnqueueAgentRunWithID(ctx, &run); err != nil {
-						return err
-					}
-					runID = &run.ID
-				} else {
-					if err := tx.EnqueueAgentRun(ctx, run); err != nil {
-						return err
-					}
+				if err := tx.EnqueueAgentRun(ctx, &run); err != nil {
+					return err
 				}
+				runID := &run.ID
 				eventType := eventlog.EventRunQueued
 				eventStatus := "queued"
 				eventSummary := "diagnosis run queued"

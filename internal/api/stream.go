@@ -33,14 +33,14 @@ type StreamConfig struct {
 // StreamAPI serves an Incident's public durable event stream.
 type StreamAPI struct {
 	db      EventStore
-	auth    SessionAuthenticator
+	console *Console
 	poll    time.Duration
 	maxAge  time.Duration
 	maxConn int32
 	active  atomic.Int32
 }
 
-func NewStreamAPI(db EventStore, authn SessionAuthenticator, configs ...StreamConfig) *StreamAPI {
+func NewStreamAPI(db EventStore, console *Console, configs ...StreamConfig) *StreamAPI {
 	cfg := StreamConfig{PollInterval: time.Second, MaxDuration: 10 * time.Minute, MaxConnections: 100}
 	if len(configs) > 0 {
 		if configs[0].PollInterval > 0 {
@@ -53,12 +53,7 @@ func NewStreamAPI(db EventStore, authn SessionAuthenticator, configs ...StreamCo
 			cfg.MaxConnections = configs[0].MaxConnections
 		}
 	}
-	return &StreamAPI{db: db, auth: authn, poll: cfg.PollInterval, maxAge: cfg.MaxDuration, maxConn: int32(cfg.MaxConnections)}
-}
-
-// NewIncidentStreamAPI is a descriptive constructor alias for route assembly.
-func NewIncidentStreamAPI(db EventStore, authn SessionAuthenticator, configs ...StreamConfig) *StreamAPI {
-	return NewStreamAPI(db, authn, configs...)
+	return &StreamAPI{db: db, console: console, poll: cfg.PollInterval, maxAge: cfg.MaxDuration, maxConn: int32(cfg.MaxConnections)}
 }
 
 func (h *StreamAPI) Handle(r *ghttp.Request) {
@@ -94,7 +89,7 @@ func (h *StreamAPI) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid incident id")
 		return
 	}
-	if _, _, ok := authenticateSession(h.auth, r); !ok {
+	if _, ok := h.console.Actor(); !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}

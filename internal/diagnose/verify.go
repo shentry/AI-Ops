@@ -18,18 +18,11 @@ import (
 // 既不能被写成"失败"，也不能干脆丢掉 —— 但也不许无限期挂住关闭流程。
 const verifyDetachedTimeout = 10 * time.Second
 
-// verifyStore 只保留 Verify 查询所需的窄接口。审计接口通过下面的类型
-// 断言接入，以便旧的测试 fake 仍能运行；真实 store 使用批次接口。
+// verifyStore 是 Verify 的窄接口：一次成员复查读，一次审计批次写。
+// 批次接口保证 step、event、problem 原子提交。
 type verifyStore interface {
 	ListIncidentMembers(ctx context.Context, incidentID uint64) ([]store.IncidentMember, error)
-}
-
-type verifyStepRecorder interface {
 	AppendRunStepRecord(ctx context.Context, record store.RunStepRecord) error
-}
-
-type legacyVerifyStepRecorder interface {
-	AppendRunStep(ctx context.Context, step store.AgentRunStep) error
 }
 
 // VerifyResult 是一次恢复验证的结论。
@@ -186,20 +179,10 @@ func (v *Verifier) record(ctx context.Context, runID, incidentID uint64, delay t
 		Problems: problems,
 	}
 
-	// 审计写入同样脱离取消：关闭中的进程也要留下这条结论。真实 store
-	// 的批次接口保证 step、event、problem 原子提交；旧 fake 仅作兼容回退。
+	// 审计写入同样脱离取消：关闭中的进程也要留下这条结论。
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyDetachedTimeout)
 	defer cancel()
-	var err error
-	switch recorder := v.db.(type) {
-	case verifyStepRecorder:
-		err = recorder.AppendRunStepRecord(writeCtx, record)
-	case legacyVerifyStepRecorder:
-		err = recorder.AppendRunStep(writeCtx, step)
-	default:
-		err = fmt.Errorf("verify store does not support run step recording")
-	}
-	if err != nil {
+	if err := v.db.AppendRunStepRecord(writeCtx, record); err != nil {
 		v.logger.Printf("verify: append step record for run %d failed: %v (result: %s)", runID, err, output)
 	}
 }

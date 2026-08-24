@@ -9,8 +9,11 @@ node_modules/
 bin/
 dist/
 data/
+# web/dist is a Vite build artifact. Keep only the placeholder so //go:embed
+# still finds the directory before `npm run build` has run.
 !web/dist/
-!web/dist/index.html
+web/dist/*
+!web/dist/.gitkeep
 tmp/
 .DS_Store
 refs/

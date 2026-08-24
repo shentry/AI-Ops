@@ -37,9 +37,6 @@ func normalizeStaticFS(content fs.FS) fs.FS {
 	return content
 }
 
-// NewStaticHandler is a descriptive alias used by route assembly code.
-func NewStaticHandler(content fs.FS) *StaticAPI { return NewStaticAPI(content) }
-
 func (h *StaticAPI) Handle(r *ghttp.Request) {
 	h.ServeHTTP(r.Response.BufferWriter, r.Request)
 }

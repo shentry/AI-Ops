@@ -124,7 +124,7 @@ func TestFactorySendsThinkingFlags(t *testing.T) {
 		factory := NewFactory(config.LLMConfig{Roles: config.LLMRoles{
 			Reasoner: config.RoleConfig{BaseURL: fake.server.URL, APIKey: "k", Model: "m", MaxTokens: 16},
 		}})
-		chatModel, err := factory.Build(RoleReasoner)
+		chatModel, err := factory.Build()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -152,7 +152,7 @@ func TestFactorySendsThinkingFlags(t *testing.T) {
 				Thinking: config.ThinkingConfig{Enabled: true, Effort: "low"},
 			},
 		}})
-		chatModel, err := factory.Build(RoleReasoner)
+		chatModel, err := factory.Build()
 		if err != nil {
 			t.Fatal(err)
 		}

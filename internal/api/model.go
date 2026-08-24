@@ -36,13 +36,13 @@ type ModelStateDTO struct {
 // management endpoint. It intentionally does not accept anonymous-console
 // identity for mutation.
 type ModelAPI struct {
-	service    ModelSwitchService
-	authToken  string
-	publicAuth SessionAuthenticator
+	service   ModelSwitchService
+	authToken string
+	console   *Console
 }
 
-func NewModelAPI(service ModelSwitchService, authToken string, publicAuth SessionAuthenticator) *ModelAPI {
-	return &ModelAPI{service: service, authToken: authToken, publicAuth: publicAuth}
+func NewModelAPI(service ModelSwitchService, authToken string, console *Console) *ModelAPI {
+	return &ModelAPI{service: service, authToken: authToken, console: console}
 }
 
 func (h *ModelAPI) Handle(r *ghttp.Request) {
@@ -72,7 +72,7 @@ func (h *ModelAPI) public(w http.ResponseWriter, r *http.Request) {
 		writeMethodNotAllowed(w)
 		return
 	}
-	if _, _, ok := authenticateSession(h.publicAuth, r); !ok {
+	if _, ok := h.console.Actor(); !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}

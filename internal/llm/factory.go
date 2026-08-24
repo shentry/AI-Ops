@@ -14,27 +14,21 @@ import (
 	"oncall-agent/internal/config"
 )
 
-// 角色名。配置里只允许这两个，多一个角色就是一处没审计过的密钥出口。
-const (
-	RoleReasoner   = "reasoner"
-	RoleSummarizer = "summarizer"
-)
-
-// Factory 按角色创建并缓存模型客户端。进程内复用（GC：不重复建连接池），
+// Factory 创建并缓存 reasoner 模型客户端。进程内复用（GC：不重复建连接池），
 // 密钥只进 client 配置，不进日志、不进错误文本。
 type Factory struct {
-	cfg   config.LLMConfig
-	mu    sync.Mutex
-	cache map[string]model.ToolCallingChatModel
+	cfg    config.LLMConfig
+	mu     sync.Mutex
+	cached model.ToolCallingChatModel
 }
 
 func NewFactory(cfg config.LLMConfig) *Factory {
-	return &Factory{cfg: cfg, cache: make(map[string]model.ToolCallingChatModel)}
+	return &Factory{cfg: cfg}
 }
 
-// SelectModel applies a configured model profile to every LLM role while
-// preserving role-specific endpoint, credential and token limits. Existing
-// in-flight callers retain their model; later Build calls receive a new client.
+// SelectModel applies a configured model profile while preserving the
+// configured endpoint, credential and token limits. Existing in-flight callers
+// retain their model; later Build calls receive a new client.
 func (f *Factory) SelectModel(profile config.ModelProfile) error {
 	if f == nil {
 		return fmt.Errorf("llm: model factory is unavailable")
@@ -47,9 +41,7 @@ func (f *Factory) SelectModel(profile config.ModelProfile) error {
 	defer f.mu.Unlock()
 	f.cfg.Roles.Reasoner.Model = profile.ID
 	f.cfg.Roles.Reasoner.Thinking = profile.Thinking
-	f.cfg.Roles.Summarizer.Model = profile.ID
-	f.cfg.Roles.Summarizer.Thinking = profile.Thinking
-	f.cache = make(map[string]model.ToolCallingChatModel)
+	f.cached = nil
 	return nil
 }
 
@@ -78,22 +70,19 @@ func (f *Factory) Validate() error {
 		missing = append(missing, "model")
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("llm: role %s missing config: %s", RoleReasoner, strings.Join(missing, ", "))
+		return fmt.Errorf("llm: reasoner missing config: %s", strings.Join(missing, ", "))
 	}
 	return nil
 }
 
-// Build 按角色取模型，进程内缓存。
-func (f *Factory) Build(role string) (model.ToolCallingChatModel, error) {
+// Build 取 reasoner 模型，进程内缓存。
+func (f *Factory) Build() (model.ToolCallingChatModel, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if cached, ok := f.cache[role]; ok {
-		return cached, nil
+	if f.cached != nil {
+		return f.cached, nil
 	}
-	roleCfg, err := f.roleConfig(role)
-	if err != nil {
-		return nil, err
-	}
+	roleCfg := f.cfg.Roles.Reasoner
 	maxTokens := roleCfg.MaxTokens
 	modelCfg := &openai.ChatModelConfig{
 		BaseURL:   roleCfg.BaseURL,
@@ -110,13 +99,13 @@ func (f *Factory) Build(role string) (model.ToolCallingChatModel, error) {
 	chatModel, err := openai.NewChatModel(context.Background(), modelCfg)
 	if err != nil {
 		// 不把错误原文透出去：SDK 错误可能带请求头里的密钥。
-		return nil, fmt.Errorf("llm: build role %s model failed", role)
+		return nil, fmt.Errorf("llm: build reasoner model failed")
 	}
 	var built model.ToolCallingChatModel = chatModel
 	if roleCfg.Thinking.Enabled {
 		built = wrapThinkingModel(chatModel)
 	}
-	f.cache[role] = built
+	f.cached = built
 	return built, nil
 }
 func thinkingType(enabled bool) string {
@@ -134,16 +123,5 @@ func thinkingEffort(effort string) openai.ReasoningEffortLevel {
 		return openai.ReasoningEffortLevelHigh
 	default:
 		return openai.ReasoningEffortLevelMedium
-	}
-}
-
-func (f *Factory) roleConfig(role string) (config.RoleConfig, error) {
-	switch role {
-	case RoleReasoner:
-		return f.cfg.Roles.Reasoner, nil
-	case RoleSummarizer:
-		return f.cfg.Roles.Summarizer, nil
-	default:
-		return config.RoleConfig{}, fmt.Errorf("llm: unknown role %q", role)
 	}
 }

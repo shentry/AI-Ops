@@ -27,16 +27,6 @@ func NewFeishuCallbackAPI(dispatcher FeishuEventDispatcher) *FeishuCallbackAPI {
 	return &FeishuCallbackAPI{dispatcher: dispatcher}
 }
 
-// NewFeishuCallbackHandler is a descriptive alias for route assembly.
-func NewFeishuCallbackHandler(dispatcher FeishuEventDispatcher) *FeishuCallbackAPI {
-	return NewFeishuCallbackAPI(dispatcher)
-}
-
-// NewFeishuCallback constructs the callback endpoint for route registration.
-func NewFeishuCallback(dispatcher FeishuEventDispatcher) *FeishuCallbackAPI {
-	return NewFeishuCallbackAPI(dispatcher)
-}
-
 // FeishuCallback is kept as the concise handler name for integrations.
 type FeishuCallback = FeishuCallbackAPI
 

@@ -23,39 +23,27 @@ const (
 
 // WorkerStore is the union of the narrow read/write surfaces used by the
 // asynchronous conversation worker. *store.DB satisfies this interface.
+// Queue polling, stale recovery and problem resolution are all required: a
+// store that cannot do one of them would leave questions queued forever, so
+// the omission must fail to compile rather than degrade silently.
 type WorkerStore interface {
 	MessageStore
 	ContextStore
 	EventStore
 	OpenIncidentProblem(context.Context, store.IncidentProblem) (store.IncidentProblem, error)
-	ListIncidents(context.Context, string) ([]store.Incident, error)
 	ClaimConversationMessage(context.Context, uint64, time.Time) (bool, error)
 	CompleteConversationMessage(context.Context, uint64, string, time.Time) error
-}
-
-// QueuedSource is optional. A store may implement it to avoid scanning every
-// incident; the built-in store currently uses the ListIncidents fallback.
-type QueuedSource interface {
 	NextQueuedConversationMessage(context.Context) (store.ConversationMessage, bool, error)
-}
-
-type staleConversationRequeuer interface {
 	RequeueStaleConversationMessages(context.Context, time.Time) (int64, error)
-}
-
-type conversationProblemResolver interface {
 	ResolveIncidentProblem(context.Context, uint64, string, *uint64, time.Time) (bool, error)
+	// GetIMBinding finds the originating Feishu message recorded in a queued
+	// question's metadata. A reply must never select the newest Incident binding.
+	GetIMBinding(ctx context.Context, provider, messageID string) (store.IMBinding, error)
 }
 
 // ThreadReplier posts an answer back to the originating Feishu thread.
 type ThreadReplier interface {
 	Reply(ctx context.Context, parentMessageID, content string) error
-}
-
-// BindingLookup finds the originating Feishu message recorded in a queued
-// question's metadata. A reply must never select the newest Incident binding.
-type BindingLookup interface {
-	GetIMBinding(ctx context.Context, provider, messageID string) (store.IMBinding, error)
 }
 
 type Worker struct {
@@ -181,11 +169,7 @@ func (w *Worker) consume(ctx context.Context) {
 }
 
 func (w *Worker) requeueStale(ctx context.Context) error {
-	requeuer, ok := w.store.(staleConversationRequeuer)
-	if !ok {
-		return nil
-	}
-	count, err := requeuer.RequeueStaleConversationMessages(ctx, w.now().UTC().Add(-conversationStaleAfter))
+	count, err := w.store.RequeueStaleConversationMessages(ctx, w.now().UTC().Add(-conversationStaleAfter))
 	if err == nil && count > 0 {
 		w.logger.Printf("conversation: requeued %d stale questions", count)
 	}
@@ -193,58 +177,28 @@ func (w *Worker) requeueStale(ctx context.Context) error {
 }
 
 func (w *Worker) resolveConversationProblems(ctx context.Context, incidentID uint64, runID *uint64, resolvedAt time.Time) {
-	resolver, ok := w.store.(conversationProblemResolver)
-	if !ok {
-		return
-	}
 	for _, code := range []string{"conversation_failed", "reasoner_parse_failed"} {
-		if _, err := resolver.ResolveIncidentProblem(ctx, incidentID, code, runID, resolvedAt); err != nil {
+		if _, err := w.store.ResolveIncidentProblem(ctx, incidentID, code, runID, resolvedAt); err != nil {
 			w.logger.Printf("conversation: resolve problem %s: %v", code, err)
 		}
 	}
 }
 
+// drain processes every currently queued question. The store hands back one
+// message at a time so a slow question never blocks the rest of the queue.
 func (w *Worker) drain(ctx context.Context) error {
-	if source, ok := w.store.(QueuedSource); ok {
-		for {
-			message, found, err := source.NextQueuedConversationMessage(ctx)
-			if err != nil {
-				return fmt.Errorf("conversation: find queued message: %w", err)
-			}
-			if !found {
-				return nil
-			}
-			if err := w.process(ctx, message); err != nil {
-				w.logger.Printf("conversation message %d failed: %v", message.ID, err)
-			}
-		}
-	}
-	incidents, err := w.store.ListIncidents(ctx, "")
-	if err != nil {
-		return fmt.Errorf("conversation: list incidents: %w", err)
-	}
-	var firstErr error
-	for _, incident := range incidents {
-		messages, err := listAllMessages(ctx, w.store, incident.ID)
+	for {
+		message, found, err := w.store.NextQueuedConversationMessage(ctx)
 		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
+			return fmt.Errorf("conversation: find queued message: %w", err)
 		}
-		for _, message := range messages {
-			if message.Role != "user" || message.Status != "queued" {
-				continue
-			}
-			if err := w.process(ctx, message); err != nil {
-				w.logger.Printf("conversation message %d failed: %v", message.ID, err)
-				if firstErr == nil {
-					firstErr = err
-				}
-			}
+		if !found {
+			return nil
+		}
+		if err := w.process(ctx, message); err != nil {
+			w.logger.Printf("conversation message %d failed: %v", message.ID, err)
 		}
 	}
-	return firstErr
 }
 
 func (w *Worker) process(ctx context.Context, queued store.ConversationMessage) error {
@@ -380,16 +334,12 @@ func (w *Worker) replyThread(_ context.Context, queued store.ConversationMessage
 	if w == nil || w.replier == nil || strings.TrimSpace(queued.Channel) != "feishu" {
 		return
 	}
-	lookup, ok := w.store.(BindingLookup)
-	if !ok {
-		return
-	}
 	messageID := feishuSourceMessageID(queued.MetadataJSON)
 	if messageID == "" {
 		w.recordReplyFailure(queued, "feishu reply binding missing")
 		return
 	}
-	binding, err := lookup.GetIMBinding(context.Background(), w.provider, messageID)
+	binding, err := w.store.GetIMBinding(context.Background(), w.provider, messageID)
 	if err != nil || binding.IncidentID != queued.IncidentID || strings.TrimSpace(binding.MessageID) == "" {
 		w.recordReplyFailure(queued, "feishu reply binding missing")
 		return

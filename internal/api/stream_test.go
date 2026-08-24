@@ -28,7 +28,7 @@ func (f fakeEventStore) ListIncidentEvents(_ context.Context, _ uint64, after ui
 func TestStreamUnauthorizedAndLastEventID(t *testing.T) {
 	api := NewStreamAPI(fakeEventStore{rows: []store.IncidentEvent{{
 		ID: 5, IncidentID: 1, EventType: "run.started", Phase: "diagnose", Status: "running", Summary: "started",
-	}}}, fakeSessionAuth{unauth: true}, StreamConfig{MaxDuration: 20 * time.Millisecond, PollInterval: 5 * time.Millisecond})
+	}}}, (*Console)(nil), StreamConfig{MaxDuration: 20 * time.Millisecond, PollInterval: 5 * time.Millisecond})
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/incidents/1/stream", nil)
 	resp := httptest.NewRecorder()
 	api.ServeHTTP(resp, req)
@@ -38,7 +38,7 @@ func TestStreamUnauthorizedAndLastEventID(t *testing.T) {
 
 	live := NewStreamAPI(fakeEventStore{rows: []store.IncidentEvent{{
 		ID: 5, IncidentID: 1, EventType: "run.started", Phase: "diagnose", Status: "running", Summary: "started",
-	}}}, fakeSessionAuth{}, StreamConfig{MaxDuration: 30 * time.Millisecond, PollInterval: 10 * time.Millisecond})
+	}}}, NewConsole(), StreamConfig{MaxDuration: 30 * time.Millisecond, PollInterval: 10 * time.Millisecond})
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/incidents/1/stream", nil)
 	req.Header.Set("Last-Event-ID", "4")
 	resp = httptest.NewRecorder()
@@ -51,7 +51,7 @@ func TestStreamUnauthorizedAndLastEventID(t *testing.T) {
 		t.Fatalf("body = %q", body)
 	}
 
-	heart := NewStreamAPI(fakeEventStore{}, fakeSessionAuth{}, StreamConfig{MaxDuration: 25 * time.Millisecond, PollInterval: 5 * time.Millisecond})
+	heart := NewStreamAPI(fakeEventStore{}, NewConsole(), StreamConfig{MaxDuration: 25 * time.Millisecond, PollInterval: 5 * time.Millisecond})
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/incidents/1/stream", nil)
 	resp = httptest.NewRecorder()
 	heart.ServeHTTP(resp, req)
@@ -61,7 +61,7 @@ func TestStreamUnauthorizedAndLastEventID(t *testing.T) {
 }
 
 func TestStreamConnectionLimit(t *testing.T) {
-	api := NewStreamAPI(fakeEventStore{}, fakeSessionAuth{}, StreamConfig{MaxConnections: 1, MaxDuration: time.Hour})
+	api := NewStreamAPI(fakeEventStore{}, NewConsole(), StreamConfig{MaxConnections: 1, MaxDuration: time.Hour})
 	if !api.tryAcquire() {
 		t.Fatal("first acquire")
 	}

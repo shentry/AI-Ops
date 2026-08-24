@@ -1,3 +1,4 @@
+import { ArrowUpRight, Check, Radar } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { ApiError, Incident, ModelState, listIncidents } from "../api";
@@ -37,7 +38,7 @@ export function IncidentPicker({ actorName, modelState, onModelChanged }: Incide
     <main className="shell room-shell">
       <header className="topbar">
         <a className="brand" href="/" aria-label="值班控制台首页">
-          <span className="brand-mark">O</span>
+          <span className="brand-mark"><Radar size={15} strokeWidth={2} /></span>
           <span>值班 <b>控制台</b></span>
         </a>
         <div className="topbar-actions">
@@ -66,7 +67,7 @@ export function IncidentPicker({ actorName, modelState, onModelChanged }: Incide
         </div>
         {incidents !== null && incidents.length === 0 ? (
           <div className="empty-state compact-empty">
-            <span className="empty-check">✓</span>
+            <span className="empty-check"><Check size={15} strokeWidth={2.5} /></span>
             <p>还没有任何 Incident</p>
             <small>Alertmanager 还没有推送过告警，或者都被去重掉了。</small>
           </div>
@@ -83,6 +84,7 @@ export function IncidentPicker({ actorName, modelState, onModelChanged }: Incide
                   <span className="picker-meta">
                     {incident.alerts_count} 条告警 · {timeLabel(incident.last_seen_at)}
                   </span>
+                  <ArrowUpRight className="picker-arrow" size={16} />
                 </a>
               </li>
             ))}

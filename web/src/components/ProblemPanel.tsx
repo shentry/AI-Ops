@@ -1,3 +1,5 @@
+import { Check, TriangleAlert } from "lucide-react";
+
 import { ProblemDTO } from "../api";
 import { problemCodeLabel, problemSeverityLabel, statusLabel } from "../labels";
 
@@ -17,7 +19,7 @@ export function ProblemPanel({ problems }: ProblemPanelProps) {
       </div>
       {problems.length === 0 ? (
         <div className="empty-state compact-empty">
-          <span className="empty-check">✓</span>
+          <span className="empty-check"><Check size={15} strokeWidth={2.5} /></span>
           <p>没有待处理问题</p>
           <small>各阶段信号都在预期范围内。</small>
         </div>
@@ -26,7 +28,7 @@ export function ProblemPanel({ problems }: ProblemPanelProps) {
           {problems.map((problem) => (
             <li className={`problem-card severity-${problem.severity.toLowerCase()}`} key={problem.id || `${problem.code}-${problem.summary}`}>
               <div className="problem-card-heading">
-                <span className="problem-severity">{problemSeverityLabel(problem.severity)}</span>
+                <span className="problem-severity"><TriangleAlert size={12} strokeWidth={2.2} />{problemSeverityLabel(problem.severity)}</span>
                 <code>{problem.code}</code>
               </div>
               <strong>{problemCodeLabel(problem.code)}</strong>

@@ -30,7 +30,6 @@ var (
 	ErrQuestionRequired       = errors.New("conversation: question is required")
 	ErrQuestionTooLong        = errors.New("conversation: question exceeds 4000 characters")
 	ErrQuestionInProgress     = errors.New("conversation: another question is already running")
-	ErrEventStoreUnavailable  = errors.New("conversation: incident event writer is unavailable")
 	ErrConversationDependency = errors.New("conversation: dependency is required")
 )
 
@@ -43,11 +42,14 @@ type Actor struct {
 
 // MessageStore is the small persistence surface needed by the synchronous
 // conversation service. *store.DB satisfies it; tests and API adapters can
-// provide a focused fake without depending on GORM.
+// provide a focused fake without depending on GORM. The event writer is part
+// of the same contract: queueing a question is an auditable operation, so a
+// store that cannot record the fact must fail to compile.
 type MessageStore interface {
 	GetIncident(context.Context, uint64) (store.Incident, error)
 	ListConversationMessages(context.Context, uint64, uint64, int) ([]store.ConversationMessage, error)
 	CreateConversationMessage(context.Context, store.ConversationMessage) (store.ConversationMessage, error)
+	EventStore
 }
 
 // EventStore persists the incident fact emitted by a conversation operation.
@@ -63,15 +65,10 @@ type Service interface {
 
 type service struct {
 	messages MessageStore
-	events   EventStore
 	now      func() time.Time
 }
 
-// NewService builds the incident-bound conversation service. The supplied
-// store must also implement EventStore in production (*store.DB does); keeping
-// the assertion optional lets read/write fakes be used for narrow callers while
-// Ask still reports the missing event writer instead of silently claiming an
-// auditable operation succeeded.
+// NewService builds the incident-bound conversation service.
 func NewService(messages MessageStore) Service {
 	return NewServiceWithClock(messages, time.Now)
 }
@@ -82,11 +79,7 @@ func NewServiceWithClock(messages MessageStore, now func() time.Time) Service {
 	if now == nil {
 		now = time.Now
 	}
-	var events EventStore
-	if candidate, ok := messages.(EventStore); ok {
-		events = candidate
-	}
-	return &service{messages: messages, events: events, now: now}
+	return &service{messages: messages, now: now}
 }
 
 func (s *service) Ask(ctx context.Context, incidentID uint64, actor Actor, question, channel string) (store.ConversationMessage, error) {
@@ -148,9 +141,6 @@ func (s *service) Ask(ctx context.Context, incidentID uint64, actor Actor, quest
 		return store.ConversationMessage{}, fmt.Errorf("conversation: create question: %w", err)
 	}
 
-	if s.events == nil {
-		return created, ErrEventStoreUnavailable
-	}
 	event := store.IncidentEvent{
 		IncidentID: created.IncidentID,
 		EventType:  string(eventlog.EventConversationAsked),
@@ -163,7 +153,7 @@ func (s *service) Ask(ctx context.Context, incidentID uint64, actor Actor, quest
 		}),
 		CreatedAt: now,
 	}
-	if _, err := s.events.AppendIncidentEvent(ctx, event); err != nil {
+	if _, err := s.messages.AppendIncidentEvent(ctx, event); err != nil {
 		// The message remains queued so the asynchronous worker can still answer
 		// it. Returning the persisted row plus the event error makes the missing
 		// audit fact visible to the caller without rolling back user input.

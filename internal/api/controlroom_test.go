@@ -7,20 +7,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"oncall-agent/internal/auth"
 	"oncall-agent/internal/store"
 )
-
-type fakeSessionAuth struct {
-	unauth bool
-}
-
-func (f fakeSessionAuth) Authenticate(context.Context, *http.Request) (auth.Actor, store.WebSession, error) {
-	if f.unauth {
-		return auth.Actor{}, store.WebSession{}, auth.ErrUnauthenticated
-	}
-	return auth.Actor{ID: "ou_1", Name: "ops"}, store.WebSession{ID: "sess"}, nil
-}
 
 type fakeControlRoomStore struct {
 	incident store.Incident
@@ -48,9 +36,18 @@ func (f fakeControlRoomStore) ListAgentRuns(context.Context, uint64, uint64, int
 func (f fakeControlRoomStore) ListIncidentApprovals(context.Context, uint64, string, int) ([]store.Approval, error) {
 	return nil, nil
 }
+func (f fakeControlRoomStore) ListIncidentRunSteps(context.Context, uint64, uint64, uint64, int) ([]store.AgentRunStep, error) {
+	return nil, nil
+}
+func (f fakeControlRoomStore) ListLatestIncidents(context.Context, string, int) ([]store.Incident, error) {
+	return []store.Incident{f.incident}, nil
+}
+func (f fakeControlRoomStore) GetApproval(context.Context, uint64) (store.Approval, error) {
+	return store.Approval{}, store.ErrApprovalNotFound
+}
 
-func TestControlRoomRequiresSession(t *testing.T) {
-	api := NewControlRoomAPI(fakeControlRoomStore{incident: store.Incident{ID: 1, Status: "open"}}, fakeSessionAuth{unauth: true})
+func TestControlRoomRejectsRequestsWhenConsoleIsDisabled(t *testing.T) {
+	api := NewControlRoomAPI(fakeControlRoomStore{incident: store.Incident{ID: 1, Status: "open"}}, nil)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/incidents/1/control-room", nil)
 	resp := httptest.NewRecorder()
 	api.ServeHTTP(resp, req)
@@ -63,7 +60,7 @@ func TestControlRoomReturnsMembersAndLatestEvents(t *testing.T) {
 	api := NewControlRoomAPI(fakeControlRoomStore{
 		incident: store.Incident{ID: 8, Status: "open", Title: "cpu"},
 		events:   []store.IncidentEvent{{ID: 12, IncidentID: 8, EventType: "run.started", Phase: "diagnose", Status: "running", Summary: "started"}},
-	}, fakeSessionAuth{})
+	}, NewConsole())
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/incidents/8/control-room", nil)
 	resp := httptest.NewRecorder()
 	api.ServeHTTP(resp, req)
@@ -84,7 +81,7 @@ func TestControlRoomReturnsMembersAndLatestEvents(t *testing.T) {
 func TestControlRoomAllowsAnonymousConsole(t *testing.T) {
 	api := NewControlRoomAPI(
 		fakeControlRoomStore{incident: store.Incident{ID: 9, Status: "open"}},
-		NewAnonymousConsoleAuthenticator(),
+		NewConsole(),
 	)
 	resp := httptest.NewRecorder()
 	api.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/api/v1/incidents/9/control-room", nil))

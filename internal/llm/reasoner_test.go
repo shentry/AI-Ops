@@ -153,10 +153,6 @@ func TestFactoryValidate(t *testing.T) {
 	if err := ok.Validate(); err != nil {
 		t.Fatalf("Validate() = %v", err)
 	}
-	// 未知角色拒绝。
-	if _, err := ok.Build("hacker"); err == nil {
-		t.Fatal("Build(unknown role) error = nil")
-	}
 }
 
 func TestReasonerDiagnoseStructuredOutput(t *testing.T) {

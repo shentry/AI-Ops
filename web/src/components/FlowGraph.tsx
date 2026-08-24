@@ -1,3 +1,5 @@
+import { BellRing, CheckCheck, ChevronRight, Database, Play, Scale, ShieldCheck, Sparkles, UserCheck } from "lucide-react";
+
 import { FlowNode } from "../api";
 import { durationLabel, statusLabel } from "../labels";
 
@@ -7,14 +9,14 @@ interface FlowGraphProps {
 }
 
 const stages = [
-  { key: "alert", label: "告警接入", aliases: ["alert", "incident", "ingest"] },
-  { key: "evidence", label: "证据采集", aliases: ["evidence", "collector", "collectors"] },
-  { key: "reasoner", label: "模型诊断", aliases: ["reasoner", "llm", "diagnose"] },
-  { key: "guard", label: "Guard 校验", aliases: ["guard"] },
-  { key: "policy", label: "Policy 判定", aliases: ["policy"] },
-  { key: "approval", label: "人工审批", aliases: ["approval"] },
-  { key: "execute", label: "执行动作", aliases: ["execute", "execution"] },
-  { key: "verify", label: "结果验证", aliases: ["verify", "verification"] },
+  { key: "alert", label: "告警接入", aliases: ["alert", "incident", "ingest"], Icon: BellRing },
+  { key: "evidence", label: "证据采集", aliases: ["evidence", "collector", "collectors"], Icon: Database },
+  { key: "reasoner", label: "模型诊断", aliases: ["reasoner", "llm", "diagnose"], Icon: Sparkles },
+  { key: "guard", label: "Guard 校验", aliases: ["guard"], Icon: ShieldCheck },
+  { key: "policy", label: "Policy 判定", aliases: ["policy"], Icon: Scale },
+  { key: "approval", label: "人工审批", aliases: ["approval"], Icon: UserCheck },
+  { key: "execute", label: "执行动作", aliases: ["execute", "execution"], Icon: Play },
+  { key: "verify", label: "结果验证", aliases: ["verify", "verification"], Icon: CheckCheck },
 ];
 
 export function FlowGraph({ nodes, onSelectNode }: FlowGraphProps) {
@@ -42,13 +44,14 @@ export function FlowGraph({ nodes, onSelectNode }: FlowGraphProps) {
                   <span className="flow-node-index">0{index + 1}</span>
                   <span className="status-dot" />
                 </span>
+                <span className="flow-node-icon" aria-hidden="true"><stage.Icon size={14} strokeWidth={2} /></span>
                 <strong>{stage.label}</strong>
                 <span className="flow-node-status">{statusLabel(node.status, "排队中")}</span>
                 <span className="flow-node-duration">{durationLabel(node.duration_ms)}</span>
                 {node.owner && <span className="flow-node-owner">{node.owner}</span>}
                 {node.error && <span className="flow-node-error">{node.error}</span>}
               </button>
-              {index < stages.length - 1 && <span className="flow-arrow" aria-hidden="true">→</span>}
+              {index < stages.length - 1 && <span className="flow-arrow" aria-hidden="true"><ChevronRight size={13} /></span>}
             </div>
           );
         })}

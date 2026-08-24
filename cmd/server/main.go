@@ -16,7 +16,6 @@ import (
 
 	"oncall-agent/internal/api"
 	"oncall-agent/internal/approval"
-	"oncall-agent/internal/auth"
 	"oncall-agent/internal/config"
 	"oncall-agent/internal/conversation"
 	"oncall-agent/internal/diagnose"
@@ -175,16 +174,15 @@ func run() error {
 	})
 	executor.Start(ctx)
 
-	// The Web surface is intentionally public: console requests use a stable
-	// anonymous actor and do not require a browser session, CSRF token or login.
-	// Keep the existing opt-in assembly so webhook-only deployments do not expose
-	// the console merely by upgrading the binary.
-	legacyTrustedOperator := strings.TrimSpace(cfg.Web.TrustedOperator)
-	webEnabled := strings.TrimSpace(cfg.Web.BaseURL) != "" || strings.TrimSpace(cfg.Web.SessionSecret) != "" || legacyTrustedOperator != "" || provider == "feishu_app"
-	var consoleAuth api.SessionAuthenticator
+	// The Web surface is intentionally public: console requests carry a stable
+	// anonymous actor and require no login or CSRF token. Assembly stays opt-in
+	// so webhook-only deployments do not expose the console merely by upgrading
+	// the binary; a nil console keeps every browser route closed.
+	webEnabled := strings.TrimSpace(cfg.Web.BaseURL) != "" || provider == "feishu_app"
+	var console *api.Console
 	var conversationService conversation.Service
 	if webEnabled {
-		consoleAuth = api.NewAnonymousConsoleAuthenticator()
+		console = api.NewConsole()
 		conversationService = conversation.NewService(db)
 	}
 	if feishuClient != nil {
@@ -249,29 +247,29 @@ func run() error {
 	server.BindHandler("/api/v1/incidents/:id/diagnose", incidentAPI.Handle)
 	server.BindHandler("/metrics", api.MetricsHandler)
 	server.BindHandler("/debug/evidence/:id", api.NewEvidenceDebugAPI(evidenceBuilder, cfg.Server.AuthToken).Handle)
-	approvalAPI := api.NewApprovalAPI(approvalSvc, cfg.Server.AuthToken, consoleAuth)
+	approvalAPI := api.NewApprovalAPI(approvalSvc, cfg.Server.AuthToken, console)
 	server.BindHandler("/api/v1/approvals", approvalAPI.Handle)
 	server.BindHandler("/api/v1/approvals/:id", approvalAPI.Handle)
 	server.BindHandler("/api/v1/approvals/:id/approve", approvalAPI.Handle)
 	server.BindHandler("/api/v1/approvals/:id/deny", approvalAPI.Handle)
-	modelAPI := api.NewModelAPI(modelSwitcher, cfg.Server.AuthToken, consoleAuth)
+	modelAPI := api.NewModelAPI(modelSwitcher, cfg.Server.AuthToken, console)
 	server.BindHandler("/api/v1/admin/model", modelAPI.Handle)
 
 	if webEnabled {
-		controlRoomAPI := api.NewControlRoomAPI(db, consoleAuth)
+		controlRoomAPI := api.NewControlRoomAPI(db, console)
 		server.BindHandler("/api/v1/incidents/:id/control-room", controlRoomAPI.Handle)
 		server.BindHandler("/api/v1/control-room/incidents", controlRoomAPI.Handle)
 		server.BindHandler("/api/v1/control-room/model", modelAPI.Handle)
 		server.BindHandler("/api/v1/incidents/:id/events", controlRoomAPI.Handle)
 		server.BindHandler("/api/v1/incidents/:id/problems", controlRoomAPI.Handle)
-		runAPI := api.NewRunAPI(db, consoleAuth)
+		runAPI := api.NewRunAPI(db, console)
 		server.BindHandler("/api/v1/incidents/:id/runs", runAPI.Handle)
 		server.BindHandler("/api/v1/runs/:id/steps", runAPI.Handle)
 		server.BindHandler("/api/v1/incidents/:id/runs/:run_id/steps", runAPI.Handle)
-		streamAPI := api.NewStreamAPI(db, consoleAuth)
+		streamAPI := api.NewStreamAPI(db, console)
 		server.BindHandler("/api/v1/incidents/:id/stream", streamAPI.Handle)
 		actionService := &incidentActionService{db: db, severityRoute: cfg.Diagnose.SeverityRoute, questions: conversationService}
-		conversationAPI := api.NewConversationAPI(conversationService, consoleAuth, actionService)
+		conversationAPI := api.NewConversationAPI(conversationService, console, actionService)
 		server.BindHandler("/api/v1/incidents/:id/conversation", conversationAPI.Handle)
 		server.BindHandler("/api/v1/incidents/:id/questions", conversationAPI.Handle)
 		server.BindHandler("/api/v1/incidents/:id/rediagnose", conversationAPI.Handle)
@@ -312,7 +310,7 @@ type incidentActionService struct {
 	questions     conversation.Service
 }
 
-func (s *incidentActionService) Rediagnose(ctx context.Context, incidentID uint64, _ auth.Actor) (store.AgentRun, error) {
+func (s *incidentActionService) Rediagnose(ctx context.Context, incidentID uint64, _ api.Actor) (store.AgentRun, error) {
 	if s == nil || s.db == nil {
 		return store.AgentRun{}, errors.New("server: incident action service unavailable")
 	}
@@ -332,7 +330,7 @@ func (s *incidentActionService) Rediagnose(ctx context.Context, incidentID uint6
 	})
 }
 
-func (s *incidentActionService) RequestEvidence(ctx context.Context, incidentID uint64, actor auth.Actor, request string) error {
+func (s *incidentActionService) RequestEvidence(ctx context.Context, incidentID uint64, actor api.Actor, request string) error {
 	if s == nil || s.questions == nil {
 		return errors.New("server: conversation service unavailable")
 	}

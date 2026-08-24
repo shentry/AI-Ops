@@ -55,7 +55,7 @@ func (r *recordingIncidentTx) ResolveIncident(context.Context, uint64, time.Time
 	return false, nil
 }
 
-func (r *recordingIncidentTx) EnqueueAgentRun(context.Context, store.AgentRun) error {
+func (r *recordingIncidentTx) EnqueueAgentRun(context.Context, *store.AgentRun) error {
 	return nil
 }
 

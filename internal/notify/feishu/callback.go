@@ -32,23 +32,6 @@ func NewDispatcher(verificationToken, encryptKey string, handlers CallbackHandle
 	return RegisterHandlers(dispatcher, handlers)
 }
 
-// NewEventDispatcher is an explicit alias for assembly code that wants to
-// distinguish this configured dispatcher from the SDK constructor.
-func NewEventDispatcher(verificationToken, encryptKey string, handlers CallbackHandlers) *larkdispatcher.EventDispatcher {
-	return NewDispatcher(verificationToken, encryptKey, handlers)
-}
-
-// NewCallbackDispatcher is the descriptive constructor used by HTTP route
-// assembly code.
-func NewCallbackDispatcher(verificationToken, encryptKey string, handlers CallbackHandlers) *larkdispatcher.EventDispatcher {
-	return NewDispatcher(verificationToken, encryptKey, handlers)
-}
-
-// RegisterCallbacks is an alias that makes the registration step explicit.
-func RegisterCallbacks(dispatcher *larkdispatcher.EventDispatcher, handlers CallbackHandlers) *larkdispatcher.EventDispatcher {
-	return RegisterHandlers(dispatcher, handlers)
-}
-
 // RegisterHandlers installs callbacks on an existing official dispatcher. It
 // always registers both event types so a missing business handler fails as a
 // controlled callback error instead of silently returning success.

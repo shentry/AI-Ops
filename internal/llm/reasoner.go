@@ -95,7 +95,7 @@ func (r *Reasoner) Diagnose(ctx context.Context, evidence string, mode string) (
 	if strings.TrimSpace(evidence) == "" {
 		return nil, errors.New("llm: evidence is empty")
 	}
-	chatModel, err := r.factory.Build(RoleReasoner)
+	chatModel, err := r.factory.Build()
 	if err != nil {
 		return nil, err
 	}

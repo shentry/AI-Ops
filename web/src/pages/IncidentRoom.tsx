@@ -1,3 +1,4 @@
+import { MessagesSquare, OctagonAlert, Radar, RefreshCw, RotateCcw } from "lucide-react";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -185,6 +186,7 @@ export function IncidentRoom({ incidentId, actorName, modelState, onModelChanged
     return (
       <main className="shell center-stage" aria-busy="true">
         <div className="loading-card">
+          <span className="card-icon"><Radar size={17} strokeWidth={2} /></span>
           <span className="eyebrow">作战台</span>
           <h1>正在加载 Incident #{incidentId}</h1>
           <div className="loading-line" />
@@ -197,6 +199,7 @@ export function IncidentRoom({ incidentId, actorName, modelState, onModelChanged
     return (
       <main className="shell center-stage">
         <div className="error-card" role="alert">
+          <span className="card-icon card-icon-danger"><OctagonAlert size={17} strokeWidth={2} /></span>
           <span className="eyebrow">作战台</span>
           <h1>打不开这个 Incident</h1>
           <p>{error ?? "数据加载失败。"}</p>
@@ -215,7 +218,7 @@ export function IncidentRoom({ incidentId, actorName, modelState, onModelChanged
     <main className="shell room-shell">
       <header className="topbar">
         <a className="brand" href="/" aria-label="返回 Incident 列表">
-          <span className="brand-mark">O</span>
+          <span className="brand-mark"><Radar size={15} strokeWidth={2} /></span>
           <span>值班 <b>控制台</b></span>
         </a>
         <div className="topbar-actions">
@@ -247,6 +250,7 @@ export function IncidentRoom({ incidentId, actorName, modelState, onModelChanged
             type="button"
             onClick={() => conversationRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })}
           >
+            <MessagesSquare size={14} />
             问 Agent
           </button>
           <button
@@ -256,12 +260,14 @@ export function IncidentRoom({ incidentId, actorName, modelState, onModelChanged
             onClick={() => void refresh(true)}
           >
             {refreshing ? "刷新中…" : "刷新"}
+            <RefreshCw size={13} className={refreshing ? "spin" : undefined} />
           </button>
           <button
             className="button primary"
             type="button"
             onClick={() => void handleAction(() => rediagnose(incident.id), "已排队一次新的诊断。")}
           >
+            <RotateCcw size={13} />
             重新诊断
           </button>
         </div>

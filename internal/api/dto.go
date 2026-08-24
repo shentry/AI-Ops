@@ -1,8 +1,6 @@
 package api
 
 import (
-	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -12,46 +10,39 @@ import (
 
 	"gorm.io/datatypes"
 
-	"oncall-agent/internal/auth"
 	"oncall-agent/internal/diagnose"
 	"oncall-agent/internal/store"
 )
 
-// SessionAuthenticator is the narrow identity seam used by control-room
-// handlers. Production may supply the public AnonymousConsoleAuthenticator or
-// a legacy session implementation; handlers never trust an actor from input.
-type SessionAuthenticator interface {
-	Authenticate(context.Context, *http.Request) (auth.Actor, store.WebSession, error)
+// Actor is the audit identity recorded for a control-room action. The console
+// is deliberately public, so every browser request carries the same fixed
+// anonymous identity; automation authenticates with the Bearer token instead.
+type Actor struct {
+	ID   string
+	Name string
 }
 
-// SessionAuthorizer is implemented by session-backed authenticators. The
-// methods remain optional at the HTTP seam so the explicit anonymous adapter
-// can intentionally bypass CSRF and operator checks.
-type SessionAuthorizer interface {
-	SessionAuthenticator
-	CheckCSRF(*http.Request, store.WebSession) error
-	CheckOperator(auth.Actor) error
+const (
+	anonymousConsoleActorID   = "anonymous"
+	anonymousConsoleActorName = "匿名用户"
+)
+
+// Console marks the control room as assembled. A nil *Console means the console
+// was not enabled for this deployment: its handlers reject every request rather
+// than serving Incident data to an unconfigured surface.
+type Console struct{ actor Actor }
+
+func NewConsole() *Console {
+	return &Console{actor: Actor{ID: anonymousConsoleActorID, Name: anonymousConsoleActorName}}
 }
 
-// AnonymousConsoleAuthenticator is the deliberate no-login adapter for the
-// control room. Every request receives the same audit identity; CSRF and
-// operator checks are no-ops because the console is explicitly public.
-// Bearer-protected automation handlers do not use this adapter.
-type AnonymousConsoleAuthenticator struct{}
-
-const anonymousConsoleActorID = "anonymous"
-
-func NewAnonymousConsoleAuthenticator() AnonymousConsoleAuthenticator {
-	return AnonymousConsoleAuthenticator{}
+// Actor returns the console identity, or false when the console is disabled.
+func (c *Console) Actor() (Actor, bool) {
+	if c == nil {
+		return Actor{}, false
+	}
+	return c.actor, true
 }
-
-func (AnonymousConsoleAuthenticator) Authenticate(context.Context, *http.Request) (auth.Actor, store.WebSession, error) {
-	return auth.Actor{ID: anonymousConsoleActorID, Name: "匿名用户"}, store.WebSession{}, nil
-}
-
-func (AnonymousConsoleAuthenticator) CheckCSRF(*http.Request, store.WebSession) error { return nil }
-
-func (AnonymousConsoleAuthenticator) CheckOperator(auth.Actor) error { return nil }
 
 // IncidentDTO is the browser-safe Incident projection. It deliberately omits
 // raw alerts, annotations, labels and generator URLs.
@@ -278,12 +269,6 @@ type ControlRoomDTO struct {
 	RecentEvents    []EventDTO          `json:"recent_events"`
 }
 
-// Descriptive aliases keep the public surface easy to discover without
-// creating a second representation or serialization path.
-type MemberDTO = IncidentMemberDTO
-type StepDTO = RunStepDTO
-type ConversationDTO = ConversationMessageDTO
-
 func safeText(value string, max int) string {
 	value = diagnose.ToSafeText(value)
 	value = diagnose.Sanitize(value)
@@ -433,55 +418,6 @@ func parseLimit(raw string) (int, error) {
 
 func pageInfo(after uint64, limit uint64, count int, next uint64) PageInfo {
 	return PageInfo{After: after, NextAfter: next, Limit: int(limit), HasMore: count >= int(limit) && next != after}
-}
-
-func authenticateSession(a SessionAuthenticator, r *http.Request) (auth.Actor, store.WebSession, bool) {
-	if a == nil || r == nil {
-		return auth.Actor{}, store.WebSession{}, false
-	}
-	actor, session, err := a.Authenticate(r.Context(), r)
-	if err != nil || strings.TrimSpace(actor.ID) == "" {
-		return auth.Actor{}, store.WebSession{}, false
-	}
-	return actor, session, true
-}
-
-func requireWriteSession(a SessionAuthenticator, r *http.Request) (auth.Actor, store.WebSession, int, string) {
-	actor, session, ok := authenticateSession(a, r)
-	if !ok {
-		return auth.Actor{}, store.WebSession{}, http.StatusUnauthorized, "unauthorized"
-	}
-	if authorizer, ok := a.(interface {
-		CheckCSRF(*http.Request, store.WebSession) error
-	}); ok {
-		if err := authorizer.CheckCSRF(r, session); err != nil {
-			return auth.Actor{}, store.WebSession{}, http.StatusForbidden, "csrf validation failed"
-		}
-	} else if !checkCSRFLocally(r, session) {
-		return auth.Actor{}, store.WebSession{}, http.StatusForbidden, "csrf validation failed"
-	}
-	if authorizer, ok := a.(interface{ CheckOperator(auth.Actor) error }); ok {
-		if err := authorizer.CheckOperator(actor); err != nil {
-			return auth.Actor{}, store.WebSession{}, http.StatusForbidden, "operator is not allowed"
-		}
-	}
-	return actor, session, 0, ""
-}
-
-func checkCSRFLocally(r *http.Request, session store.WebSession) bool {
-	if r == nil {
-		return false
-	}
-	header := strings.TrimSpace(r.Header.Get("X-CSRF-Token"))
-	cookie, err := r.Cookie("oncall_csrf")
-	if err != nil {
-		return false
-	}
-	value := strings.TrimSpace(cookie.Value)
-	if header == "" || value == "" || subtle.ConstantTimeCompare([]byte(header), []byte(value)) != 1 {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(auth.HashSecret(header)), []byte(session.CSRFTokenHash)) == 1
 }
 
 func writePage(w http.ResponseWriter, key string, values any, after uint64, limit int, count int, next uint64) {
