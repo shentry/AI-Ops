@@ -43,7 +43,7 @@ func TestModelAPIPublicStatusAndBearerMutation(t *testing.T) {
 		selection: llm.ModelSelection{Model: "glm-5", UpdatedAt: time.Date(2026, 8, 22, 21, 0, 0, 0, time.UTC)},
 		options:   []llm.ModelOption{{ID: "glm-5"}, {ID: "deepseek-v4-pro", ThinkingEnabled: true}},
 	}
-	api := NewModelAPI(svc, "secret", NewAnonymousConsoleAuthenticator())
+	api := NewModelAPI(svc, "secret", NewConsole())
 
 	public := httptest.NewRecorder()
 	api.ServeHTTP(public, httptest.NewRequest(http.MethodGet, "/api/v1/control-room/model", nil))

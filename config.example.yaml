@@ -17,13 +17,6 @@ llm:
       max_tokens: 8192
       thinking:
         enabled: false
-    summarizer:
-      base_url: "https://your-openai-compatible-endpoint"
-      api_key: "${ARK_KEY}"
-      model: "your-model"
-      max_tokens: 4096
-      thinking:
-        enabled: false
   # 运行时切换只能从此 allowlist 选择；不要加入未经授权的模型。
   models:
     - id: "your-model"
@@ -103,9 +96,5 @@ notify:
     #   web_base_url: "https://oncall.example.com"
 web:
   base_url: "http://127.0.0.1:8080"  # 非空即启用公开控制台
-  # 以下字段仅为旧配置兼容，不再参与控制台登录或写操作鉴权。
-  session_secret: ""
-  session_ttl_minutes: 480
-  cookie_secure: false
+  # 飞书审批卡片的操作人 open_id 白名单（仅约束飞书回调，不影响公开控制台）。
   operator_allowlist: []
-  trusted_operator: "oncall"

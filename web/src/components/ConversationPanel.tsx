@@ -1,3 +1,4 @@
+import { Bot, SendHorizontal, Wrench } from "lucide-react";
 import { FormEvent, useMemo, useState } from "react";
 
 import { ApiError, ConversationMessage, askQuestion } from "../api";
@@ -66,6 +67,7 @@ export function ConversationPanel({ incidentID, messages, onMessage }: Conversat
           <small>{question.length}/4000 · 只允许只读工具</small>
           <button className="button primary" type="submit" disabled={busy || !question.trim()}>
             {busy ? "提交中…" : "提问"}
+            <SendHorizontal size={13} />
           </button>
         </div>
       </form>
@@ -80,12 +82,12 @@ function MessageBubble({ message }: { message: ConversationMessage }) {
   return (
     <article className={`message-bubble role-${message.role}`}>
       <div className="message-meta">
-        <strong>{message.role === "assistant" ? "排障 Agent" : message.actor_name || roleLabel(message.role)}</strong>
+        <strong>{message.role === "assistant" ? <Bot size={13} /> : null}{message.role === "assistant" ? "排障 Agent" : message.actor_name || roleLabel(message.role)}</strong>
         <time dateTime={message.created_at}>{timeLabel(message.created_at)}</time>
         <span className={`message-status status-${message.status}`}>{statusLabel(message.status)}</span>
       </div>
       <p className="message-content">{message.content || (message.status === "queued" ? "问题已排队，等待 Agent 回答…" : "")}</p>
-      {message.tool_name && <span className="tool-chip">工具 · {message.tool_name}</span>}
+      {message.tool_name && <span className="tool-chip"><Wrench size={10} />工具 · {message.tool_name}</span>}
       {citations.length > 0 && (
         <div className="citation-list"><span>依据</span>{citations.slice(0, 12).map((citation, index) => <cite key={`${citationID(citation)}-${index}`}>{citationLabel(citation)}</cite>)}</div>
       )}

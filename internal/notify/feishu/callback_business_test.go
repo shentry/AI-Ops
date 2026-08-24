@@ -11,11 +11,15 @@ import (
 	"oncall-agent/internal/store"
 )
 
-type fakeReceipts struct {
+// fakeCallbackStore implements the whole CallbackStore contract. Receipt claims
+// are the only behaviour these tests exercise; the remaining methods record
+// nothing and must stay present so the fake compiles against the real contract.
+type fakeCallbackStore struct {
 	claimed map[string]bool
+	events  []store.IncidentEvent
 }
 
-func (f *fakeReceipts) ClaimIntegrationEventReceipt(_ context.Context, receipt store.IntegrationEventReceipt) (bool, error) {
+func (f *fakeCallbackStore) ClaimIntegrationEventReceipt(_ context.Context, receipt store.IntegrationEventReceipt) (bool, error) {
 	if f.claimed == nil {
 		f.claimed = map[string]bool{}
 	}
@@ -25,8 +29,27 @@ func (f *fakeReceipts) ClaimIntegrationEventReceipt(_ context.Context, receipt s
 	f.claimed[receipt.EventID] = true
 	return true, nil
 }
-func (f *fakeReceipts) CompleteIntegrationEventReceipt(context.Context, string, string, time.Time) error {
+
+func (f *fakeCallbackStore) CompleteIntegrationEventReceipt(context.Context, string, string, time.Time) error {
 	return nil
+}
+
+func (f *fakeCallbackStore) DeleteIntegrationEventReceipt(_ context.Context, eventID string) error {
+	delete(f.claimed, eventID)
+	return nil
+}
+
+func (f *fakeCallbackStore) CreateIMBinding(_ context.Context, binding store.IMBinding) (store.IMBinding, error) {
+	return binding, nil
+}
+
+func (f *fakeCallbackStore) FindIMBinding(context.Context, string, string, string, string, string) (store.IMBinding, error) {
+	return store.IMBinding{}, ErrCallbackBinding
+}
+
+func (f *fakeCallbackStore) AppendIncidentEvent(_ context.Context, event store.IncidentEvent) (store.IncidentEvent, error) {
+	f.events = append(f.events, event)
+	return event, nil
 }
 
 type fakeApproval struct {
@@ -65,7 +88,7 @@ func cardEvent(eventID, openID, action string, approvalID uint64, planHash strin
 func TestCardActionApproveUsesSharedDecide(t *testing.T) {
 	approval := &fakeApproval{row: store.Approval{ID: 7, Status: "pending", PlanHash: "abc"}}
 	business := NewCallbackBusiness(BusinessDependencies{
-		Receipts:          &fakeReceipts{},
+		Store:             &fakeCallbackStore{},
 		Approval:          approval,
 		OperatorAllowlist: []string{"ou_ops"},
 	})
@@ -83,9 +106,9 @@ func TestCardActionApproveUsesSharedDecide(t *testing.T) {
 
 func TestCardActionDuplicateReceiptIsIdempotent(t *testing.T) {
 	approval := &fakeApproval{row: store.Approval{ID: 7, Status: "pending", PlanHash: "abc"}}
-	receipts := &fakeReceipts{}
+	receipts := &fakeCallbackStore{}
 	business := NewCallbackBusiness(BusinessDependencies{
-		Receipts:          receipts,
+		Store:             receipts,
 		Approval:          approval,
 		OperatorAllowlist: []string{"ou_ops"},
 	})
@@ -108,7 +131,7 @@ func TestCardActionDuplicateReceiptIsIdempotent(t *testing.T) {
 func TestCardActionRequestEvidenceIsRejectedWithoutFalseSuccess(t *testing.T) {
 	approval := &fakeApproval{row: store.Approval{ID: 7, Status: "pending", PlanHash: "abc"}}
 	business := NewCallbackBusiness(BusinessDependencies{
-		Receipts:          &fakeReceipts{},
+		Store:             &fakeCallbackStore{},
 		Approval:          approval,
 		OperatorAllowlist: []string{"ou_ops"},
 	})
@@ -127,7 +150,7 @@ func TestCardActionRequestEvidenceIsRejectedWithoutFalseSuccess(t *testing.T) {
 func TestCardActionRejectsUnknownOperator(t *testing.T) {
 	approval := &fakeApproval{row: store.Approval{ID: 7, Status: "pending", PlanHash: "abc"}}
 	business := NewCallbackBusiness(BusinessDependencies{
-		Receipts:          &fakeReceipts{},
+		Store:             &fakeCallbackStore{},
 		Approval:          approval,
 		OperatorAllowlist: []string{"ou_ops"},
 	})

@@ -1,3 +1,4 @@
+import { Check, FlaskConical, ShieldCheck, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
 import { ApprovalDTO } from "../api";
@@ -31,7 +32,7 @@ export function ApprovalPanel({ approval, onDecide, onRequestEvidence }: Approva
       <section className="panel approval-panel" aria-labelledby="approval-title">
         <div className="panel-heading">
           <div><span className="eyebrow">变更闸门</span><h2 id="approval-title">人工审批</h2></div>
-          <span className="status-pill status-succeeded">无待批</span>
+          <span className="status-pill status-succeeded"><ShieldCheck size={11} />无待批</span>
         </div>
         <div className="empty-state compact-empty"><p>没有待审批的变更</p><small>Policy 尚未拦下任何动作。</small></div>
       </section>
@@ -79,14 +80,17 @@ export function ApprovalPanel({ approval, onDecide, onRequestEvidence }: Approva
       />
       <div className="approval-actions">
         <button className="button danger" type="button" disabled={busy || expired || approval.status !== "pending" || !reason.trim()} onClick={() => void decide(false)}>
+          <X size={13} />
           拒绝
         </button>
         <button className="button primary" type="button" disabled={busy || expired || approval.status !== "pending"} onClick={() => void decide(true)}>
+          <Check size={13} />
           批准执行
         </button>
       </div>
       {onRequestEvidence && approval.status === "pending" && (
         <button className="text-button" type="button" disabled={busy} onClick={() => onRequestEvidence(approval.id)}>
+          <FlaskConical size={12} />
           先补充证据再决定
         </button>
       )}

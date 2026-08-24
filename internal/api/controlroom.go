@@ -12,47 +12,31 @@ import (
 )
 
 // ControlRoomStore is the read-only database seam for Incident control-room
-// projections. *store.DB satisfies it directly; tests can provide a small fake.
+// projections. *store.DB satisfies it directly; tests provide a small fake.
+// Every method is required: a partially-implemented store must fail to compile
+// rather than degrade one panel of the room at runtime.
 type ControlRoomStore interface {
 	GetIncident(context.Context, uint64) (store.Incident, error)
 	ListIncidentMembers(context.Context, uint64) ([]store.IncidentMember, error)
 	ListIncidentEvents(context.Context, uint64, uint64, int) ([]store.IncidentEvent, error)
+	ListLatestIncidentEvents(context.Context, uint64, int) ([]store.IncidentEvent, error)
 	ListIncidentProblems(context.Context, uint64, string, int) ([]store.IncidentProblem, error)
 	ListAgentRuns(context.Context, uint64, uint64, int) ([]store.AgentRun, error)
+	ListIncidentRunSteps(context.Context, uint64, uint64, uint64, int) ([]store.AgentRunStep, error)
 	ListIncidentApprovals(context.Context, uint64, string, int) ([]store.Approval, error)
-}
-
-// ApprovalReader is optional because the control-room aggregate only needs the
-// Incident-scoped approval list. Providing it enables GET /api/v1/approvals/:id
-// with the same browser session boundary.
-type ApprovalReader interface {
+	ListLatestIncidents(context.Context, string, int) ([]store.Incident, error)
 	GetApproval(context.Context, uint64) (store.Approval, error)
 }
 
-// IncidentLister is optional and powers the console's incident picker. The
-// Bearer-authenticated IncidentAPI keeps returning store rows for automation;
-// this seam exists so the browser reads the same sanitized DTO as every other
-// control-room view.
-type IncidentLister interface {
-	ListLatestIncidents(context.Context, string, int) ([]store.Incident, error)
-}
-
-// IncidentRunStepReader is optional for first-paint flow nodes. The dedicated
-// RunAPI always requires this method for ownership-safe step reads.
-type IncidentRunStepReader interface {
-	ListIncidentRunSteps(context.Context, uint64, uint64, uint64, int) ([]store.AgentRunStep, error)
-}
-
 // ControlRoomAPI serves the public, read-only Incident projection.
-// Mutating operations live in ConversationAPI and are injected separately; the
-// route assembly decides whether the authenticator is anonymous or session-backed.
+// Mutating operations live in ConversationAPI and are injected separately.
 type ControlRoomAPI struct {
-	db   ControlRoomStore
-	auth SessionAuthenticator
+	db      ControlRoomStore
+	console *Console
 }
 
-func NewControlRoomAPI(db ControlRoomStore, auth SessionAuthenticator) *ControlRoomAPI {
-	return &ControlRoomAPI{db: db, auth: auth}
+func NewControlRoomAPI(db ControlRoomStore, console *Console) *ControlRoomAPI {
+	return &ControlRoomAPI{db: db, console: console}
 }
 
 // Handle adapts the standard-library handler to GoFrame routing.
@@ -77,7 +61,7 @@ func (h *ControlRoomAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid incident id")
 			return
 		}
-		if _, _, ok := authenticateSession(h.auth, r); !ok {
+		if _, ok := h.console.Actor(); !ok {
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
@@ -99,7 +83,7 @@ func (h *ControlRoomAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid approval id")
 			return
 		}
-		if _, _, ok := authenticateSession(h.auth, r); !ok {
+		if _, ok := h.console.Actor(); !ok {
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
@@ -107,7 +91,7 @@ func (h *ControlRoomAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(parts) == 2 && parts[0] == "control-room" && parts[1] == "incidents" {
-		if _, _, ok := authenticateSession(h.auth, r); !ok {
+		if _, ok := h.console.Actor(); !ok {
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
@@ -143,7 +127,7 @@ func (h *ControlRoomAPI) controlRoom(w http.ResponseWriter, r *http.Request, id 
 		writeError(w, http.StatusServiceUnavailable, "list incident approvals failed")
 		return
 	}
-	events, err := h.latestEvents(r.Context(), id, 20)
+	events, err := h.db.ListLatestIncidentEvents(r.Context(), id, 20)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "list incident events failed")
 		return
@@ -179,12 +163,10 @@ func (h *ControlRoomAPI) controlRoom(w http.ResponseWriter, r *http.Request, id 
 		}
 		current := runDTO(currentRun)
 		response.CurrentRun = &current
-		if stepReader, ok := h.db.(IncidentRunStepReader); ok {
-			steps, err = stepReader.ListIncidentRunSteps(r.Context(), id, currentRun.ID, 0, 100)
-			if err != nil {
-				writeError(w, http.StatusServiceUnavailable, "list run steps failed")
-				return
-			}
+		steps, err = h.db.ListIncidentRunSteps(r.Context(), id, currentRun.ID, 0, 100)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "list run steps failed")
+			return
 		}
 	}
 	response.FlowNodes = controlRoomFlowNodes(incident, steps, approvals, events)
@@ -251,23 +233,6 @@ func flowEventStatus(status string) string {
 	}
 }
 
-func (h *ControlRoomAPI) latestEvents(ctx context.Context, incidentID uint64, limit int) ([]store.IncidentEvent, error) {
-	type latestReader interface {
-		ListLatestIncidentEvents(context.Context, uint64, int) ([]store.IncidentEvent, error)
-	}
-	if reader, ok := h.db.(latestReader); ok {
-		return reader.ListLatestIncidentEvents(ctx, incidentID, limit)
-	}
-	events, err := h.db.ListIncidentEvents(ctx, incidentID, 0, 100)
-	if err != nil {
-		return nil, err
-	}
-	if len(events) > limit {
-		events = events[len(events)-limit:]
-	}
-	return events, nil
-}
-
 func (h *ControlRoomAPI) events(w http.ResponseWriter, r *http.Request, id uint64) {
 	after, limit, ok := parsePageQuery(w, r)
 	if !ok {
@@ -318,12 +283,7 @@ func (h *ControlRoomAPI) problems(w http.ResponseWriter, r *http.Request, id uin
 }
 
 func (h *ControlRoomAPI) approval(w http.ResponseWriter, r *http.Request, id uint64) {
-	reader, ok := h.db.(ApprovalReader)
-	if !ok {
-		writeError(w, http.StatusNotImplemented, "approval reader unavailable")
-		return
-	}
-	row, err := reader.GetApproval(r.Context(), id)
+	row, err := h.db.GetApproval(r.Context(), id)
 	if err != nil {
 		writeStoreError(w, err, store.ErrApprovalNotFound, "approval not found", "get approval failed")
 		return
@@ -335,17 +295,12 @@ func (h *ControlRoomAPI) approval(w http.ResponseWriter, r *http.Request, id uin
 // by design: the picker needs the current page, and every deeper view is reached
 // by incident id.
 func (h *ControlRoomAPI) incidents(w http.ResponseWriter, r *http.Request) {
-	lister, ok := h.db.(IncidentLister)
-	if !ok {
-		writeError(w, http.StatusNotImplemented, "incident lister unavailable")
-		return
-	}
 	limit, err := parseLimit(r.URL.Query().Get("limit"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	rows, err := lister.ListLatestIncidents(r.Context(), strings.TrimSpace(r.URL.Query().Get("status")), limit)
+	rows, err := h.db.ListLatestIncidents(r.Context(), strings.TrimSpace(r.URL.Query().Get("status")), limit)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "list incidents failed")
 		return

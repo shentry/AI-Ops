@@ -50,8 +50,14 @@ func (s *stubWorkerStore) AppendIncidentEvent(_ context.Context, event store.Inc
 func (s *stubWorkerStore) OpenIncidentProblem(_ context.Context, problem store.IncidentProblem) (store.IncidentProblem, error) {
 	return problem, nil
 }
-func (s *stubWorkerStore) ListIncidents(context.Context, string) ([]store.Incident, error) {
-	return nil, nil
+func (s *stubWorkerStore) NextQueuedConversationMessage(context.Context) (store.ConversationMessage, bool, error) {
+	return store.ConversationMessage{}, false, nil
+}
+func (s *stubWorkerStore) RequeueStaleConversationMessages(context.Context, time.Time) (int64, error) {
+	return 0, nil
+}
+func (s *stubWorkerStore) ResolveIncidentProblem(context.Context, uint64, string, *uint64, time.Time) (bool, error) {
+	return false, nil
 }
 func (s *stubWorkerStore) ClaimConversationMessage(context.Context, uint64, time.Time) (bool, error) {
 	return true, nil

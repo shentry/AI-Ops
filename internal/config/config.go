@@ -63,8 +63,7 @@ type ModelProfile struct {
 }
 
 type LLMRoles struct {
-	Reasoner   RoleConfig `yaml:"reasoner"`
-	Summarizer RoleConfig `yaml:"summarizer"`
+	Reasoner RoleConfig `yaml:"reasoner"`
 }
 
 type RoleConfig struct {
@@ -198,19 +197,14 @@ type FeishuConfig struct {
 	WebBaseURL        string `yaml:"web_base_url"`
 }
 
-// WebConfig controls the browser control-room surface. The console is public
-// when base_url, a legacy session/trusted field, or feishu_app enables it;
-// session fields are retained for compatible configuration files but are not
-// required by the anonymous console.
+// WebConfig controls the browser control-room surface. A non-empty base_url
+// (or a configured feishu_app provider) enables the public console; the console
+// has no login, so there is no session or cookie configuration.
 type WebConfig struct {
-	BaseURL           string   `yaml:"base_url"`
-	SessionSecret     string   `yaml:"session_secret"`
-	SessionTTLMinutes int      `yaml:"session_ttl_minutes"`
-	CookieSecure      bool     `yaml:"cookie_secure"`
+	BaseURL string `yaml:"base_url"`
+	// OperatorAllowlist is the Feishu open_id allowlist for approval cards. It
+	// governs the Feishu callback only; the public console is not gated by it.
 	OperatorAllowlist []string `yaml:"operator_allowlist"`
-	// TrustedOperator remains an opt-in switch for deployments that already use
-	// this field. Its value is not used as an authenticated identity anymore.
-	TrustedOperator string `yaml:"trusted_operator"`
 }
 
 // Load 读 YAML、展开 ${ENV}、套上非敏感默认值，再校验必填项和数值边界。
@@ -249,8 +243,7 @@ func defaultConfig() Config {
 	return Config{
 		Server: ServerConfig{Port: 8080},
 		LLM: LLMConfig{Roles: LLMRoles{
-			Reasoner:   RoleConfig{MaxTokens: 2048},
-			Summarizer: RoleConfig{MaxTokens: 1024},
+			Reasoner: RoleConfig{MaxTokens: 2048},
 		}},
 		Ingest: IngestConfig{
 			SeverityLabel:   "severity",
@@ -296,7 +289,6 @@ func defaultConfig() Config {
 			Logs:   LogsConfig{Provider: "cls"},
 			Docker: DockerToolsConfig{RestartMinIntervalSeconds: 60, RestartMaxPerHour: 3},
 		},
-		Web: WebConfig{SessionTTLMinutes: 480, CookieSecure: true},
 	}
 }
 
@@ -417,13 +409,7 @@ func validate(cfg Config) error {
 	if cfg.LLM.Roles.Reasoner.MaxTokens < 1 {
 		return fmt.Errorf("config: llm.roles.reasoner.max_tokens must be at least 1")
 	}
-	if cfg.LLM.Roles.Summarizer.MaxTokens < 1 {
-		return fmt.Errorf("config: llm.roles.summarizer.max_tokens must be at least 1")
-	}
 	if err := validateThinking("reasoner", cfg.LLM.Roles.Reasoner.Thinking); err != nil {
-		return err
-	}
-	if err := validateThinking("summarizer", cfg.LLM.Roles.Summarizer.Thinking); err != nil {
 		return err
 	}
 	if err := validateModelProfiles(cfg.LLM); err != nil {
@@ -459,17 +445,6 @@ func validate(cfg Config) error {
 		}
 	default:
 		return fmt.Errorf("config: notify.im.provider %q is unsupported", cfg.Notify.IM.Provider)
-	}
-
-	// The Web console is anonymous; session fields remain accepted only for
-	// compatibility with older configurations and are no longer required.
-	if strings.TrimSpace(cfg.Web.SessionSecret) != "" {
-		if len([]byte(cfg.Web.SessionSecret)) < 32 {
-			return fmt.Errorf("config: web.session_secret must be at least 32 bytes")
-		}
-		if err := validatePositiveMinutes("web.session_ttl_minutes", cfg.Web.SessionTTLMinutes); err != nil {
-			return err
-		}
 	}
 	return nil
 }

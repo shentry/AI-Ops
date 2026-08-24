@@ -54,7 +54,7 @@ Alertmanager
 | Incident 列表和详情 | `internal/api/incident.go` |
 | 手动重诊 | `POST /api/v1/incidents/{id}/diagnose` |
 | Approval 列表和决策 | `internal/api/approval.go` |
-| 审批状态机 | `internal/approval/service.go`、`internal/store/store.go` |
+| 审批状态机 | `internal/approval/service.go`、`internal/store/approval.go`、`internal/store/execution.go` |
 | 执行和 Verify | `internal/approval/executor.go`、`internal/diagnose/verify.go` |
 | Run 和 Step 持久化 | `internal/store/models.go` 中的 `AgentRun`、`AgentRunStep` |
 | 出站 IM 通知 | `internal/notify/notifier.go` |

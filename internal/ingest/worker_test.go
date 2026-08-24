@@ -53,10 +53,11 @@ func (f *fakeIncidentTx) ResolveIncident(_ context.Context, id uint64, _ time.Ti
 	return true, nil
 }
 
-func (f *fakeIncidentTx) EnqueueAgentRun(_ context.Context, run store.AgentRun) error {
+func (f *fakeIncidentTx) EnqueueAgentRun(_ context.Context, run *store.AgentRun) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.runs = append(f.runs, run)
+	run.ID = uint64(len(f.runs) + 1)
+	f.runs = append(f.runs, *run)
 	return nil
 }
 

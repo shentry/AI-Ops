@@ -21,6 +21,7 @@ V1 目标环境是 Sub2API 测试环境（网关 + PostgreSQL + Redis + 宿主�
 
 - Go 1.24+
 - Docker（Compose 提供 MySQL/Prometheus/Alertmanager/blackbox/node_exporter）
+- Node.js 20+（仅在需要 Web 控制台时；后端不依赖）
 
 ### 三步跑通
 
@@ -94,8 +95,16 @@ curl -X POST -H "Authorization: Bearer $AUTH_TOKEN" -H 'X-Operator: <你的工�
 ```yaml
 web:
   base_url: "http://127.0.0.1:8080"  # 非空即启用控制台
-  trusted_operator: "oncall"          # 兼容旧配置；不再作为登录身份
+  operator_allowlist: []              # 仅约束飞书审批卡片的操作人
 ```
+
+前端产物不入库，启用控制台前需先构建一次（产物落在 `web/dist/`，由 `//go:embed` 打进二进制）：
+
+```bash
+cd web && npm ci && npm run build && cd ..
+```
+
+未构建时后端照常编译运行，只是所有静态资源返回 404。
 
 打开 `http://127.0.0.1:8080/` 即进入 Incident 列表，点进去是实时作战台（流程节点、事件时间线、问题面板、Step 检查器、审批、对话）。控制台所有读写操作都以 `anonymous` 记录，任何能访问该端口的人都可批准、重诊、提问和请求补充证据。
 
@@ -155,11 +164,12 @@ go build ./... && go vet ./...
 
 ## 文档
 
-- [14 天实施计划](docs/14-day-plan/README.md)：每日清单、全局约束与验收记录
+- [当前架构](docs/current-architecture.md)：现状分层、数据流与关键不变量
+- [代码阅读指南](docs/code-reading-guide.md)：按链路顺序的源码导读
 - [系统设计](docs/ai-opus-system-design.md)
 - [Web 控制台与飞书协同接入方案](docs/web-feishu-control-room-design.md)：实时流程、问题面板、Incident 对话、Web/飞书统一审批与回调设计；
 - [开发 SPEC](oncall-agent-开发SPEC.md)
-- 每日实现文档：`docs/day1-implementation.md` … `docs/day13-implementation.md`
+- 历史过程文档（14 天计划与每日实现记录）已归档在 `docs/archive/`，仅供追溯，不再随代码更新
 
 ## 安全边界
 

@@ -20,12 +20,12 @@ type RunStore interface {
 
 // RunAPI serves public Incident-scoped run and step history.
 type RunAPI struct {
-	db   RunStore
-	auth SessionAuthenticator
+	db      RunStore
+	console *Console
 }
 
-func NewRunAPI(db RunStore, auth SessionAuthenticator) *RunAPI {
-	return &RunAPI{db: db, auth: auth}
+func NewRunAPI(db RunStore, console *Console) *RunAPI {
+	return &RunAPI{db: db, console: console}
 }
 
 func (h *RunAPI) Handle(r *ghttp.Request) {
@@ -43,7 +43,7 @@ func (h *RunAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/"), "/")
 	parts := strings.Split(path, "/")
-	if _, _, ok := authenticateSession(h.auth, r); !ok {
+	if _, ok := h.console.Actor(); !ok {
 		// Do not distinguish an invalid resource from a missing session on known
 		// data paths; the caller must authenticate before any store read.
 		if isRunPath(parts) {

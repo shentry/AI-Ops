@@ -39,41 +39,27 @@ var (
 	ErrCallbackBinding      = errors.New("feishu: callback message is not bound")
 )
 
-// ReceiptStore is the minimal callback de-duplication surface. The concrete
-// *store.DB implementation uses integration_event_receipt's primary key as the
-// cross-process CAS boundary. Finalization is optional for small test fakes;
-// production always provides it.
-type ReceiptStore interface {
+// CallbackStore is the persistence surface required by callback business
+// logic. *store.DB satisfies it; tests supply one fake covering the whole
+// contract. It is deliberately a single required interface: a missing method
+// must fail to compile, never silently disable receipt finalization or binding
+// lookup at runtime.
+type CallbackStore interface {
+	// Receipt CAS. integration_event_receipt's primary key is the cross-process
+	// de-duplication boundary for redelivered Feishu events.
 	ClaimIntegrationEventReceipt(context.Context, store.IntegrationEventReceipt) (bool, error)
-}
-
-type receiptFinalizer interface {
 	CompleteIntegrationEventReceipt(context.Context, string, string, time.Time) error
-}
-
-type receiptAbandoner interface {
 	DeleteIntegrationEventReceipt(context.Context, string) error
-}
 
-// BindingStore persists and resolves Feishu message/thread-to-Incident links.
-// FindIMBinding must enforce provider and chat equality; callers must not fall
-// back to a global message search.
-type BindingStore interface {
+	// Feishu message/thread-to-Incident links. FindIMBinding must enforce
+	// provider and chat equality; callers must not fall back to a global
+	// message search.
 	CreateIMBinding(context.Context, store.IMBinding) (store.IMBinding, error)
-}
-
-type bindingFinder interface {
 	FindIMBinding(context.Context, string, string, string, string, string) (store.IMBinding, error)
-}
 
-type bindingGetter interface {
-	GetIMBinding(context.Context, string, string) (store.IMBinding, error)
-}
-
-// CallbackEventWriter is used only for durable notification.failed facts when
-// an already-committed approval cannot be reflected back into Feishu. It must
-// never be used to roll back the approval decision.
-type CallbackEventWriter interface {
+	// AppendIncidentEvent is used only for durable notification.failed facts
+	// when an already-committed approval cannot be reflected back into Feishu.
+	// It must never be used to roll back the approval decision.
 	AppendIncidentEvent(context.Context, store.IncidentEvent) (store.IncidentEvent, error)
 }
 
@@ -99,16 +85,9 @@ type MessageClient interface {
 	Patch(context.Context, string, string) error
 }
 
-// BusinessDependencies contains callback business dependencies. Store is the
-// preferred aggregate field; DB is an explicit alias for assembly code that
-// names its persistence dependency db.
+// BusinessDependencies contains callback business dependencies.
 type BusinessDependencies struct {
-	Store any
-	DB    any
-
-	Receipts          ReceiptStore
-	Bindings          BindingStore
-	Events            CallbackEventWriter
+	Store             CallbackStore
 	Approval          ApprovalDecider
 	Conversation      ConversationAsker
 	Client            MessageClient
@@ -118,13 +97,7 @@ type BusinessDependencies struct {
 }
 
 type CallbackBusiness struct {
-	receipts     ReceiptStore
-	finalizer    receiptFinalizer
-	abandoner    receiptAbandoner
-	bindings     BindingStore
-	finder       bindingFinder
-	getter       bindingGetter
-	events       CallbackEventWriter
+	store        CallbackStore
 	approval     ApprovalDecider
 	conversation ConversationAsker
 	client       MessageClient
@@ -137,6 +110,7 @@ type CallbackBusiness struct {
 // no network requests and is safe to use in tests or during server assembly.
 func NewCallbackBusiness(deps BusinessDependencies) *CallbackBusiness {
 	b := &CallbackBusiness{
+		store:        deps.Store,
 		chatID:       strings.TrimSpace(deps.ChatID),
 		provider:     strings.TrimSpace(deps.Provider),
 		approval:     deps.Approval,
@@ -156,43 +130,6 @@ func NewCallbackBusiness(deps BusinessDependencies) *CallbackBusiness {
 			}
 		}
 	}
-
-	// Explicit interfaces win. This lets a test fake expose only the methods it
-	// needs while *store.DB can still be passed once through Store.
-	b.receipts = deps.Receipts
-	b.bindings = deps.Bindings
-	b.events = deps.Events
-	persistence := deps.Store
-	if persistence == nil {
-		persistence = deps.DB
-	}
-	if persistence != nil {
-		if b.receipts == nil {
-			b.receipts, _ = persistence.(ReceiptStore)
-		}
-		if b.bindings == nil {
-			b.bindings, _ = persistence.(BindingStore)
-		}
-		if b.events == nil {
-			b.events, _ = persistence.(CallbackEventWriter)
-		}
-		b.finalizer, _ = persistence.(receiptFinalizer)
-		b.abandoner, _ = persistence.(receiptAbandoner)
-		b.finder, _ = persistence.(bindingFinder)
-		b.getter, _ = persistence.(bindingGetter)
-	}
-	if candidate, ok := deps.Receipts.(receiptFinalizer); ok {
-		b.finalizer = candidate
-	}
-	if candidate, ok := deps.Receipts.(receiptAbandoner); ok {
-		b.abandoner = candidate
-	}
-	if candidate, ok := deps.Bindings.(bindingFinder); ok {
-		b.finder = candidate
-	}
-	if candidate, ok := deps.Bindings.(bindingGetter); ok {
-		b.getter = candidate
-	}
 	return b
 }
 
@@ -202,21 +139,11 @@ func NewBusinessHandlers(deps BusinessDependencies) CallbackHandlers {
 	return CallbackHandlers{CardAction: business.CardAction, MessageReceive: business.MessageReceive}
 }
 
-// NewCallbackHandlers is a descriptive alias used by route assembly.
-func NewCallbackHandlers(deps BusinessDependencies) CallbackHandlers {
-	return NewBusinessHandlers(deps)
-}
-
-// NewFeishuCallbackBusiness is an explicit constructor alias for integrations.
-func NewFeishuCallbackBusiness(deps BusinessDependencies) *CallbackBusiness {
-	return NewCallbackBusiness(deps)
-}
-
 // CardAction is the callback registered for card.action.trigger. It does only
 // bounded DB reads/CAS and returns a toast; card patching is always dispatched
 // asynchronously after the decision commits.
 func (b *CallbackBusiness) CardAction(ctx context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
-	if b == nil || b.receipts == nil || b.approval == nil {
+	if b == nil || b.store == nil || b.approval == nil {
 		return nil, ErrCallbackDependency
 	}
 	if ctx == nil {
@@ -296,7 +223,7 @@ func (b *CallbackBusiness) HandleCardAction(ctx context.Context, event *callback
 // the configured chat that are explicitly incident-bound or belong to a known
 // message/thread binding. It queues a question and returns without LLM work.
 func (b *CallbackBusiness) MessageReceive(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
-	if b == nil || b.receipts == nil || b.bindings == nil || b.conversation == nil {
+	if b == nil || b.store == nil || b.conversation == nil {
 		return ErrCallbackDependency
 	}
 	if ctx == nil {
@@ -406,20 +333,15 @@ func (b *CallbackBusiness) claimReceipt(ctx context.Context, eventID, eventType 
 		EventID: eventID, Provider: b.provider, EventType: eventType,
 		ProcessedAt: time.Now().UTC(), Result: "processing",
 	}
-	return b.receipts.ClaimIntegrationEventReceipt(ctx, receipt)
+	return b.store.ClaimIntegrationEventReceipt(ctx, receipt)
 }
 
 func (b *CallbackBusiness) finishReceipt(ctx context.Context, eventID, result string) {
-	if b == nil || b.finalizer == nil {
-		return
-	}
-	_ = b.finalizer.CompleteIntegrationEventReceipt(ctx, eventID, result, time.Now().UTC())
+	_ = b.store.CompleteIntegrationEventReceipt(ctx, eventID, result, time.Now().UTC())
 }
+
 func (b *CallbackBusiness) abandonReceipt(ctx context.Context, eventID string) {
-	if b == nil || b.abandoner == nil {
-		return
-	}
-	_ = b.abandoner.DeleteIntegrationEventReceipt(ctx, eventID)
+	_ = b.store.DeleteIntegrationEventReceipt(ctx, eventID)
 }
 
 func (b *CallbackBusiness) allowed(openID string) bool {
@@ -431,14 +353,9 @@ func (b *CallbackBusiness) allowed(openID string) bool {
 }
 
 func (b *CallbackBusiness) findBinding(ctx context.Context, chatID, messageID, rootID, threadID string) (store.IMBinding, error) {
-	if b.finder != nil {
-		return b.finder.FindIMBinding(ctx, b.provider, chatID, messageID, rootID, threadID)
-	}
-	if b.getter != nil && messageID != "" {
-		return b.getter.GetIMBinding(ctx, b.provider, messageID)
-	}
-	return store.IMBinding{}, ErrCallbackBinding
+	return b.store.FindIMBinding(ctx, b.provider, chatID, messageID, rootID, threadID)
 }
+
 func (b *CallbackBusiness) createQuestionBinding(ctx context.Context, chatID string, message *larkim.EventMessage, incidentID uint64) error {
 	messageID := stringValue(message.MessageId)
 	binding := store.IMBinding{
@@ -456,7 +373,7 @@ func (b *CallbackBusiness) createQuestionBinding(ctx context.Context, chatID str
 	if thread := stringValue(message.ThreadId); thread != "" {
 		binding.ThreadID = stringPtr(thread)
 	}
-	_, err := b.bindings.CreateIMBinding(ctx, binding)
+	_, err := b.store.CreateIMBinding(ctx, binding)
 	return err
 }
 
@@ -506,11 +423,11 @@ func (b *CallbackBusiness) patchDecisionAsync(approvalRow store.Approval, messag
 }
 
 func (b *CallbackBusiness) recordNotificationFailure(ctx context.Context, incidentID uint64, runID *uint64, summary string) {
-	if b == nil || b.events == nil || incidentID == 0 {
+	if b == nil || b.store == nil || incidentID == 0 {
 		return
 	}
 	payload := datatypes.JSON([]byte(`{"provider":"feishu_app"}`))
-	_, _ = b.events.AppendIncidentEvent(ctx, store.IncidentEvent{
+	_, _ = b.store.AppendIncidentEvent(ctx, store.IncidentEvent{
 		IncidentID: incidentID, RunID: runID,
 		EventType: string(eventlog.EventNotificationFailed),
 		Phase:     "notification", Status: "failed", Summary: summary,
@@ -700,8 +617,6 @@ func (b *CallbackBusiness) String() string {
 	return fmt.Sprintf("feishu callback business provider=%s chat=%s", b.provider, b.chatID)
 }
 
-var _ ReceiptStore = (*store.DB)(nil)
-var _ BindingStore = (*store.DB)(nil)
-var _ CallbackEventWriter = (*store.DB)(nil)
+var _ CallbackStore = (*store.DB)(nil)
 var _ ConversationAsker = (conversation.Service)(nil)
 var _ MessageClient = (*Client)(nil)

@@ -1,3 +1,4 @@
+import { Cpu, X } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { ApiError, ModelState, switchCurrentModel } from "../api";
@@ -49,7 +50,7 @@ export function ModelSwitcher({ state, onChanged }: ModelSwitcherProps) {
           setError(null);
         }}
       >
-        <span>模型</span>
+        <Cpu size={12} />
         <strong>{state.current_model}</strong>
       </button>
       {open && (
@@ -59,7 +60,7 @@ export function ModelSwitcher({ state, onChanged }: ModelSwitcherProps) {
               <span className="eyebrow">LLM 路由</span>
               <strong>切换诊断模型</strong>
             </div>
-            <button className="button subtle" type="button" onClick={() => setOpen(false)}>关闭</button>
+            <button className="button subtle" type="button" aria-label="关闭" onClick={() => setOpen(false)}><X size={13} /></button>
           </div>
           <p>切换只影响后续诊断和新提问；正在执行的任务继续使用原模型。</p>
           <label className="field-label" htmlFor="selected-model">候选模型</label>

@@ -12,7 +12,7 @@
 - PostgreSQL、Redis、Sub2API 属于被监控目标及其依赖，不是 AI-Opus 自身的存储。
 - React 控制台构建后通过 `go:embed` 嵌入 Go 服务，同源提供。
 - LLM 只负责基于证据生成 RCA/Plan 或回答只读问题；变更动作必须经过 Guard、Policy、Approval、Executor、Verify。
-- 当前控制台默认使用匿名公开操作面；OAuth/Session 实现存在，但没有接入当前主程序路由。
+- 控制台是**显式的匿名公开操作面**：没有登录、会话或 CSRF，`api.Console` 是唯一的身份来源，控制台上的所有读写一律记为 `anonymous`。曾经存在但从未接入路由的 OAuth/Session 实现已于 2026-08-24 删除。
 
 ## 2. 运行时部署拓扑
 
@@ -114,9 +114,8 @@ flowchart TB
     end
 
     subgraph edge["边界层"]
-        API["internal/api<br/>HTTP Handler、DTO、鉴权、SSE、静态资源"]
+        API["internal/api<br/>HTTP Handler、DTO、Bearer 校验、SSE、静态资源"]
         WEB["web/src<br/>React 控制台"]
-        AUTH["internal/auth<br/>Session/OAuth 安全原语"]
     end
 
     subgraph workers["异步运行时"]
@@ -165,7 +164,6 @@ flowchart TB
     API --> CONV
     API --> LLM
     API --> METRICS
-    API -.-> AUTH
 
     INGW --> ING
     ING --> INC
@@ -226,8 +224,7 @@ flowchart TB
 | `internal/store` | 唯一 GORM/MySQL 边界；所有业务状态和审计写入 |
 | `internal/eventlog` | 事件类型常量；事件实际由各业务模块通过 store 写入 |
 | `internal/metrics` | 进程内 counter/gauge，暴露 `/metrics` |
-| `internal/auth` | Session/OAuth/CSRF 实现；当前主程序未接入 |
-| `web` | Vite 产物通过 `go:embed` 嵌入 Go 服务 |
+| `web` | Vite 产物通过 `go:embed` 嵌入 Go 服务；产物不入库，需先 `npm run build` |
 | `cmd/simulate` | 走同一个 webhook 入口注入测试告警 |
 
 ## 4. 告警接入、去重与 Incident 归并
@@ -314,7 +311,7 @@ flowchart LR
 - 数据库事务失败时 `raw_event` 保持 `pending`，等待下一轮重试。
 - 输入本身不可恢复时，`raw_event` 标记 `failed`，不会永久堵住队首。
 
-依据：`internal/ingest/worker.go:78-319`、`internal/ingest/webhook.go:27-133`、`internal/ingest/fingerprint.go:12-90`、`internal/ingest/correlate.go:47-101`、`internal/store/store.go:833-984`。
+依据：`internal/ingest/worker.go:78-319`、`internal/ingest/webhook.go:27-133`、`internal/ingest/fingerprint.go:12-90`、`internal/ingest/correlate.go:47-101`、`internal/store/rawevent.go:114-220`。
 
 ## 5. 诊断、Guard、Policy、审批、执行、验证闭环
 
@@ -830,27 +827,6 @@ erDiagram
         VARCHAR result
     }
 
-    web_oauth_state {
-        VARCHAR state_hash PK
-        TEXT code_verifier_ciphertext
-        VARCHAR redirect_uri
-        DATETIME expires_at
-        DATETIME created_at
-    }
-
-    web_session {
-        VARCHAR id PK
-        VARCHAR token_hash
-        VARCHAR actor_id
-        VARCHAR actor_name
-        VARCHAR tenant_key
-        VARCHAR csrf_token_hash
-        DATETIME expires_at
-        DATETIME created_at
-        DATETIME last_seen_at
-        DATETIME revoked_at
-    }
-
     llm_model_selection {
         TINYINT singleton_id PK
         VARCHAR current_model
@@ -907,16 +883,15 @@ raw_event → incident
 |---|---|---|
 | MySQL | `mysql.dsn: ${MYSQL_DSN}` | 必须配置，否则启动失败 |
 | LLM Reasoner | 已配置 `glm-5` | `diagnose.Worker` 会启动 |
-| LLM Summarizer | 已配置 | Factory 支持，但当前主流程主要使用 Reasoner |
-| Web 控制台 | `trusted_operator` 非空 | `webEnabled=true` |
-| Web 鉴权 | `AnonymousConsoleAuthenticator` | 控制台读写使用固定 `anonymous` 身份，不要求 Session/CSRF |
+| Web 控制台 | `web.base_url` 非空，或 provider 为 `feishu_app` | `webEnabled=true`，组装 `api.Console` |
+| Web 鉴权 | 无 | 控制台读写使用固定 `anonymous` 身份；没有登录、会话或 CSRF |
 | Feishu | `notify.im.provider` 未启用 | 不绑定 Feishu callback；通知通常回退 Noop |
 | `approval.dry_run` | 未配置，默认 `true` | 默认不执行真实 Docker 变更 |
 | `approval.auto_execute_l2` | 未配置，默认 `false` | L2 自动路径默认关闭 |
 | Docker allowlist | 未配置，默认为空 | 没有默认可自动重启目标 |
 | Prometheus | 配置为本机 Prometheus | 证据和黄金指标查询使用该地址 |
 | Docker socket | 配置为独立 Unix socket | socket 不存在时跳过 Docker 工具和证据 |
-| Web OAuth | 代码存在 | 当前 `main.go` 没有绑定 `/auth/feishu/*` |
+| Web 前端产物 | `web/dist/` 不入库 | 未跑 `npm run build` 时后端照常启动，静态资源全 404 |
 
 ## 12. 安全与可靠性不变量
 
@@ -952,13 +927,12 @@ raw_event → incident
 
 ## 13. 当前漂移与风险点
 
-1. **控制台是公开操作面**：`webEnabled` 后使用匿名认证；能访问服务端口的请求方可以查看、提问、重诊、请求证据和审批。
-2. **Feishu OAuth/session 未接入主程序**：OAuth 和 Session 实现存在，但当前路由组装使用匿名控制台。
-3. **Alertmanager 凭据需要对齐**：Alertmanager 配置文件中的固定凭据必须与服务端环境变量一致，否则 webhook 会返回 401。
-4. **当前 Compose 未抓取 oncall-agent `/metrics`**：Prometheus 配置只有 node-exporter 和 blackbox job。
-5. **默认是演练模式**：`dry_run=true`、`auto_execute_l2=false`，且 Docker allowlist 为空。
-6. **原始告警到 Incident 缺少数据库直接关联**：`raw_event_id` 没有进入 `incident_event` 或后续状态表。
-7. **部分旧文档已过时**：当前实现已经包含诊断、审批、执行、Verify、Memory、控制室、SSE 和对话队列。
+1. **控制台是公开操作面**：`webEnabled` 后无任何鉴权；能访问服务端口的请求方可以查看、提问、重诊、请求证据和审批，审计一律记为 `anonymous`。这是明确的设计选择（见 `docs/design-review.md` B1 补记），要鉴权需要重新实现。
+2. **Alertmanager 凭据需要对齐**：Alertmanager 配置文件中的固定凭据必须与服务端环境变量一致，否则 webhook 会返回 401。
+3. **当前 Compose 未抓取 oncall-agent `/metrics`**：Prometheus 配置只有 node-exporter 和 blackbox job。
+4. **默认是演练模式**：`dry_run=true`、`auto_execute_l2=false`，且 Docker allowlist 为空。
+5. **原始告警到 Incident 缺少数据库直接关联**：`raw_event_id` 没有进入 `incident_event` 或后续状态表。
+6. **部分旧文档已过时**：当前实现已经包含诊断、审批、执行、Verify、Memory、控制室、SSE 和对话队列。
 
 ## 14. 代码依据索引
 
@@ -968,7 +942,7 @@ raw_event → incident
 | HTTP 路由 | `cmd/server/main.go:242-287` |
 | 配置与默认值 | `internal/config/config.go`、`config.yaml` |
 | 告警解析/指纹/归并 | `internal/ingest/*.go` |
-| 摄入事务与队列 | `internal/ingest/worker.go`、`internal/store/store.go` |
+| 摄入事务与队列 | `internal/ingest/worker.go`、`internal/store/rawevent.go`、`internal/store/incident.go` |
 | 诊断 Pipeline | `internal/diagnose/pipeline.go` |
 | Evidence collectors | `internal/diagnose/collector_*.go`、`internal/diagnose/evidence.go` |
 | LLM 与工具权限 | `internal/llm/*.go`、`internal/tools/*.go` |
@@ -988,7 +962,8 @@ raw_event → incident
 go list ./...
 ```
 
-识别到 19 个 Go 包，覆盖 server、simulate、全部 internal 模块和 `web`。
+识别到 18 个 Go 包，覆盖 server、simulate、全部 internal 模块和 `web`。
+（2026-08-24 起 `internal/auth` 已删除，包数由 19 降为 18。）
 
 已运行核心模块单元测试：
 

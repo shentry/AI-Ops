@@ -284,18 +284,18 @@ func TestServiceLifecycle(t *testing.T) {
 	}
 
 	// approve → 幂等冲突：第二次 409。
-    if _, err := svc.Decide(ctx, created.ID, true, "ops", "", "api"); err != nil {
+	if _, err := svc.Decide(ctx, created.ID, true, "ops", "", "api"); err != nil {
 		t.Fatal(err)
 	}
-    if _, err := svc.Decide(ctx, created.ID, true, "ops", "", "api"); !errors.Is(err, store.ErrApprovalConflict) {
+	if _, err := svc.Decide(ctx, created.ID, true, "ops", "", "api"); !errors.Is(err, store.ErrApprovalConflict) {
 		t.Fatalf("re-approve error = %v, want conflict", err)
 	}
 	// deny 已决单同样冲突。
-    if _, err := svc.Decide(ctx, created.ID, false, "ops", "", "api"); !errors.Is(err, store.ErrApprovalConflict) {
+	if _, err := svc.Decide(ctx, created.ID, false, "ops", "", "api"); !errors.Is(err, store.ErrApprovalConflict) {
 		t.Fatalf("deny after approve error = %v, want conflict", err)
 	}
 	// 不存在 404。
-    if _, err := svc.Decide(ctx, 999, true, "ops", "", "api"); !errors.Is(err, store.ErrApprovalNotFound) {
+	if _, err := svc.Decide(ctx, 999, true, "ops", "", "api"); !errors.Is(err, store.ErrApprovalNotFound) {
 		t.Fatalf("missing error = %v, want not found", err)
 	}
 }
@@ -310,7 +310,7 @@ func TestValidateExecution(t *testing.T) {
 	if err := svc.ValidateExecution(ctx, created.ID, decision); err == nil {
 		t.Fatal("pending approval passed execution validation")
 	}
-    if _, err := svc.Decide(ctx, created.ID, true, "ops", "", "api"); err != nil {
+	if _, err := svc.Decide(ctx, created.ID, true, "ops", "", "api"); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.ValidateExecution(ctx, created.ID, decision); err != nil {

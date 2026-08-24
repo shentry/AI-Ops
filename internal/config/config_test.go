@@ -116,7 +116,6 @@ func TestLoadRejectsInvalidNumericFields(t *testing.T) {
 		{"restart interval negative", "tools:\n  docker:\n    restart_min_interval_seconds: -1\n", "restart_min_interval_seconds"},
 		{"restart cap zero", "tools:\n  docker:\n    restart_max_per_hour: 0\n", "restart_max_per_hour"},
 		{"reasoner tokens zero", "llm:\n  roles:\n    reasoner:\n      max_tokens: 0\n", "llm.roles.reasoner.max_tokens"},
-		{"summarizer tokens zero", "llm:\n  roles:\n    summarizer:\n      max_tokens: 0\n", "llm.roles.summarizer.max_tokens"},
 		{"thinking effort crazy", "llm:\n  roles:\n    reasoner:\n      thinking:\n        effort: crazy\n", "thinking.effort"},
 		{"thinking none when enabled", "llm:\n  roles:\n    reasoner:\n      thinking:\n        enabled: true\n        effort: none\n", "cannot be none"},
 		{"port out of range", "server:\n  port: 70000\n", "server.port"},
@@ -199,14 +198,14 @@ func TestLoadAcceptsThinkingEnabledWithoutEffort(t *testing.T) {
 	}
 }
 
-func TestLoadAllowsAnonymousWebWithoutSessionSecret(t *testing.T) {
-	path := writeConfig(t, "mysql:\n  dsn: test\nweb:\n  trusted_operator: oncall\n")
+func TestLoadEnablesAnonymousConsoleFromBaseURLAlone(t *testing.T) {
+	path := writeConfig(t, "mysql:\n  dsn: test\nweb:\n  base_url: http://127.0.0.1:8080\n")
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.Web.TrustedOperator != "oncall" {
-		t.Fatalf("trusted_operator = %q", cfg.Web.TrustedOperator)
+	if cfg.Web.BaseURL != "http://127.0.0.1:8080" {
+		t.Fatalf("base_url = %q", cfg.Web.BaseURL)
 	}
 }
 

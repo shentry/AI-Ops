@@ -64,7 +64,7 @@ func approvalRequest(t *testing.T, api *ApprovalAPI, method, path, token, operat
 
 func TestApprovalAPIAuthAndParams(t *testing.T) {
 	svc := &fakeApprovalService{}
-	api := NewApprovalAPI(svc, "secret")
+	api := NewApprovalAPI(svc, "secret", nil)
 
 	// 无 token 401。
 	if resp := approvalRequest(t, api, http.MethodPost, "/api/v1/approvals/1/approve", "", "ops"); resp.Code != http.StatusUnauthorized {
@@ -86,7 +86,7 @@ func TestApprovalAPIAuthAndParams(t *testing.T) {
 
 func TestApprovalAPIDecide(t *testing.T) {
 	svc := &fakeApprovalService{}
-	api := NewApprovalAPI(svc, "secret")
+	api := NewApprovalAPI(svc, "secret", nil)
 	resp := approvalRequest(t, api, http.MethodPost, "/api/v1/approvals/7/approve", "Bearer secret", "ops-li")
 	if resp.Code != http.StatusOK {
 		t.Fatalf("approve = %d, want 200", resp.Code)
@@ -97,7 +97,7 @@ func TestApprovalAPIDecide(t *testing.T) {
 
 	// deny 路径。
 	svc2 := &fakeApprovalService{}
-	api2 := NewApprovalAPI(svc2, "secret")
+	api2 := NewApprovalAPI(svc2, "secret", nil)
 	if resp := approvalRequest(t, api2, http.MethodPost, "/api/v1/approvals/8/deny", "Bearer secret", "ops-li"); resp.Code != http.StatusOK || svc2.approver {
 		t.Fatalf("deny = %d, approver = %v", resp.Code, svc2.approver)
 	}
@@ -106,7 +106,7 @@ func TestApprovalAPIDecide(t *testing.T) {
 func TestApprovalAPIConflictAndNotFound(t *testing.T) {
 	// 重复决策 409。
 	svc := &fakeApprovalService{decideErr: store.ErrApprovalConflict}
-	api := NewApprovalAPI(svc, "secret")
+	api := NewApprovalAPI(svc, "secret", nil)
 	if resp := approvalRequest(t, api, http.MethodPost, "/api/v1/approvals/7/approve", "Bearer secret", "ops"); resp.Code != http.StatusConflict {
 		t.Fatalf("conflict = %d, want 409", resp.Code)
 	}
@@ -124,7 +124,7 @@ func TestApprovalAPIConflictAndNotFound(t *testing.T) {
 
 func TestApprovalAPIList(t *testing.T) {
 	svc := &fakeApprovalService{}
-	api := NewApprovalAPI(svc, "secret")
+	api := NewApprovalAPI(svc, "secret", nil)
 	resp := approvalRequest(t, api, http.MethodGet, "/api/v1/approvals?status=pending", "Bearer secret", "")
 	if resp.Code != http.StatusOK || svc.listStatus != "pending" {
 		t.Fatalf("list = %d, status = %q", resp.Code, svc.listStatus)
@@ -133,7 +133,7 @@ func TestApprovalAPIList(t *testing.T) {
 
 func TestApprovalAPIAllowsAnonymousConsoleDecision(t *testing.T) {
 	svc := &fakeApprovalService{}
-	api := NewApprovalAPI(svc, "secret", NewAnonymousConsoleAuthenticator())
+	api := NewApprovalAPI(svc, "secret", NewConsole())
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/approvals/11/approve", strings.NewReader(`{"reason":"public console"}`))
 	req.Header.Set("Content-Type", "application/json")
 	resp := httptest.NewRecorder()

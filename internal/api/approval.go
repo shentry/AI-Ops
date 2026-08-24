@@ -11,7 +11,6 @@ import (
 
 	"github.com/gogf/gf/v2/net/ghttp"
 
-	"oncall-agent/internal/auth"
 	"oncall-agent/internal/metrics"
 	"oncall-agent/internal/store"
 )
@@ -23,26 +22,18 @@ type approvalService interface {
 	Get(ctx context.Context, id uint64) (store.Approval, error)
 }
 
-// ApprovalAPI exposes approval decisions and list/query operations. Bearer
-// automation remains supported; the Web route assembly may deliberately pass
-// AnonymousConsoleAuthenticator so browser decisions require no login or CSRF.
+// ApprovalAPI exposes approval decisions and list/query operations. Automation
+// authenticates with the Bearer token; the browser reaches the same handlers
+// through the public console, which requires no login and records a fixed
+// anonymous operator on every decision.
 type ApprovalAPI struct {
 	svc       approvalService
 	authToken string
-	session   SessionAuthenticator
+	console   *Console
 }
 
-func NewApprovalAPI(svc approvalService, authToken string, sessions ...SessionAuthenticator) *ApprovalAPI {
-	var session SessionAuthenticator
-	if len(sessions) > 0 {
-		session = sessions[0]
-	}
-	return &ApprovalAPI{svc: svc, authToken: authToken, session: session}
-}
-
-// NewApprovalAPIWithSession is the explicit constructor used by Web assembly.
-func NewApprovalAPIWithSession(svc approvalService, authToken string, session SessionAuthenticator) *ApprovalAPI {
-	return NewApprovalAPI(svc, authToken, session)
+func NewApprovalAPI(svc approvalService, authToken string, console *Console) *ApprovalAPI {
+	return &ApprovalAPI{svc: svc, authToken: authToken, console: console}
 }
 
 func (h *ApprovalAPI) Handle(r *ghttp.Request) {
@@ -54,9 +45,9 @@ func (h *ApprovalAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "approval service unavailable")
 		return
 	}
-	_, web, status, message := h.authenticate(r)
-	if status != 0 {
-		writeError(w, status, message)
+	web, ok := h.authenticate(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/approvals"), "/")
@@ -116,12 +107,8 @@ func (h *ApprovalAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	operator := strings.TrimSpace(r.Header.Get("X-Operator"))
 	source := "api"
 	if web {
-		actor, _, writeStatus, writeMessage := requireWriteSession(h.session, r)
-		if writeStatus != 0 {
-			writeError(w, writeStatus, writeMessage)
-			return
-		}
-		operator = strings.TrimSpace(actor.ID)
+		actor, _ := h.console.Actor()
+		operator = actor.ID
 		source = "web"
 	} else if operator == "" {
 		writeError(w, http.StatusBadRequest, "X-Operator header is required")
@@ -135,21 +122,17 @@ func (h *ApprovalAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.decide(w, r, id, parts[1] == "approve", operator, reason, source, web)
 }
 
-func (h *ApprovalAPI) authenticate(r *http.Request) (auth.Actor, bool, int, string) {
+// authenticate reports whether the caller is allowed and whether the request
+// arrived through the browser console rather than Bearer automation. The two
+// channels differ only in the operator recorded on a decision.
+func (h *ApprovalAPI) authenticate(r *http.Request) (web bool, ok bool) {
 	if r != nil && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+h.authToken)) == 1 {
-		return auth.Actor{}, false, 0, ""
+		return false, true
 	}
-	if h.session == nil {
-		return auth.Actor{}, false, http.StatusUnauthorized, "unauthorized"
+	if _, enabled := h.console.Actor(); !enabled {
+		return false, false
 	}
-	actor, _, err := h.session.Authenticate(r.Context(), r)
-	if err != nil {
-		if errors.Is(err, auth.ErrUnauthenticated) || errors.Is(err, auth.ErrSessionUnavailable) {
-			return auth.Actor{}, false, http.StatusUnauthorized, "unauthorized"
-		}
-		return auth.Actor{}, false, http.StatusServiceUnavailable, "session lookup failed"
-	}
-	return actor, true, 0, ""
+	return true, true
 }
 
 func (h *ApprovalAPI) decide(w http.ResponseWriter, r *http.Request, id uint64, approve bool, operator, reason, source string, web bool) {

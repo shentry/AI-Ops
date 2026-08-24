@@ -55,7 +55,7 @@ func (q *Questioner) Answer(ctx context.Context, input conversation.QuestionInpu
 	if input.IncidentID == 0 || strings.TrimSpace(input.Question) == "" {
 		return conversation.QuestionAnswer{}, fmt.Errorf("%w: incident and question are required", conversation.ErrQuestionParse)
 	}
-	model, err := q.factory.Build(RoleReasoner)
+	model, err := q.factory.Build()
 	if err != nil {
 		return conversation.QuestionAnswer{}, err
 	}

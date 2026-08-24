@@ -52,8 +52,7 @@ func (s *memoryModelSelectionStore) SetLLMModelSelection(_ context.Context, mode
 func testModelSwitchConfig() config.LLMConfig {
 	return config.LLMConfig{
 		Roles: config.LLMRoles{
-			Reasoner:   config.RoleConfig{BaseURL: "http://127.0.0.1:1", APIKey: "key", Model: "glm-5", MaxTokens: 128},
-			Summarizer: config.RoleConfig{BaseURL: "http://127.0.0.1:1", APIKey: "key", Model: "glm-5", MaxTokens: 64},
+			Reasoner: config.RoleConfig{BaseURL: "http://127.0.0.1:1", APIKey: "key", Model: "glm-5", MaxTokens: 128},
 		},
 		Models: []config.ModelProfile{
 			{ID: "glm-5"},
@@ -131,7 +130,6 @@ func TestModelSwitcherRebuildsFutureRoleClients(t *testing.T) {
 	})
 	cfg := testModelSwitchConfig()
 	cfg.Roles.Reasoner.BaseURL = fake.server.URL
-	cfg.Roles.Summarizer.BaseURL = fake.server.URL
 	factory := NewFactory(cfg)
 	state := &memoryModelSelectionStore{}
 	switcher, err := NewModelSwitcher(state, factory, cfg)
@@ -141,7 +139,7 @@ func TestModelSwitcherRebuildsFutureRoleClients(t *testing.T) {
 	if _, err := switcher.Initialize(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	first, err := factory.Build(RoleReasoner)
+	first, err := factory.Build()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,21 +149,14 @@ func TestModelSwitcherRebuildsFutureRoleClients(t *testing.T) {
 	if _, err := switcher.Select(context.Background(), "deepseek-v4-pro"); err != nil {
 		t.Fatal(err)
 	}
-	next, err := factory.Build(RoleReasoner)
+	next, err := factory.Build()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := next.Generate(context.Background(), []*schema.Message{schema.UserMessage("after")}); err != nil {
 		t.Fatal(err)
 	}
-	summarizer, err := factory.Build(RoleSummarizer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := summarizer.Generate(context.Background(), []*schema.Message{schema.UserMessage("summary")}); err != nil {
-		t.Fatal(err)
-	}
-	if got, want := models, []string{"glm-5", "deepseek-v4-pro", "deepseek-v4-pro"}; !slices.Equal(got, want) {
+	if got, want := models, []string{"glm-5", "deepseek-v4-pro"}; !slices.Equal(got, want) {
 		t.Fatalf("models = %v, want %v", got, want)
 	}
 }

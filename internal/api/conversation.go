@@ -10,7 +10,6 @@ import (
 
 	"github.com/gogf/gf/v2/net/ghttp"
 
-	"oncall-agent/internal/auth"
 	"oncall-agent/internal/conversation"
 	"oncall-agent/internal/store"
 )
@@ -27,24 +26,20 @@ type ConversationService interface {
 // action endpoints. Implementations own authorization/business validation and
 // must not run LLM, Docker or Verify work synchronously in this handler.
 type IncidentActionService interface {
-	Rediagnose(context.Context, uint64, auth.Actor) (store.AgentRun, error)
-	RequestEvidence(context.Context, uint64, auth.Actor, string) error
+	Rediagnose(context.Context, uint64, Actor) (store.AgentRun, error)
+	RequestEvidence(context.Context, uint64, Actor, string) error
 }
 
 // ConversationAPI serves public conversation history and asynchronous Incident
-// actions. The route assembly may provide an anonymous or session authenticator.
+// actions. A nil console keeps every route closed.
 type ConversationAPI struct {
 	service ConversationService
-	auth    SessionAuthenticator
+	console *Console
 	actions IncidentActionService
 }
 
-func NewConversationAPI(service ConversationService, authn SessionAuthenticator, actions ...IncidentActionService) *ConversationAPI {
-	var action IncidentActionService
-	if len(actions) > 0 {
-		action = actions[0]
-	}
-	return &ConversationAPI{service: service, auth: authn, actions: action}
+func NewConversationAPI(service ConversationService, console *Console, actions IncidentActionService) *ConversationAPI {
+	return &ConversationAPI{service: service, console: console, actions: actions}
 }
 
 func (h *ConversationAPI) Handle(r *ghttp.Request) {
@@ -98,7 +93,7 @@ func (h *ConversationAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ConversationAPI) list(w http.ResponseWriter, r *http.Request, incidentID uint64) {
-	if _, _, ok := authenticateSession(h.auth, r); !ok {
+	if _, ok := h.console.Actor(); !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -134,9 +129,9 @@ func (h *ConversationAPI) list(w http.ResponseWriter, r *http.Request, incidentI
 }
 
 func (h *ConversationAPI) ask(w http.ResponseWriter, r *http.Request, incidentID uint64) {
-	actor, _, status, message := requireWriteSession(h.auth, r)
-	if status != 0 {
-		writeError(w, status, message)
+	actor, ok := h.console.Actor()
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 	if h.service == nil {
@@ -173,9 +168,9 @@ func (h *ConversationAPI) ask(w http.ResponseWriter, r *http.Request, incidentID
 }
 
 func (h *ConversationAPI) rediagnose(w http.ResponseWriter, r *http.Request, incidentID uint64) {
-	actor, _, status, message := requireWriteSession(h.auth, r)
-	if status != 0 {
-		writeError(w, status, message)
+	actor, ok := h.console.Actor()
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 	if h.actions == nil {
@@ -195,9 +190,9 @@ func (h *ConversationAPI) rediagnose(w http.ResponseWriter, r *http.Request, inc
 }
 
 func (h *ConversationAPI) requestEvidence(w http.ResponseWriter, r *http.Request, incidentID uint64) {
-	actor, _, status, message := requireWriteSession(h.auth, r)
-	if status != 0 {
-		writeError(w, status, message)
+	actor, ok := h.console.Actor()
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 	if h.actions == nil {

@@ -246,33 +246,6 @@ type IntegrationEventReceipt struct {
 	Result      string    `gorm:"column:result;size:32;not null"`
 }
 
-// WebOAuthState 是一次性 OAuth state/PKCE 存储，不保存明文 verifier。
-type WebOAuthState struct {
-	StateHash              string    `gorm:"column:state_hash;primaryKey;size:128"`
-	CodeVerifierCiphertext string    `gorm:"column:code_verifier_ciphertext;type:text;not null"`
-	RedirectURI            string    `gorm:"column:redirect_uri;size:512;not null"`
-	ExpiresAt              time.Time `gorm:"column:expires_at;not null"`
-	CreatedAt              time.Time `gorm:"column:created_at;not null"`
-}
-
-func (WebOAuthState) TableName() string { return "web_oauth_state" }
-
-// WebSession 是浏览器会话；数据库只存 token/csrf 的哈希。
-type WebSession struct {
-	ID            string     `gorm:"column:id;primaryKey;size:64"`
-	TokenHash     string     `gorm:"column:token_hash;size:128;uniqueIndex;not null"`
-	ActorID       string     `gorm:"column:actor_id;size:128;not null"`
-	ActorName     string     `gorm:"column:actor_name;size:128;not null"`
-	TenantKey     *string    `gorm:"column:tenant_key;size:128"`
-	CSRFTokenHash string     `gorm:"column:csrf_token_hash;size:128;not null"`
-	ExpiresAt     time.Time  `gorm:"column:expires_at;not null"`
-	CreatedAt     time.Time  `gorm:"column:created_at;not null"`
-	LastSeenAt    time.Time  `gorm:"column:last_seen_at;not null"`
-	RevokedAt     *time.Time `gorm:"column:revoked_at"`
-}
-
-func (WebSession) TableName() string { return "web_session" }
-
 // LLMModelSelection 是唯一的全局当前模型记录。模型 allowlist、端点和
 // 凭据始终留在配置文件；此表只保存已选择的安全模型 ID。
 type LLMModelSelection struct {
