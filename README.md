@@ -1,4 +1,4 @@
-# oncall-agent（AI-Opus）
+# oncall-agent（AI-Ops）
 
 面向 Prometheus/Alertmanager 告警的 V1 自愈系统：告警接入 → 去重 → incident 归并 → 证据采集 → LLM 诊断 → Guard/Policy 决策 → 审批 → 受控执行 → 恢复验证 → 故障记忆，全链路可审计回放。
 
