@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"oncall-agent/internal/eventlog"
 	"oncall-agent/internal/store"
 )
 
@@ -57,6 +58,28 @@ func TestStreamUnauthorizedAndLastEventID(t *testing.T) {
 	heart.ServeHTTP(resp, req)
 	if !strings.Contains(resp.Body.String(), ": heartbeat") {
 		t.Fatalf("missing heartbeat: %q", resp.Body.String())
+	}
+}
+
+func TestStreamExecutionAndVerificationEvents(t *testing.T) {
+	types := []eventlog.EventType{eventlog.EventExecutionSimulated, eventlog.EventVerifyQueued, eventlog.EventVerifyStarted, eventlog.EventVerifyChecked}
+	rows := make([]store.IncidentEvent, 0, len(types))
+	for index, eventType := range types {
+		rows = append(rows, store.IncidentEvent{ID: uint64(index + 1), IncidentID: 11, EventType: string(eventType)})
+	}
+	api := NewStreamAPI(fakeEventStore{rows: rows}, NewConsole())
+	response := httptest.NewRecorder()
+	var cursor uint64
+	if err := api.writeEvents(response, response, context.Background(), 11, &cursor); err != nil {
+		t.Fatal(err)
+	}
+	for _, eventType := range types {
+		if !strings.Contains(response.Body.String(), "event: "+string(eventType)+"\n") {
+			t.Fatalf("event missing: %s", response.Body.String())
+		}
+	}
+	if cursor != uint64(len(types)) {
+		t.Fatalf("cursor = %d", cursor)
 	}
 }
 

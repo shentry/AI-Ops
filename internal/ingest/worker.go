@@ -250,28 +250,17 @@ func (w *Worker) process(ctx context.Context, event store.RawEvent) error {
 				// D05 促发分流：在促发同一事务里按 severity route 落 agent_run。
 				// skip 直接落 succeeded（可统计），full/light 落 pending 等 D09 消费。
 				mode := incident.RouteMode(assignment.Severity, w.severityRoute)
-				run := incident.NewQueueRun(assignment.IncidentID, mode, time.Now().UTC())
+				queued := incident.NewQueueRun(assignment.IncidentID, mode, time.Now().UTC())
+				run := store.AgentRun{
+					IncidentID: queued.IncidentID,
+					Mode:       queued.Mode,
+					Status:     queued.Status,
+					StartedAt:  queued.StartedAt,
+				}
+				if queued.Finished {
+					run.FinishedAt = &run.StartedAt
+				}
 				if err := tx.EnqueueAgentRun(ctx, &run); err != nil {
-					return err
-				}
-				runID := &run.ID
-				eventType := eventlog.EventRunQueued
-				eventStatus := "queued"
-				eventSummary := "diagnosis run queued"
-				if run.Status == "succeeded" {
-					eventType = eventlog.EventRunSucceeded
-					eventStatus = "succeeded"
-					eventSummary = "diagnosis run succeeded"
-				}
-				if _, err := tx.AppendIncidentEvent(ctx, incidentEvent(
-					assignment.IncidentID,
-					eventType,
-					"run",
-					eventStatus,
-					eventSummary,
-					run.StartedAt,
-					runID,
-				)); err != nil {
 					return err
 				}
 				promoted = append(promoted, assignment.IncidentID)

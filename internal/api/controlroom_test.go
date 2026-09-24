@@ -7,12 +7,14 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"oncall-agent/internal/incident"
 	"oncall-agent/internal/store"
 )
 
 type fakeControlRoomStore struct {
-	incident store.Incident
-	events   []store.IncidentEvent
+	incident  store.Incident
+	events    []store.IncidentEvent
+	approvals []store.Approval
 }
 
 func (f fakeControlRoomStore) GetIncident(context.Context, uint64) (store.Incident, error) {
@@ -33,8 +35,17 @@ func (f fakeControlRoomStore) ListIncidentProblems(context.Context, uint64, stri
 func (f fakeControlRoomStore) ListAgentRuns(context.Context, uint64, uint64, int) ([]store.AgentRun, error) {
 	return nil, nil
 }
-func (f fakeControlRoomStore) ListIncidentApprovals(context.Context, uint64, string, int) ([]store.Approval, error) {
-	return nil, nil
+func (f fakeControlRoomStore) ListIncidentApprovals(_ context.Context, _ uint64, status string, limit int) ([]store.Approval, error) {
+	var rows []store.Approval
+	for _, row := range f.approvals {
+		if status == "" || row.Status == status {
+			rows = append(rows, row)
+		}
+		if len(rows) == limit {
+			break
+		}
+	}
+	return rows, nil
 }
 func (f fakeControlRoomStore) ListIncidentRunSteps(context.Context, uint64, uint64, uint64, int) ([]store.AgentRunStep, error) {
 	return nil, nil
@@ -87,5 +98,70 @@ func TestControlRoomAllowsAnonymousConsole(t *testing.T) {
 	api.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/api/v1/incidents/9/control-room", nil))
 	if resp.Code != http.StatusOK {
 		t.Fatalf("anonymous console = %d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestControlRoomLatestActionIndependentOfPending(t *testing.T) {
+	for _, pending := range []bool{false, true} {
+		latest := completeApproval(t)
+		latest.ID = 12
+		latest.Status = "executed"
+		latest.Verification = &store.VerifyTask{ApprovalID: latest.ID, Status: "running"}
+		rows := []store.Approval{latest}
+		if pending {
+			rows = append(rows, completeApproval(t))
+		}
+		api := NewControlRoomAPI(fakeControlRoomStore{incident: store.Incident{ID: 11, Status: "firing"}, approvals: rows}, NewConsole())
+		resp := httptest.NewRecorder()
+		api.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/api/v1/incidents/11/control-room", nil))
+		var body ControlRoomDTO
+		if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if resp.Code != http.StatusOK || body.LatestAction == nil || body.LatestAction.ID != 12 || body.LatestAction.Verification.Status != "running" {
+			t.Fatalf("latest action: %d %s", resp.Code, resp.Body.String())
+		}
+		if pending != (body.PendingApproval != nil) {
+			t.Fatalf("pending conflated with latest: %s", resp.Body.String())
+		}
+	}
+}
+
+func TestControlRoomFlowUsesTerminalSnapshotWhenEventsAreAbsent(t *testing.T) {
+	for _, status := range []string{"simulated", "denied", "expired", "failed", "executed"} {
+		t.Run(status, func(t *testing.T) {
+			row := completeApproval(t)
+			row.Status = status
+			if status == "simulated" {
+				snapshot, err := incident.ParseExecutionContext(row.ExecutionContext)
+				if err != nil {
+					t.Fatal(err)
+				}
+				snapshot.DryRun = true
+				row.ExecutionContext, _ = json.Marshal(snapshot)
+				row.PlanHash, _ = incident.PlanHash(row.ToolName, row.ArgsJSON, row.ExecutionContext)
+			}
+			var events []store.IncidentEvent
+			wantVerification := "not_applicable"
+			if status == "executed" {
+				row.Verification = &store.VerifyTask{ApprovalID: row.ID, Status: "passed"}
+				events = []store.IncidentEvent{{EventType: "verify.passed", Status: "passed"}}
+				wantVerification = "passed" // Use the task verdict, not generic event completion.
+			}
+			handler := NewControlRoomAPI(fakeControlRoomStore{incident: store.Incident{ID: 11, Status: "firing"}, approvals: []store.Approval{row}, events: events}, NewConsole())
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/incidents/11/control-room", nil))
+			var body ControlRoomDTO
+			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || response.Code != http.StatusOK {
+				t.Fatalf("response=%s err=%v", response.Body.String(), err)
+			}
+			statuses := make(map[string]string)
+			for _, node := range body.FlowNodes {
+				statuses[node.Kind] = node.Status
+			}
+			if statuses["execute"] != status || statuses["verify"] != wantVerification {
+				t.Fatalf("flow=%v want execution=%s verify=%s", statuses, status, wantVerification)
+			}
+		})
 	}
 }

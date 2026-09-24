@@ -6,11 +6,11 @@
 
 ## 1. 架构结论
 
-- 一个 `oncall-agent` Go 进程同时承载 HTTP、静态前端、SSE 和 5 类后台 worker。
-- MySQL 是 AI-Opus 的唯一权威业务库，也是摄入、诊断、审批执行的持久队列。
+- 一个 `oncall-agent` Go 进程同时承载 HTTP、静态前端、SSE 和 6 类后台 worker；同一业务库只运行一个 server，不允许新旧进程重叠消费。
+- MySQL 是 AI-Opus 的唯一权威业务库，也是摄入、诊断、审批执行、恢复验证和对话的持久队列。
 - Prometheus、Alertmanager、blackbox-exporter 属于观测与告警侧。
 - PostgreSQL、Redis、Sub2API 属于被监控目标及其依赖，不是 AI-Opus 自身的存储。
-- React 控制台构建后通过 `go:embed` 嵌入 Go 服务，同源提供。
+- React 控制台必须先构建，再通过 `go:embed` 嵌入本次 Go 构建，同源提供。
 - LLM 只负责基于证据生成 RCA/Plan 或回答只读问题；变更动作必须经过 Guard、Policy、Approval、Executor、Verify。
 - 控制台是**显式的匿名公开操作面**：没有登录、会话或 CSRF，`api.Console` 是唯一的身份来源，控制台上的所有读写一律记为 `anonymous`。曾经存在但从未接入路由的 OAuth/Session 实现已于 2026-08-24 删除。
 
@@ -46,12 +46,13 @@ flowchart LR
     BB -.->|"TCP probe<br/>Redis 隧道"| RD
 
     subgraph mono["宿主机：oncall-agent 模块化单体"]
-        HTTP["GoFrame HTTP 层<br/>API / SSE / /metrics<br/>当前端口：18080"]
+        HTTP["GoFrame 单 listener<br/>API / SSE / /metrics<br/>Compose 显式端口：18080"]
         STATIC["web/embed.go<br/>嵌入 web/dist"]
         IW["ingest.Worker<br/>raw_event 消费"]
         DW["diagnose.Worker<br/>agent_run 消费"]
         EW["approval.ExpiryWorker<br/>审批 TTL 扫描"]
         EX["approval.Executor<br/>approved 审批执行"]
+        VW["diagnose.VerificationWorker<br/>到期 verify_task 消费"]
         CW["conversation.Worker<br/>对话队列消费"]
         REG["tools.Registry<br/>Prometheus / Docker 工具"]
         NOTIFY["notify.Notifier<br/>Noop / Webhook / Feishu"]
@@ -62,17 +63,19 @@ flowchart LR
         DW --> MYSQL
         EW --> MYSQL
         EX --> MYSQL
+        VW --> MYSQL
         CW --> MYSQL
         DW --> REG
         EX --> REG
         DW --> NOTIFY
-        EX --> NOTIFY
+        VW --> NOTIFY
     end
 
     BROWSER["浏览器控制台"] -->|"same-origin HTTP"| HTTP
     AM -->|"POST /webhook/alertmanager<br/>Bearer Token"| HTTP
 
     DW -.->|"证据：/health"| GW
+    VW -.->|"快照绑定的 /health 验证"| GW
     DW -.->|"证据：PostgreSQL"| PG
     DW -.->|"证据：Redis"| RD
     DW -.->|"PromQL 查询"| PROM
@@ -92,7 +95,7 @@ flowchart LR
 | 部分 | 当前实现 |
 |---|---|
 | `oncall-agent` | 跑在宿主机，不在 `docker-compose.dev.yml` 中 |
-| HTTP | GoFrame，当前配置端口为 `18080` |
+| HTTP | GoFrame 单 listener；独立默认 `127.0.0.1:8080`，Compose 显式覆盖 `0.0.0.0:18080` |
 | MySQL | Compose 容器，AI-Opus 自身唯一业务数据库 |
 | Prometheus | `:9090`，抓 node-exporter 和 blackbox |
 | Alertmanager | `:9093`，向宿主机发送 Alertmanager webhook |
@@ -102,7 +105,9 @@ flowchart LR
 | LLM | OpenAI 兼容接口，凭据只来自服务端配置 |
 | Feishu | 可选出向通知和入向回调 |
 
-依据：`docker-compose.dev.yml`、`prometheus.yml`、`alertmanager.yml`、`blackbox.yml`、`config.yaml`、`cmd/server/main.go:42-239`。
+独立运行省略 `server.listen_addr` 时默认只绑定回环。Compose 的 Alertmanager 访问 `host.docker.internal:18080`，必须显式使用容器可达的监听地址；示例 `0.0.0.0` 必须配合宿主防火墙限制**整个 listener**，包括匿名写接口与 `/metrics`，不是只隐藏首页。`web.base_url` 只控制启用/链接，不提供访问控制；飞书验签/白名单与 Bearer 自动化入口也不等于 Web 受保护。匿名控制台没有个人身份或授权保证。Sub2API 示例的 `8080` 是被监控服务，与这里显式使用 `18080` 的 oncall-agent 不同。
+
+依据：`docker-compose.dev.yml`、`prometheus.yml`、`alertmanager.yml`、`blackbox.yml`、`config.example.yaml`、`internal/config/config.go:defaultConfig`、`cmd/server/main.go:run`。
 
 ## 3. 代码分层与模块依赖
 
@@ -123,15 +128,15 @@ flowchart TB
         DIAGW["internal/diagnose.Worker<br/>agent_run"]
         EXPW["internal/approval.ExpiryWorker<br/>审批 TTL"]
         EXECW["internal/approval.Executor<br/>approved approval"]
+        VERIFYW["internal/diagnose.VerificationWorker<br/>due verify_task"]
         CONVW["internal/conversation.Worker<br/>conversation_message"]
     end
 
     subgraph domain["业务控制面"]
         ING["internal/ingest<br/>解析、指纹、去重、归并"]
-        INC["internal/incident<br/>严重度路由、run 初始化"]
+        INC["internal/incident<br/>纯规则、ExecutionContext / PlanHash"]
         PIPE["internal/diagnose.Pipeline<br/>memory → evidence → LLM → Guard → Policy → notify"]
-        VERIFY["internal/diagnose.Verifier<br/>独立恢复验证"]
-        RETRY["internal/diagnose.RetryScheduler<br/>重诊与人工升级"]
+        VERIFY["internal/diagnose.Verifier<br/>单次有界只读健康检查"]
         APPROVAL["internal/approval<br/>Policy、审批状态机、执行器"]
         MEMORY["internal/memory<br/>fault_memory 召回/写回/降级"]
         CONV["internal/conversation<br/>对话入队、上下文、回答持久化"]
@@ -156,6 +161,7 @@ flowchart TB
     BOOT --> DIAGW
     BOOT --> EXPW
     BOOT --> EXECW
+    BOOT --> VERIFYW
     BOOT --> CONVW
 
     WEB --> API
@@ -168,7 +174,7 @@ flowchart TB
     INGW --> ING
     ING --> INC
     ING --> STORE
-    INC --> STORE
+    STORE --> INC
 
     DIAGW --> PIPE
     PIPE --> MEMORY
@@ -180,10 +186,11 @@ flowchart TB
 
     EXECW --> APPROVAL
     EXECW --> TOOLS
-    EXECW --> VERIFY
-    EXECW --> MEMORY
-    EXECW --> RETRY
     EXECW --> STORE
+
+    VERIFYW --> VERIFY
+    VERIFYW --> STORE
+    VERIFYW --> NOTIFY
 
     CONVW --> CONV
     CONVW --> LLM
@@ -193,8 +200,6 @@ flowchart TB
 
     APPROVAL --> STORE
     MEMORY --> STORE
-    VERIFY --> STORE
-    RETRY --> STORE
     NOTIFY --> STORE
     EVENTS -.-> STORE
 
@@ -210,22 +215,23 @@ flowchart TB
 | 模块 | 当前职责 |
 |---|---|
 | `cmd/server` | 唯一组合根；所有依赖在这里组装 |
-| `internal/config` | YAML 读取、环境变量展开、启动前校验、默认值 |
+| `internal/config` | YAML AST 环境变量展开、KnownFields 严格解码、监听/验证默认值与启动前校验 |
 | `internal/api` | GoFrame 适配器、HTTP 路由、DTO 脱敏、Bearer/匿名鉴权、SSE |
 | `internal/ingest` | Alertmanager v4 解析、fingerprint、alert hash、severity、去重、归并 |
-| `internal/incident` | severity → `full/light/skip` 路由；构造诊断队列行 |
-| `internal/diagnose` | Evidence、Pipeline、Guard、Verify、Retry |
+| `internal/incident` | 不依赖 store 的归并/生命周期/路由纯规则；ExecutionContext、PlanHash、FaultFingerprint 与重诊规则 |
+| `internal/diagnose` | Evidence、Pipeline、Guard、单次 Verifier 和持久验证队列 Worker |
 | `internal/llm` | OpenAI 兼容模型工厂、Eino ReAct、只读 Questioner、模型切换 |
 | `internal/tools` | 工具注册、等级控制、统一超时、输出截断、Prometheus/Docker 适配 |
 | `internal/approval` | Policy 判定、审批 CAS、审批 TTL、执行队列、执行结果 |
 | `internal/memory` | 精确故障指纹记忆；高置信 TTL 召回、写回和降级 |
 | `internal/conversation` | Web/Feishu 共用的对话队列、上下文组装、回答持久化 |
 | `internal/notify` | Provider 无关通知接口；Noop、传统 webhook、Feishu |
-| `internal/store` | 唯一 GORM/MySQL 边界；所有业务状态和审计写入 |
+| `internal/store` | 唯一 GORM/MySQL 边界；统一 RequestRun 准入，CompleteRun/FinishExecution/FinalizeVerification 事务与审计 |
 | `internal/eventlog` | 事件类型常量；事件实际由各业务模块通过 store 写入 |
 | `internal/metrics` | 进程内 counter/gauge，暴露 `/metrics` |
 | `web` | Vite 产物通过 `go:embed` 嵌入 Go 服务；产物不入库，需先 `npm run build` |
 | `cmd/simulate` | 走同一个 webhook 入口注入测试告警 |
+| `cmd/retire-approvals` | 停机备份后的显式旧审批退役；不由 server 启动时自动执行 |
 
 ## 4. 告警接入、去重与 Incident 归并
 
@@ -270,7 +276,7 @@ sequenceDiagram
 
         alt 达到 min_alerts 且首次 promote
             DB->>DB: candidate → firing
-            DB->>DB: 创建 agent_run
+            DB->>DB: 事务内 RequestRun 共用准入 → agent_run
             alt mode=skip
                 DB->>DB: agent_run 直接 succeeded
             else mode=full/light
@@ -352,7 +358,7 @@ flowchart TB
     RDCOL --> COLLECTED
     DOCCOL --> COLLECTED
     COLLECTED --> RENDER["Evidence.Render<br/>脱敏、截断、防 Prompt Injection"]
-    RENDER --> REASON["llm.Reasoner<br/>Eino ReAct<br/>full≤8步 / light≤3步"]
+    RENDER --> REASON["llm.Reasoner<br/>上下文预算 + 旧工具结果压缩<br/>兜底 full≤32步 / light≤16步"]
 
     subgraph llmtools["LLM 可见工具面"]
         L1["Registry.ForLLM()<br/>仅 L1 只读工具"]
@@ -370,8 +376,9 @@ flowchart TB
 
     POLICY -->|"none / denied"| REPORT["诊断报告 + 审计"]
     POLICY -->|"L1 read-only"| REPORT
-    POLICY -->|"L2 自动条件满足"| SYSAPP["系统批准 approval<br/>统一进入执行队列"]
-    POLICY -->|"L3 或 L2 护栏失败"| PENDING["approval=pending"]
+    POLICY -->|"支持范围内的 L2/L3"| PUBLISH["CompleteRun 同事务<br/>诊断终态 + 审批快照 + 事件"]
+    PUBLISH -->|"L2 自动条件满足"| SYSAPP["系统批准 approval<br/>统一进入执行队列"]
+    PUBLISH -->|"L3 或 L2 自动护栏失败"| PENDING["approval=pending"]
 
     PENDING --> HUMAN["Web 匿名控制台<br/>或 Feishu 卡片"]
     HUMAN -->|approve| APPROVED["approval=approved"]
@@ -379,18 +386,20 @@ flowchart TB
     PENDING -->|"TTL 到期"| EXPIRED["approval=expired"]
 
     SYSAPP --> APPROVED
-    APPROVED --> EXEC["approval.Executor<br/>claim approved → executing"]
-    EXEC --> HASH["重算 tool + args + plan_hash"]
-    HASH --> REGEXEC["Registry.Execute<br/>统一超时 + 输出截断"]
-    REGEXEC --> ACTION["Docker / 外部运行时动作"]
-    ACTION --> VERIFY["独立 Verify<br/>延迟复查 Incident 成员状态"]
-
-    VERIFY -->|passed| SUCCESS["approval=executed<br/>写 fault_cmd_history"]
-    SUCCESS --> COMMIT["仅 high + 干净案例<br/>写 fault_memory"]
-    VERIFY -->|failed| RETRY{"retry_of 链<br/>是否仍在上限内?"}
-    RETRY -->|是| NEWRUN["创建 full retry agent_run<br/>注入上一轮失败上下文"]
-    RETRY -->|否| ESCALATE["通知人工升级"]
-    VERIFY -->|inconclusive| MANUAL["只留审计<br/>等待人工核查"]
+    APPROVED --> EXEC["approval.Executor<br/>锁内复验 Hash / TTL / 配置 / 故障范围<br/>approved → executing"]
+    EXEC -->|"快照 dry_run"| SIM["FinishExecution: simulated<br/>无外部动作、无验证任务"]
+    EXEC -->|"快照真实执行"| REGEXEC["Registry.Execute<br/>统一超时 + 输出截断"]
+    REGEXEC --> RESULT["FinishExecution 同事务<br/>终态 + history + 事件"]
+    RESULT -->|executed| TASK[(verify_task: pending)]
+    RESULT -->|failed| MANUAL["manual_check<br/>结果未知不重放动作"]
+    TASK --> VERIFY["VerificationWorker<br/>领取到期任务 + 单次 /health"]
+    VERIFY -->|"窗口未结束"| TASK
+    VERIFY --> FINAL["FinalizeVerification 同事务<br/>任务 + Step/Event/Problem + 后续变化"]
+    FINAL -->|passed| COMMIT["符合高置信/Guard 等门槛<br/>写 fault_memory"]
+    FINAL -->|failed| RETRY{"retry_of 链<br/>是否仍在上限内?"}
+    RETRY -->|是| NEWRUN["事务内复用 RequestRun<br/>必要记忆降级 + full retry"]
+    RETRY -->|否| ESCALATE["持久人工问题 + 升级事件<br/>提交后通知"]
+    FINAL -->|inconclusive| MANUAL
 
     NEWRUN --> Q
     REPORT --> AUDIT["agent_run_step<br/>incident_event<br/>incident_problem"]
@@ -411,10 +420,13 @@ flowchart TB
 5. `Reasoner.Diagnose`：Eino ReAct，非法 JSON 最多重试一次。
 6. `Guard`：确定性规则覆盖 LLM 计划。
 7. `Policy`：决定 `none / denied / approval / auto_l2`。
-8. `NotifyReporter`：通知失败单独记录，不回滚诊断终态。
-9. `CompleteRun`：run 状态和最终事件短事务提交。
+8. `Service.Prepare`：只准备不可变审批草稿，不独立写审批。
+9. `CompleteRun`：Run 的 RCA/Plan/终态、审批快照与相关事件同事务发布。
+10. `NotifyReporter`：提交后发送通知，失败不回滚已提交的诊断。
 
-依据：`internal/diagnose/pipeline.go:110-283`、`internal/diagnose/evidence.go:15-152`、`internal/diagnose/guard.go:26-95`、`internal/approval/policy.go:92-184`。
+阶段开始事件、普通步骤和工具步骤写入错误均传播并阻止发布可执行审批。
+
+依据：`internal/diagnose/pipeline.go:Run/withStep/recordToolSteps`、`internal/diagnose/evidence.go`、`internal/diagnose/guard.go`、`internal/approval/policy.go:Decide`、`internal/store/runstep.go:CompleteRun`。
 
 ### 安全闸门
 
@@ -424,17 +436,30 @@ flowchart LR
     GUARD --> POLICY["Policy"]
     POLICY --> TOOL["Registry 工具目录"]
     TOOL --> EXEC["Executor"]
-    EXEC --> VERIFY["Verify"]
+    EXEC --> TASK["持久 verify_task"]
+    TASK --> VERIFY["VerificationWorker / Verifier"]
 ```
 
 - LLM 只能看到 `Registry.ForLLM()` 导出的 L1 工具。
 - L2/L3/L4 变更动作不会直接暴露给 ReAct。
 - `Guard` 会拦截无真实 target 的动作。
 - 配置错误、镜像不存在、凭据错误等根因会禁止重启类动作并升级人工。
-- L2 自动执行必须同时满足全局开关、非 dry-run、目标白名单、可信 target 来源、单对象影响范围、可验证结果和限频条件。
-- L4 永远拒绝，审批不能解除。
-- 执行前重新计算 `plan_hash`，审批单被篡改时拒绝执行。
-- Verify 不把“命令调用成功”当作“故障恢复成功”。
+- 人工/自动变更都只支持白名单 Sub2API 单容器 `docker_restart`，firing 成员必须属于该目标的 `Sub2APIDown`；Slow、依赖故障、混合范围或无可靠验证绑定直接拒绝计划。
+- 支持范围通过后，L2 自动路径再检查全局开关、非 dry-run 与限频；未通过才降级人工。L4 永远拒绝，审批不能解除。
+- `incident.PlanHash = SHA256(canonicalJSON(tool_name, args, execution_context))`；快照固定 Registry 安全等级、dry-run、目标/URL、成员与验证时长。Hash 是内容绑定，不是身份签名。
+- 裁决比较预期 Hash、实际内容、状态和 TTL；执行领取还检查当前配置/白名单、安全开关、Incident firing 与故障范围。配置漂移不改写旧快照，也不把旧任务转向新地址。
+- Web/飞书展示同一快照的 target、scope、safety_level、dry_run、reason、plan_hash、expires_at；缺少决策信息不能批准，不把模型 risk 当权限。
+
+### 独立恢复验证与准入
+
+- `FinishExecution` 先提交 `executed` 与 `verify_task`，Executor 不等待健康检查；`simulated` 无真实动作、无验证、无成功记忆。
+- `Verifier.Check` 与 Collector 共用 `health.go` 的 HTTP 判定，不跟随重定向。2xx 表示健康，非 2xx 表示不健康，无法请求/读取表示无可靠观测；仅适用于上述支持故障。
+- Worker 每秒消费到期任务，默认每 10 秒观察、120 秒窗口、单次最多 5 秒（这些不是实测恢复时间）。未到终点则持久化下次检查，不 sleep 等待窗口；只有截止前的健康观测能 passed，截止时只有新鲜的先前不健康观测能 failed，否则 inconclusive。
+- `FinalizeVerification` 同事务写任务、Step/Event/Problem、必要记忆变化与重诊。不可判定不降级记忆、不自动重诊；通过也不直接把 Incident 改为 resolved，Incident 仍由告警成员恢复驱动。
+- 告警促发、Bearer `/diagnose`、Web `/rediagnose` 和验证重诊共用 `RequestRun`/事务内函数：锁 Incident、要求 firing、拒绝活跃 Run/审批/验证周期；人工有 60 秒冷却（按 `run.queued`），自动最多两次（按 `retry_of` 链）。人工冲突返回 409，冷却返回 429 与 Retry-After。
+- 执行结果提交失败只重试持久化，不重新调用工具；重启时未知 executing 标 failed + manual_check。已提交执行只恢复验证；只读领取 30 秒超时可回队，终态提交比较 claimed_at，重启不延长 deadline。
+
+依据：`internal/store/runrequest.go`、`internal/store/execution.go`、`internal/store/verification.go`、`internal/diagnose/verification_worker.go`、`internal/incident/execution.go`。
 
 ## 6. Web 控制室、SSE 与 Feishu 协同
 
@@ -448,6 +473,7 @@ flowchart LR
         TIMELINE["EventTimeline<br/>事件审计流"]
         PROBLEM["ProblemPanel<br/>当前问题"]
         APPROVAL["ApprovalPanel<br/>批准/拒绝/请求证据"]
+        ACTION["ActionPanel<br/>最近执行 / 验证双状态"]
         STEP["StepInspector<br/>安全展示 step JSON"]
         CONV["ConversationPanel<br/>Incident 问答"]
         MODEL["ModelSwitcher<br/>模型 allowlist 切换"]
@@ -458,6 +484,7 @@ flowchart LR
         ROOM --> TIMELINE
         ROOM --> PROBLEM
         ROOM --> APPROVAL
+        ROOM --> ACTION
         ROOM --> STEP
         ROOM --> CONV
         APP --> MODEL
@@ -479,7 +506,7 @@ flowchart LR
         PROBLEMS[("incident_problem")]
         MSG[("conversation_message")]
         RUNS[("agent_run / agent_run_step")]
-        APPS[("approval")]
+        APPS[("approval / verify_task")]
         MODELSEL[("llm_model_selection")]
     end
 
@@ -518,7 +545,9 @@ flowchart LR
 - `IncidentRoom` 首屏读取控制室聚合、run steps 和对话历史。
 - `EventSource` 连接后端 SSE，后端按 MySQL `incident_event.id` 做游标轮询。
 - 前端收到事件后合并去重，并触发延迟刷新。
-- 重诊、补充证据、提问、审批都是异步入队。
+- 重诊经统一准入入队，补充证据/提问入对话队列；审批决定同步事务提交，变更执行异步消费。
+- `pending_approval` 用于裁决，`latest_action` 展示最近审批的执行/验证事实，终态不会随待审批列表清空而消失。旧版无快照记录展示未知，不伪造过去的演练/验证结果。
+- `execution.simulated`、`verify.queued/started/checked/passed/failed/inconclusive` 等事件驱动刷新；`GET /api/v1/approvals/:id` 返回同一验证摘要，不暴露验证 URL。
 - `request-evidence` 复用 conversation 队列，不在 HTTP handler 中直接采证据或调用 Docker。
 - `FlowGraph` 固定展示：
 
@@ -530,7 +559,7 @@ alert → evidence → reasoner → guard → policy → approval → execute �
 
 ```mermaid
 sequenceDiagram
-    participant P as Pipeline/Executor
+    participant P as Pipeline/VerificationWorker
     participant N as Feishu Notifier
     participant F as Feishu API
     participant CB as /integrations/feishu/events
@@ -551,7 +580,7 @@ sequenceDiagram
 
     alt 卡片批准/拒绝
         BIZ->>DB: 读取 approval
-        BIZ->>DB: CAS 决策 pending → approved/denied
+        BIZ->>DB: 锁内校验 Hash / TTL / 状态并提交决定
         BIZ-->>F: Toast
         BIZ-)F: 异步 patch 卡片
     else Incident 对话
@@ -573,10 +602,10 @@ sequenceDiagram
 | `POST /webhook/alertmanager` | Bearer | Alertmanager v4 告警入队 |
 | `GET /api/v1/incidents` | Bearer | 自动化 Incident 列表 |
 | `GET /api/v1/incidents/:id` | Bearer | Incident 详情和成员 |
-| `POST /api/v1/incidents/:id/diagnose` | Bearer | 手动创建诊断 run |
+| `POST /api/v1/incidents/:id/diagnose` | Bearer | 统一准入的人工诊断（含冷却） |
 | `GET /debug/evidence/:id` | Bearer | 查看渲染后的证据 |
 | `GET /metrics` | 无鉴权 | Prometheus 文本指标 |
-| `/api/v1/approvals...` | Bearer 或匿名控制台 | 审批列表、approve、deny |
+| `/api/v1/approvals...` | Bearer 或匿名控制台 | 列表/详情与验证摘要；approve/deny 需 plan_hash、reason |
 | `/api/v1/admin/model` | Bearer | 管理端切换模型 |
 | `/api/v1/control-room/model` | 控制室公开读 | 当前模型和 allowlist |
 | `/api/v1/control-room/incidents` | 匿名控制台 | 控制室 Incident 列表 |
@@ -592,7 +621,7 @@ sequenceDiagram
 | `POST /integrations/feishu/events` | Lark SDK 验签解密 | Feishu 事件和卡片回调 |
 | `/`、`/*path` | 无 | 嵌入式 React 静态资源 |
 
-路由绑定集中在 `cmd/server/main.go:242-287`。
+路由绑定集中在 `cmd/server/main.go:run`。
 
 ## 8. Worker 与队列
 
@@ -602,17 +631,22 @@ sequenceDiagram
 | `diagnose.Worker` | `agent_run.status=pending` | 定时轮询 | 启动和运行中将超时 `running` 重新放回 pending |
 | `approval.ExpiryWorker` | `approval.status=pending/approved` | 默认每分钟扫描 | 过期审批转 `expired` 并写事件/问题 |
 | `approval.Executor` | `approval.status=approved` | 默认每秒轮询 | 启动时回收中断的 `executing`；不自动重放外部动作 |
+| `diagnose.VerificationWorker` | `verify_task.status=pending` 且到期 | 每秒处理一个到期任务 | 启动及循环回收超时 running；取消/读库错误保留可恢复领取，deadline 不变 |
 | `conversation.Worker` | `conversation_message.status=queued` | 定时轮询 | 超时 `running` 消息重新入队 |
 
-系统不使用 RabbitMQ、Kafka、Redis Streams 或独立任务服务。MySQL 行锁、条件更新和幂等状态迁移承担队列可靠性。
+系统不使用 RabbitMQ、Kafka、Redis Streams 或独立任务服务。MySQL 行锁、条件更新和幂等状态迁移承担队列可靠性；这不等于支持多实例，也不保证外部动作与 MySQL 的 exactly-once。
 
 ## 9. MySQL 数据模型
 
-当前 migration 逻辑上共有 18 张表：
+空库按 001–011 顺序迁移后共有 19 张表（含两张已弃用、尚未 DROP 的 Web 会话表）：
 
 - `001_init.sql`：10 张核心表
 - `005_control_room.sql`：7 张控制室/会话表
 - `007_llm_model_selection.sql`：1 张模型选择表
+- `008_deprecate_web_session.sql`：标记两张会话表弃用，不删除
+- `009_approval_execution_context.sql`：审批快照与 simulated 终态
+- `010_verify_task.sql`：1 张持久验证任务表
+- `011_queue_admission_indexes.sql`：统一准入/队列查询索引
 
 下面关系是**业务逻辑关系**。当前 SQL 没有声明外键，图中的关系不是数据库 FK 约束。
 
@@ -709,6 +743,7 @@ erDiagram
         VARCHAR tool_name
         JSON args_json
         CHAR64 plan_hash
+        JSON execution_context
         TEXT reason
         ENUM status
         DATETIME expires_at
@@ -718,6 +753,18 @@ erDiagram
         DATETIME decided_at
         TEXT decision_reason
         VARCHAR decision_source
+    }
+
+    verify_task {
+        BIGINT approval_id PK
+        ENUM status
+        DATETIME next_check_at
+        DATETIME deadline_at
+        DATETIME claimed_at
+        DATETIME last_checked_at
+        JSON last_result_json
+        DATETIME created_at
+        DATETIME finished_at
     }
 
     fault_memory {
@@ -752,6 +799,7 @@ erDiagram
     agent_run ||--o{ agent_run_step : "步骤审计"
     agent_run ||--o{ approval : "动作申请"
     approval ||--o{ fault_cmd_history : "执行结果"
+    approval ||--o| verify_task : "真实执行的恢复验证"
     fault_memory ||--o{ fault_cmd_history : "同故障指纹"
 ```
 
@@ -862,7 +910,7 @@ raw_event → incident
 
 这与部分设计文档中“按 raw_event_id 贯穿全链路”的描述不一致。
 
-依据：`migrations/001_init.sql`、`migrations/005_control_room.sql`、`migrations/007_llm_model_selection.sql`、`internal/store/models.go`。
+依据：`migrations/001_init.sql` 至 `011_queue_admission_indexes.sql`、`internal/store/models.go`。
 
 ## 10. 状态机
 
@@ -872,26 +920,30 @@ raw_event → incident
 | `incident` | 枚举包含 `candidate/firing/acknowledged/resolved`；主链主要为 `candidate → firing → resolved` |
 | `agent_run` | `pending → running → succeeded/failed` |
 | 重诊 run | 通过 `retry_of` 串成 run 链，自动重诊上限为 2 |
-| `approval` | `pending → approved/denied/expired`；`approved → executing → executed/failed` |
+| `approval` | `pending → approved/denied/expired`；`approved → executing/expired`；`executing → executed/simulated/failed` |
+| `verify_task` | `pending → running → passed/failed/inconclusive`；未到终点或领取超时 `running → pending` |
 | `conversation_message` | `queued → running → completed/failed`；租约超时可重新入队 |
 | `fault_memory` | `high` 命中验证失败后降为 `low`，后续不再召回 |
 | `llm_model_selection` | 单例行保存当前模型 ID，不保存 URL、密钥或 token |
 
-## 11. 当前配置下的启用状态
+## 11. 配置与启用条件
 
 | 能力 | 当前配置 | 实际效果 |
 |---|---|---|
 | MySQL | `mysql.dsn: ${MYSQL_DSN}` | 必须配置，否则启动失败 |
-| LLM Reasoner | 已配置 `glm-5` | `diagnose.Worker` 会启动 |
+| LLM Reasoner | 需配置有效角色与模型 | 配置缺失时 `diagnose.Worker` 不启动 |
 | Web 控制台 | `web.base_url` 非空，或 provider 为 `feishu_app` | `webEnabled=true`，组装 `api.Console` |
 | Web 鉴权 | 无 | 控制台读写使用固定 `anonymous` 身份；没有登录、会话或 CSRF |
-| Feishu | `notify.im.provider` 未启用 | 不绑定 Feishu callback；通知通常回退 Noop |
+| Feishu | 选择 `notify.im.provider: feishu_app` | 启用时需完整配置；不回退 Noop，回调验签不保护 Web |
 | `approval.dry_run` | 未配置，默认 `true` | 默认不执行真实 Docker 变更 |
 | `approval.auto_execute_l2` | 未配置，默认 `false` | L2 自动路径默认关闭 |
-| Docker allowlist | 未配置，默认为空 | 没有默认可自动重启目标 |
-| Prometheus | 配置为本机 Prometheus | 证据和黄金指标查询使用该地址 |
-| Docker socket | 配置为独立 Unix socket | socket 不存在时跳过 Docker 工具和证据 |
-| Web 前端产物 | `web/dist/` 不入库 | 未跑 `npm run build` 时后端照常启动，静态资源全 404 |
+| Docker allowlist | 未配置时默认为空 | 无可批准的重启目标；示例配置需显式列出目标 |
+| HTTP 监听 | `server.listen_addr` 默认 `127.0.0.1` | Compose 显式 `0.0.0.0:18080`，全 listener 必须限制可信来源 |
+| 独立验证 | `diagnose.verification` 默认 interval/window/timeout=`10/120/5` 秒 | `0 < timeout < interval < window` 且 timeout < 30 秒；不复用 evidence 超时 |
+| 严格配置 | YAML AST 展开后 `KnownFields(true)` | 未知/删除字段、多文档或无效时长拒绝启动 |
+| Prometheus | 默认本机 `9090` | 证据和黄金指标查询使用该地址 |
+| Docker socket | 默认 `/var/run/docker.sock` | socket 不存在时跳过 Docker 工具和证据 |
+| Web 前端产物 | `web/dist/` 不入库 | 必须先 `npm run build` 再编译 Go；`.gitkeep` 不是可用控制台 |
 
 ## 12. 安全与可靠性不变量
 
@@ -907,17 +959,25 @@ raw_event → incident
 - LLM 只接收脱敏、截断后的证据。
 - LLM 只能调用 L1 只读工具。
 - LLM 输出不是权限结论。
-- 非法 JSON 最多重试一次。
+- 上下文窗口配置在 `llm.models[].context_window_tokens`，随模型切换；DeepSeek 示例值为 1000000，未指定模型窗口时应用缺省值为 131072（不是对供应商容量的保证）。诊断在同一锁内取得客户端与窗口快照，扣除 `max_tokens` 输出预留及 512 协议余量。旧 `diagnose.budget.context_tokens` 已删除，配置加载会拒绝该字段。
+- 每次请求估算系统提示、工具定义、Evidence 和完整消息历史：ASCII 约 3 字符/Token，非 ASCII 约 2 UTF-8 字节/Token，初始增加 20% 余量；根据本次诊断各轮实际 `prompt_tokens` 对低估偏差向上校准，保留 10% 余量。分母使用实际发送的压缩后输入，校准不跨模型或诊断共享。它是启发式估算，不是精确 tokenizer、累计费用上限或网关容量认证。
+- 输入超过可用额度的 80% 时，仅压缩旧工具结果：Prometheus 数值序列保留标签、首尾点、最小/最大点与样本数；Docker 日志对连续相同行保存原文和次数。中间指标样本的省略有显式标记，不能据摘要推断完整波形或异常持续时间。
+- 初始证据、最近一批完整工具交互、assistant reasoning 和协议元数据保持原样；不新增摘要模型调用。压缩只作用于发送副本，原始 ReAct 历史和已有审计截断规则不变。压缩后仍超过预算则报错，不继续删除受保护事实。
+- 默认 full/light 图步数上限为 32/16，诊断含契约重试总超时为 3 分钟；配置文件显式设置的旧步数仍然生效。只读 Questioner 仍复用 light 步数，尚未接入本次诊断上下文压缩。
+- 诊断的 full/light 预算限制图执行步数（模型与工具批次各占一步），不等于单个工具调用次数；最后可用模型轮次禁用工具调用，基于已有证据输出结论。工具批次仍可并行，调用日志使用互斥保护。
+- 成功诊断的 LLM 步骤记录 `context_compactions`、最近一次输入估算的压缩前后值和累计估算节省量；同时记录最后一轮 `actual_prompt` 和供后续估算使用的 `estimate_factor`；实际总 Token 仍取模型 usage 累加，二者分开解释。
+- 诊断 Plan 的 action 只接受 `none` 或 `docker_restart`，未支持的变更写为人工建议；注册、目标与审批仍由 Policy 校验。
+- 非法 JSON 或非法 action 最多重试一次；最后一轮仍请求工具则失败，不执行越预算的工具。
 - 工具统一设置超时和最大输出。
 
 ### 12.3 变更动作
 
 - 所有动作必须存在于 Registry。
-- L2 自动执行需要完整护栏；任一条件失败则降级审批。
-- 审批绑定 `tool_name + args_json + plan_hash`。
-- 执行前重新计算 hash，内容变化即拒绝。
-- 执行成功后还必须独立 Verify。
-- Verify 不可判定时不写成功记忆，也不自动重诊。
+- 目标/验证范围不合法直接拒绝，只有通过共同前置条件的 L2 才可按自动护栏降级人工。
+- 审批 Hash 绑定 `tool_name + args + execution_context`，快照不可变；裁决和执行前复验。
+- Run 结论与审批原子发布，执行成功与验证任务原子提交，验证终态与审计/记忆/必要重诊原子提交。
+- 执行、验证、Incident 恢复是不同事实；不可判定不写成功记忆、不降级记忆，也不自动重诊。
+- IM 通知在提交后发送，不保证必达；结果未知的外部动作不自动重放。
 
 ### 12.4 敏感数据
 
@@ -927,7 +987,7 @@ raw_event → incident
 
 ## 13. 当前漂移与风险点
 
-1. **控制台是公开操作面**：`webEnabled` 后无任何鉴权；能访问服务端口的请求方可以查看、提问、重诊、请求证据和审批，审计一律记为 `anonymous`。这是明确的设计选择（见 `docs/design-review.md` B1 补记），要鉴权需要重新实现。
+1. **可信网络匿名操作面**：控制台可达即具有读写操作权限，审计记为 `anonymous`，不提供个人身份保证；必须限制整个 listener。
 2. **Alertmanager 凭据需要对齐**：Alertmanager 配置文件中的固定凭据必须与服务端环境变量一致，否则 webhook 会返回 401。
 3. **当前 Compose 未抓取 oncall-agent `/metrics`**：Prometheus 配置只有 node-exporter 和 blackbox job。
 4. **默认是演练模式**：`dry_run=true`、`auto_execute_l2=false`，且 Docker allowlist 为空。
@@ -939,37 +999,32 @@ raw_event → incident
 | 主题 | 主要文件 |
 |---|---|
 | 服务启动与依赖组装 | `cmd/server/main.go` |
-| HTTP 路由 | `cmd/server/main.go:242-287` |
-| 配置与默认值 | `internal/config/config.go`、`config.yaml` |
+| HTTP 路由 | `cmd/server/main.go:run` |
+| 配置与默认值 | `internal/config/config.go`、`config.example.yaml` |
 | 告警解析/指纹/归并 | `internal/ingest/*.go` |
 | 摄入事务与队列 | `internal/ingest/worker.go`、`internal/store/rawevent.go`、`internal/store/incident.go` |
 | 诊断 Pipeline | `internal/diagnose/pipeline.go` |
 | Evidence collectors | `internal/diagnose/collector_*.go`、`internal/diagnose/evidence.go` |
 | LLM 与工具权限 | `internal/llm/*.go`、`internal/tools/*.go` |
 | Guard/Policy/审批/执行 | `internal/diagnose/guard.go`、`internal/approval/*.go` |
-| Verify/重诊 | `internal/diagnose/verify.go`、`internal/diagnose/retry.go` |
+| 执行契约/纯规则 | `internal/incident/execution.go`、`internal/incident/merge.go`、`internal/incident/retry.go` |
+| Verify/重诊准入 | `internal/diagnose/verify.go`、`internal/diagnose/verification_worker.go`、`internal/store/verification.go`、`internal/store/runrequest.go` |
 | 控制室/SSE/对话 | `internal/api/controlroom.go`、`internal/api/stream.go`、`internal/conversation/*.go` |
 | Feishu 回调 | `internal/notify/feishu/*.go`、`internal/api/feishu_callback.go` |
 | 数据模型 | `migrations/*.sql`、`internal/store/models.go` |
 | 前端控制台 | `web/src/main.tsx`、`web/src/pages/IncidentRoom.tsx`、`web/src/api.ts` |
 | 部署与告警 | `docker-compose.dev.yml`、`prometheus.yml`、`alerts.yml`、`alertmanager.yml`、`blackbox.yml` |
 
-## 15. 核验记录
+## 15. 升级与验证边界
 
-已核验：
+已有数据库升级必须先停 server/外部写入并备份，再执行：
 
-```text
-go list ./...
+```bash
+MYSQL_DSN=... go run ./cmd/retire-approvals -apply
 ```
 
-识别到 18 个 Go 包，覆盖 server、simulate、全部 internal 模块和 `web`。
-（2026-08-24 起 `internal/auth` 已删除，包数由 19 降为 18。）
+该离线命令支持 migration 009 前/后：只退役旧 pending/approved（expired + 事件）和结果未知的旧 executing（failed + manual_check），不改现代快照、不补造历史验证。之后迁移到 011、清理已删除配置键、先构建前端再构建 Go。启动检查只读，遇到未退役的旧活跃审批拒绝启动，不代替维护命令。详细流程与回退见[执行安全升级说明](execution-trust-upgrade.md)。
 
-已运行核心模块单元测试：
+CI 从独立空 MySQL 执行全部 001–011，使用显式 `TEST_MYSQL_DSN` 运行 `go test -count=1 -race ./...`，另用两个新库显式运行 empty/legacy 升级测试，避免其模式门控被跳过；事务故障注入通过条件 trigger + SIGNAL，应用测试账号需 TRIGGER，binlog trust 仅在可丢弃 CI 实例由 root 设置。保留 gofmt/vet/build 和前端 typecheck/build/交互门禁。
 
-```text
-go test ./internal/ingest ./internal/incident ./internal/approval \
-  ./internal/diagnose ./internal/tools ./internal/conversation ./internal/api
-```
-
-结果：全部通过。
+浏览器交互测试使用拦截 API，不是 live-backend 全链路验收。历史单测通过记录不能证明本轮执行安全的验收已完成；[原设计](execution-trust-design.md)的 T1–T17、迁移与真实故障实验仍需各自执行并记录，不从调度默认值推导实际 resolved 延迟。

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+
+	incidentrule "oncall-agent/internal/incident"
 )
 
 // agent_run_step 逐步审计，以及 CompleteRun ——
@@ -36,25 +39,11 @@ type RunCompletion struct {
 	Steps      []AgentRunStep
 	Events     []IncidentEvent
 	Problems   []ProblemMutation
-}
-
-// AppendRunStep 落一条流水线审计步。input/output 应在调用方截断，
-// 这里只兜底校验 run 关联和序号。
-func (db *DB) AppendRunStep(ctx context.Context, step AgentRunStep) error {
-	if step.RunID == 0 || step.Name == "" || step.Kind == "" {
-		return errors.New("store: run step run_id, kind and name are required")
-	}
-	if step.StartedAt.IsZero() {
-		return errors.New("store: run step start time is required")
-	}
-	if err := db.WithContext(ctx).Create(&step).Error; err != nil {
-		return fmt.Errorf("store: append run step: %w", err)
-	}
-	return nil
+	Approval   *Approval // Published in the same transaction; ID is filled on success.
 }
 
 // AppendRunStepRecord 在同一短事务中写入 step、事件和有限问题变更。
-// 任一写入失败都会回滚整批，旧 AppendRunStep 保持单步兼容。
+// 任一写入失败都会回滚整批；流水线只使用这一条审计写入路径。
 func (db *DB) AppendRunStepRecord(ctx context.Context, record RunStepRecord) error {
 	step := record.Step
 	if step.RunID == 0 || step.Name == "" || step.Kind == "" {
@@ -81,13 +70,8 @@ func (db *DB) AppendRunStepRecord(ctx context.Context, record RunStepRecord) err
 	})
 }
 
-// AppendRunStepBatch 是 AppendRunStepRecord 的语义同义入口，便于调用方迁移。
-func (db *DB) AppendRunStepBatch(ctx context.Context, record RunStepRecord) error {
-	return db.AppendRunStepRecord(ctx, record)
-}
-
 // CompleteRun 原子更新 run 终态，并写入最后一批 Step/Event/Problem。
-// 事务锁住 run 后执行 CAS；任一审计记录失败都会回滚终态更新。
+// 事务先锁 Incident 再锁 Run；READ COMMITTED 防止锁前身份查询固定旧成员快照。
 func (db *DB) CompleteRun(ctx context.Context, completion RunCompletion) error {
 	if completion.RunID == 0 {
 		return errors.New("store: run completion run_id is required")
@@ -102,8 +86,16 @@ func (db *DB) CompleteRun(ctx context.Context, completion RunCompletion) error {
 		return errors.New("store: run completion plan must be valid JSON")
 	}
 	completion.FinishedAt = completion.FinishedAt.UTC()
+	var published Approval
 	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var run AgentRun
+		if err := tx.WithContext(ctx).First(&run, completion.RunID).Error; err != nil {
+			return err
+		}
+		parent, err := lockIncident(ctx, tx, run.IncidentID)
+		if err != nil {
+			return err
+		}
 		query := tx.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).First(&run, completion.RunID)
 		if errors.Is(query.Error, gorm.ErrRecordNotFound) {
 			return ErrAgentRunNotFound
@@ -188,10 +180,34 @@ func (db *DB) CompleteRun(ctx context.Context, completion RunCompletion) error {
 				return err
 			}
 		}
+		if completion.Approval != nil {
+			draft := *completion.Approval
+			if completion.Status != "succeeded" || parent.Status != incidentrule.StatusFiring || draft.IncidentID != run.IncidentID || draft.RunID != run.ID {
+				return errors.New("store: approval cannot be published for this run")
+			}
+			snapshot, err := incidentrule.ParseExecutionContext(draft.ExecutionContext)
+			if err != nil {
+				return err
+			}
+			members, err := listIncidentExecutionMembers(ctx, tx, parent.ID)
+			if err != nil {
+				return err
+			}
+			if err := snapshot.ValidateMembers(members, true); err != nil {
+				return err
+			}
+			published, err = insertApproval(ctx, tx, draft)
+			if err != nil {
+				return err
+			}
+		}
 		return nil
-	})
+	}, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return fmt.Errorf("store: complete run: %w", err)
+	}
+	if completion.Approval != nil {
+		*completion.Approval = published
 	}
 	return nil
 }

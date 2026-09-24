@@ -127,6 +127,11 @@ func (h *ControlRoomAPI) controlRoom(w http.ResponseWriter, r *http.Request, id 
 		writeError(w, http.StatusServiceUnavailable, "list incident approvals failed")
 		return
 	}
+	latestActions, err := h.db.ListIncidentApprovals(r.Context(), id, "", 1)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "list latest incident action failed")
+		return
+	}
 	events, err := h.db.ListLatestIncidentEvents(r.Context(), id, 20)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "list incident events failed")
@@ -153,6 +158,10 @@ func (h *ControlRoomAPI) controlRoom(w http.ResponseWriter, r *http.Request, id 
 		value := approvalDTO(approvals[0])
 		response.PendingApproval = &value
 	}
+	if len(latestActions) > 0 {
+		value := approvalDTO(latestActions[0])
+		response.LatestAction = &value
+	}
 	var steps []store.AgentRunStep
 	if len(runs) > 0 {
 		currentRun := runs[0]
@@ -169,11 +178,22 @@ func (h *ControlRoomAPI) controlRoom(w http.ResponseWriter, r *http.Request, id 
 			return
 		}
 	}
-	response.FlowNodes = controlRoomFlowNodes(incident, steps, approvals, events)
+	flowAction := response.LatestAction
+	if flowAction != nil && response.CurrentRun != nil && flowAction.RunID != response.CurrentRun.ID {
+		// The separate latest_action panel retains earlier history, not this Run's flow.
+		flowAction = nil
+	}
+	flowEvents := make([]store.IncidentEvent, 0, len(events))
+	for _, event := range events {
+		if response.CurrentRun == nil || (event.RunID != nil && *event.RunID == response.CurrentRun.ID) {
+			flowEvents = append(flowEvents, event)
+		}
+	}
+	response.FlowNodes = controlRoomFlowNodes(incident, steps, approvals, flowEvents, flowAction)
 	writeJSON(w, http.StatusOK, response)
 }
 
-func controlRoomFlowNodes(incident store.Incident, steps []store.AgentRunStep, approvals []store.Approval, events []store.IncidentEvent) []FlowNodeDTO {
+func controlRoomFlowNodes(incident store.Incident, steps []store.AgentRunStep, approvals []store.Approval, events []store.IncidentEvent, action *ApprovalDTO) []FlowNodeDTO {
 	stages := []struct{ key, label string }{{"alert", "alert"}, {"evidence", "evidence"}, {"reasoner", "llm"}, {"guard", "guard"}, {"policy", "policy"}, {"approval", "approval"}, {"execute", "execution"}, {"verify", "verify"}}
 	nodes := make([]FlowNodeDTO, 0, len(stages))
 	for _, stage := range stages {
@@ -199,6 +219,18 @@ func controlRoomFlowNodes(incident store.Incident, steps []store.AgentRunStep, a
 		}
 		if stage.key == "approval" && len(approvals) > 0 && approvals[0].Status == "pending" {
 			node.Status = "blocked"
+		}
+		// A completed audit step is not a recovery verdict, and the event window
+		// may no longer contain the terminal event. Use the persisted action/task.
+		if stage.key == "execute" || stage.key == "verify" {
+			node.Status = "not_started"
+			if action != nil {
+				if stage.key == "execute" {
+					node.Status = action.Status
+				} else {
+					node.Status = action.Verification.Status
+				}
+			}
 		}
 		nodes = append(nodes, node)
 	}

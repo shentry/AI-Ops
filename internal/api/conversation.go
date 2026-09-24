@@ -179,11 +179,7 @@ func (h *ConversationAPI) rediagnose(w http.ResponseWriter, r *http.Request, inc
 	}
 	run, err := h.actions.Rediagnose(r.Context(), incidentID, actor)
 	if err != nil {
-		if errors.Is(err, store.ErrIncidentNotFound) {
-			writeError(w, http.StatusNotFound, "incident not found")
-			return
-		}
-		writeError(w, http.StatusServiceUnavailable, "queue rediagnosis failed")
+		writeRunAdmissionError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"run": runDTO(run)})

@@ -22,7 +22,7 @@ type incidentStore interface {
 	ListIncidents(ctx context.Context, status string) ([]store.Incident, error)
 	GetIncident(ctx context.Context, id uint64) (store.Incident, error)
 	ListIncidentMembers(ctx context.Context, incidentID uint64) ([]store.IncidentMember, error)
-	CreateAgentRun(ctx context.Context, run store.AgentRun) (store.AgentRun, error)
+	RequestRun(ctx context.Context, request store.RunRequest) (store.AgentRun, bool, error)
 }
 
 // IncidentAPI 暴露 D05 的三个接口：列表、详情（含成员）、手动重诊。
@@ -111,10 +111,9 @@ func (h *IncidentAPI) getIncident(w http.ResponseWriter, r *http.Request, id uin
 	writeJSON(w, http.StatusOK, map[string]any{"incident": found, "members": members})
 }
 
-// diagnoseIncident 是手动重诊兜底：severity 升级或 run 失败后由人触发。
-// 无论路由结果如何都落 pending —— 人显式要求诊断，skip 只约束自动分流；
-// 路由为 skip 时降为 light，用最小预算诊断而不是花 full 的预算。
-// retry_of 为空：它是新的一次诊断，不是某个失败 run 的自动重试（D12 才用 retry_of）。
+// diagnoseIncident uses the same atomic admission rules as Web rediagnosis.
+// A manual request overrides skip with light mode but cannot bypass an active
+// processing cycle, incident status or cooldown. It starts a new retry chain.
 func (h *IncidentAPI) diagnoseIncident(w http.ResponseWriter, r *http.Request, id uint64) {
 	found, err := h.db.GetIncident(r.Context(), id)
 	if err != nil {
@@ -129,17 +128,46 @@ func (h *IncidentAPI) diagnoseIncident(w http.ResponseWriter, r *http.Request, i
 	if mode == incident.ModeSkip {
 		mode = incident.ModeLight
 	}
-	run, err := h.db.CreateAgentRun(r.Context(), store.AgentRun{
-		IncidentID: id,
-		Mode:       mode,
-		Status:     "pending",
-		StartedAt:  time.Now().UTC(),
+	run, _, err := h.db.RequestRun(r.Context(), store.RunRequest{
+		IncidentID:  id,
+		Mode:        mode,
+		Trigger:     store.RunTriggerManual,
+		Reason:      "manual diagnosis requested via API",
+		RequestedAt: time.Now().UTC(),
 	})
 	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, "create agent run failed")
+		writeRunAdmissionError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"run": run})
+}
+
+// writeRunAdmissionError is shared by both manual diagnosis routes. Refusals
+// remain structured; storage errors never expose database details to clients.
+func writeRunAdmissionError(w http.ResponseWriter, err error) {
+	if errors.Is(err, store.ErrIncidentNotFound) {
+		writeError(w, http.StatusNotFound, "incident not found")
+		return
+	}
+	var admission *store.RunAdmissionError
+	if errors.As(err, &admission) {
+		status := http.StatusConflict
+		body := map[string]any{"error": admission.Code, "code": admission.Code}
+		if admission.RunID != 0 {
+			body["run_id"] = admission.RunID
+		}
+		if admission.ApprovalID != 0 {
+			body["approval_id"] = admission.ApprovalID
+		}
+		if admission.Code == "cooldown" {
+			status = http.StatusTooManyRequests
+			w.Header().Set("Retry-After", strconv.Itoa(admission.RetryAfterSeconds))
+			body["retry_after_seconds"] = admission.RetryAfterSeconds
+		}
+		writeJSON(w, status, body)
+		return
+	}
+	writeError(w, http.StatusServiceUnavailable, "queue rediagnosis failed")
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

@@ -10,7 +10,7 @@
 八站路线，按依赖顺序排的 —— 后一站会用到前一站的概念，别跳。
 
 每站给三样东西：
-- **读什么** —— 精确到 `file:line`，别通读整个文件
+- **读什么** —— 优先按文件与函数定位；未变动部分保留行号参考，行号漂移时以当前源码为准
 - **看什么** —— 这段代码在解决什么问题、为什么这么写
 - **可迁移的经验** —— 换个项目还能用的那部分
 
@@ -44,7 +44,7 @@ api/alertmanager.go (落 raw_event 持久化)
   │ (内存 channel 唤醒)
   ▼
 ingest.Worker (解析 / 指纹 / 去重 / 归并)
-  │ (促发 incident，agent_run 入队)
+  │ (促发 incident，事务内共用 RequestRun 准入)
   ▼
 diagnose.Worker (领取任务 Claim)
   │ (证据采集 Builder / Collector)
@@ -55,17 +55,22 @@ llm.Reasoner (ReAct 推理循环，限 L1 只读工具)
 diagnose.Guard (确定性领域规则改写)
   │ (评估风险等级)
   ▼
-approval.Policy (L2 护栏检查 & 限频)
-  │ (需审批 / 自动放行)
+approval.Policy (限定故障/目标范围，构造 ExecutionContext & PlanHash)
+  │ (Service.Prepare 只准备审批草稿)
   ▼
-approval.Executor (重算 PlanHash 校验并执行 L2/L3 动作)
-  │ (执行后复查)
+store.CompleteRun (诊断终态 + 审批快照 + 事件同事务发布)
+  │ (人工裁决 / 系统批准)
   ▼
-diagnose.Verify (延时复查三态判定)
-  │
-  ├── Passed       → 提交有效经验到 Memory
-  ├── Inconclusive → 留痕并升级人工核查
-  └── Failed       → 降级拉黑记忆 / 触发重诊 / 升级人工
+approval.Executor (锁内复验、执行；不等待验证)
+  │ (FinishExecution: 结果 + history + 事件；真实成功创建 verify_task)
+  ▼
+diagnose.VerificationWorker (领取到期任务，Verifier 单次健康检查)
+  │ (FinalizeVerification 同事务提交结论与后续变化)
+  ├── passed       → 满足门槛才写 Memory；不直接 resolve Incident
+  ├── inconclusive → 持久人工核查，不降级记忆/自动重诊
+  └── failed       → 必要记忆降级 + RequestRun 重诊 / 持久人工升级
+
+演练路径：FinishExecution → simulated；无外部动作、verify_task 或成功记忆。
 ```
 
 七个词记住就行：**摄入 → 归并 → 诊断 → 闸门 → 审批 → 执行 → 验证**。
@@ -94,22 +99,20 @@ diagnose.Verify (延时复查三态判定)
 
 | 文件 | 行号 | 内容 |
 |---|---|---|
-| `cmd/server/main.go` | 41-87 | `run()` 开头 + 统一清理路径 |
-| `cmd/server/main.go` | 89-120 | 工具注册 + collector 装配 |
-| `cmd/server/main.go` | 206-238 | LLM 缺失时的降级装配 |
-| `internal/config/config.go` | 210-238 | `Load()` |
-| `internal/config/config.go` | 315-344 | `expandEnvironment` |
-| `internal/config/config.go` | 346-349 | `validate` 的那段注释 |
+| `cmd/server/main.go` | `run` | 启动检查、统一清理、工具/collector/六类 worker 装配与单 listener |
+| `internal/config/config.go` | `Load` / `expandEnvironment` | YAML AST 环境展开 + KnownFields 严格解码 |
+| `internal/config/config.go` | `defaultConfig` / `validate` | loopback 默认值、独立验证时长与 fail-fast 校验 |
 
 ## 看什么
 
 **1. 唯一组装根。** 所有依赖在 `run()` 里组装，没有全局变量、没有 `init()` 魔法、没有 DI 容器。整个进程的依赖关系读一个函数就全知道了。
 
-**2. 单一清理路径。** `main.go:66-87`：
+**2. 单一清理路径。** `main.go:run`（节选）：
 
 ```go
 var expiryWorker *approval.ExpiryWorker
 var executor *approval.Executor
+var verificationWorker *diagnose.VerificationWorker
 var diagnoseWorker *diagnose.Worker
 var conversationWorker *conversation.Worker
 // Every worker is started only after its dependency has been assembled. A
@@ -118,6 +121,7 @@ defer func() {
     stop()
     if conversationWorker != nil { conversationWorker.Wait() }
     if diagnoseWorker != nil     { diagnoseWorker.Wait() }
+    if verificationWorker != nil { verificationWorker.Wait() }
     ...
 }()
 ```
@@ -140,17 +144,21 @@ Docker socket 没有 → 只跳过 Docker 相关的证据和工具，**其余全
 
 > 每一个「依赖不可用」都要明确回答三个问题：哪些能力关掉、哪些照常、已经在队列里的存量数据怎么办。第三问最容易漏。
 
-**4. 配置校验的理由。** `config.go:346-349`：
+**4. 配置校验的理由。** `config.go:validate`：
 
 ```go
 // validate 是启动前的 fail-fast 关口。
 // 数值边界一律在这里挡住：0 或负数会在运行时变成"立即超时"、"审批立即过期"、
-// "跳过 Verify"这类静默失效行为 —— 那时候没人看得出是配置写错了。
+// "验证窗口失效"这类静默失效行为 —— 那时候没人看得出是配置写错了。
 ```
 
 这是配置校验的正确心智：不是「防止程序崩溃」，是**防止程序静默地做错事**。
 
-**5. 环境变量展开走 YAML AST。** `config.go:315-344` 遍历 `yaml.Node`，只对 `!!str` 标量做 `${ENV}` 替换 —— 注释、数字、布尔值都不碰，缺变量在加载期就失败。对比常见的「先字符串替换再 parse」，后者会把注释里的 `${...}` 也换掉。
+**5. 环境变量展开走 YAML AST。** `expandEnvironment` 只对 `!!str` 标量做 `${ENV}` 替换；再编码并用 `KnownFields(true)` 解码到默认 Config。未知/已删除键明确报错，不保留静默兼容；只接受一个 YAML 文档。
+
+独立验证默认 interval/window/timeout=`10/120/5` 秒，要求 `0 < timeout < interval < window` 且 timeout < 30 秒；独立于 evidence 超时。这是调度参数，不是实测恢复时间。
+
+**6. 监听是部署安全边界。** `server.listen_addr` 默认 `127.0.0.1`；Compose 联调显式覆盖 `0.0.0.0:18080`，让 Alertmanager 从容器访问宿主机。Webhook、控制台、匿名写接口、SSE、飞书回调和 `/metrics` 共用一个 listener，必须限制整个 listener 到可信网络。`web.base_url` 不是访问控制，匿名控制台没有个人身份保证；Sub2API 示例的 `8080` 是另一服务。构建也有顺序：先 `web` 的 `npm run build`，再编译 Go embed，不能把 `.gitkeep` 当控制台产物。
 
 ## 可迁移的经验
 
@@ -162,7 +170,7 @@ Docker socket 没有 → 只跳过 Docker 相关的证据和工具，**其余全
 ## 自测
 
 1. LLM 没配置时，用户在 Web 上提一个问题，会发生什么？
-2. 为什么 `defer` 里的 `Wait()` 顺序是 `conversation` → `diagnose` → `executor` → `expiry` → `ingest`？
+2. 为什么统一 `stop()` 后还要等待 conversation、diagnose、verification、executor、expiry、ingest？取消中的只读验证会留下什么持久状态？
 
 ---
 
@@ -176,7 +184,8 @@ Docker socket 没有 → 只跳过 Docker 相关的证据和工具，**其余全
 | `internal/ingest/worker.go` | 24-33 | 收窄接口 |
 | `internal/ingest/worker.go` | 80-129 | `Notify` / `consume` / `drain` |
 | `internal/ingest/worker.go` | 131-139, 307-317 | 失败分类 + `reject` |
-| `internal/store/agentrun.go` | 228-307 | `NextPendingAgentRun` + `ClaimAgentRun` |
+| `internal/store/agentrun.go` | `NextPendingAgentRun` / `ClaimAgentRun` | 诊断任务领取 |
+| `internal/store/runrequest.go` | `RequestRun` / `requestRun` | 告警、人工、自动重诊共用事务准入 |
 
 ## 看什么
 
@@ -248,6 +257,8 @@ promoted := make([]uint64, 0)
 
 日志和 metrics 都在事务外、提交后才发（`worker.go:287-303`）。**副作用不能先于事务提交。**
 
+**6. 准入与领取不是同一关口。** `store/runrequest.go` 先锁 Incident，要求 firing，再检查活跃 Run、审批、验证任务。人工请求按最近 `run.queued` 做 60 秒冷却；自动请求验证父 Run 与最多两次 `retry_of` 预算。告警事务和验证终态事务复用同一个内部准入函数，不先查后插、不嵌套事务。HTTP 人工冲突返回 409，冷却返回 429 与 Retry-After。
+
 ## 可迁移的经验
 
 - **持久化为准**：落库 → 唤醒 → 返回；内存 channel 不是真相。
@@ -271,7 +282,9 @@ promoted := make([]uint64, 0)
 |---|---|---|
 | `internal/ingest/fingerprint.go` | 全部 | 三层身份 |
 | `internal/ingest/correlate.go` | 52-70 | `GroupKey` 的兜底 |
-| `internal/ingest/worker.go` | 154-164 | 指纹退化的防护 |
+| `internal/ingest/worker.go` | 指纹校验段 | 指纹退化的防护 |
+| `internal/incident/merge.go` | 纯规则 | 归并/生命周期规则，store 在锁内调用 |
+| `internal/incident/execution.go` | `FaultFingerprint` | 故障记忆键的唯一实现，区别于告警指纹和 PlanHash |
 
 ## 看什么
 
@@ -512,11 +525,11 @@ func (m *usageModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatM
 | 文件 | 行号 | 内容 |
 |---|---|---|
 | `internal/diagnose/guard.go` | 全部 | 规则表 |
-| `internal/approval/policy.go` | 94-130 | `Decide` |
-| `internal/approval/policy.go` | 141-184 | `l2Guardrails` ★ |
-| `internal/approval/policy.go` | 206-242 | `CanonicalArgs` / `PlanHash` / `normalizeJSON` |
-| `internal/approval/service.go` | 64-81 | `ValidateExecution` |
-| `internal/diagnose/targets.go` | 全部 | 可信 target 来源 |
+| `internal/approval/policy.go` | `Decide` / `l2Guardrails` | 共同前置条件与自动执行护栏 |
+| `internal/incident/execution.go` | `ExecutionContext` / `PlanHash` / `CanonicalJSON` | 不可变执行契约与内容哈希 |
+| `internal/approval/service.go` | `Prepare` / `Decide` | 准备草稿、委托锁内裁决 |
+| `internal/store/approval.go` / `execution.go` | `DecideApproval` / `ClaimApprovalExecution` | 锁内复验与状态/事件原子提交 |
+| `internal/store/incident.go` | `ExecutionMembersFromAlerts` | 从当前告警提取执行成员事实 |
 
 ## 看什么
 
@@ -534,27 +547,11 @@ type GuardRule struct {
 
 规则本身也值得看，`guard.go:64-90`：根因是**配置错误 / 镜像不存在 / 凭据问题**时，禁止一切重启类动作 —— 因为重启解决不了这类问题，只会抹掉现场。**这是领域知识写进代码**，不是通用逻辑。
 
-**2. 护栏返回名字，不返回 bool。** `policy.go:141-184`：
+**2. 先检查人工/自动共同边界，再决定是否自动。** `Policy.Decide` 先确认注册工具与等级，调用 `incident.FiringFingerprints`、`ExecutionContext.ValidateBinding` 和 `incident.PlanHash`。当前只接受白名单 Sub2API 单容器 restart，firing 成员必须都是该目标的 `Sub2APIDown`。不支持的动作、Slow/依赖/混合故障直接 denied，不能靠人工批准越过范围限制。
 
-```go
-// l2Guardrails 逐条检查设计要求的 L2 护栏，返回第一条不满足的护栏名；
-// 全部满足返回空串。顺序按"越便宜越先查"排列，限频查库放最后。
-func (p *Policy) l2Guardrails(...) string {
-    if !p.cfg.AutoExecuteL2 { return "auto_execute_l2 disabled" }
-    if p.cfg.DryRun         { return "dry_run enabled" }
-    ...
-    if !p.allowed[targetName] {
-        return fmt.Sprintf("target %q is not in the auto-execute allowlist", targetName)
-    }
-```
+通过共同条件后，`l2Guardrails` 才检查自动开关、dry-run 与 tool+target 限频。它返回原因字符串而不是 bool，降级原因直接进入审批 reason、事件和通知。快照 Hash 随故障成员和配置变化，不能再拿它代替目标限频键。
 
-返回**字符串而不是 bool**，于是「为什么降级成人工审批」这句话可以直接进审批单的 reason、进事件、进通知。用户看到的是：
-`L2 guardrail not satisfied (target "x" is not in the auto-execute allowlist), degraded to approval`
-而不是冷冰冰的 `permission denied`。
-
-顺序「越便宜越先查」也是有意的：配置开关 → 字符串检查 → map 查找 → **查库放最后**。
-
-**3. Fail closed 的三处写法。** 同一个文件里三种形态：
+**3. Fail closed 的三处写法。** Policy 与执行契约分别守住自动许可和共同边界：
 
 ```go
 // 1. 没有限频数据源 → 降级审批，不是"没数据就放行"
@@ -565,66 +562,33 @@ if p.counter == nil || p.cfg.RateWindow <= 0 || p.cfg.MaxPerWindow < 1 {
 if err != nil {
     return "rate limit check failed: " + err.Error()
 }
-// 3. 空白名单 = 没有任何目标可自动动作（policy.go:44-46 注释）
+// 3. 空白名单 = 没有任何可批准的变更目标（ExecutionContext.ValidateBinding）
 ```
 
 **「不知道」一律等于「不允许」。** 这是安全护栏和普通业务逻辑最大的区别。
 
-**4. 影响范围的判定。** `policy.go:134-137, 154-159`：
+**4. 用精确契约限制影响范围。** `ExecutionContext.Target` 只接受 `docker_restart`、`target_kind=container` 且名称等于快照的受控目标；`ValidateMembers` 拒绝未批准的新 firing 成员或不支持的故障。发布审批、领取执行与验证终结时都要检查范围，不能只在模型输出时查一次。
 
-```go
-var broadTargetKinds = map[string]bool{
-    "cluster": true, "host": true, "node": true, "namespace": true,
-    "database": true, "db": true, "all": true, "group": true, "zone": true, "region": true,
-}
-...
-if strings.ContainsAny(targetName, "*?,; \t") || strings.EqualFold(targetName, "all") {
-    return "target is not a single concrete object"
-}
+**5. 内容指纹绑定完整执行契约。** 唯一算法位于 `internal/incident/execution.go`：
+
+```text
+PlanHash = SHA256(canonicalJSON(tool_name, args, execution_context))
 ```
 
-自动执行只允许作用于**单个具体对象**。通配符、分隔符、宽范围 kind 一律降级。「爆炸半径」是可以用代码判定的。
+`CanonicalJSON` 消除 JSON 键序/空白差异，避免 MySQL JSON 重排后失配。`ExecutionContext` 固定 Registry 安全等级、明确的 dry-run 布尔值，以及服务端生成的目标/URL/成员/验证时长；缺字段不能默认成真实执行许可。
 
-**5. 内容指纹的双向校验。** `policy.go:220-242`：
+`Service.Prepare` 只准备草稿，`CompleteRun` 才与诊断结论一起发布。Web/飞书都展示 target、scope、safety_level、dry_run、reason、plan_hash、expires_at；批准/拒绝携带预期 Hash，`DecideApproval` 持锁比较内容、Hash、TTL 和状态。执行领取重新检查当前白名单/工具等级/目标配置/安全开关与故障范围。
 
-```go
-// normalizeJSON 把 JSON 归一成规范形态：Unmarshal → Marshal 重编码。
-// MySQL JSON 列会重排键序和空白，只去空格治不了键序，必须全量重编码；
-// Go 的 map 序列化按键排序，两侧走同一归一即可稳定比对。
-```
+**批准的内容和执行的内容必须是同一份。** 演练快照永远不能升级为真实执行；全局改为 dry-run 不会把旧真实审批偷偷变成演练；配置漂移也不能把旧验证任务转向新 URL。Hash 仅绑定内容，不是个人身份认证或数据库管理员不可伪造的签名。
 
-这段注释解释了一个**真实会踩的坑**：你算 hash 时的 JSON 和从 MySQL JSON 列读回来的 JSON，字节不一样。解法是两侧都走同一个归一化函数。
-
-然后执行前重算（`executor.go:127-130`）：
-
-```go
-if PlanHash(approval.ToolName, json.RawMessage(approval.ArgsJSON)) != approval.PlanHash {
-    e.finishWithError(ctx, approval, nil, "plan hash mismatch, refusing to execute")
-    return
-}
-```
-
-**批准的内容和执行的内容必须是同一份。** 中间任何环节改了字段，这里失配。
-
-**6. 可信来源白名单。** `targets.go:15-23`：
-
-```go
-var targetLabelKeys = []string{
-    "container", "container_name", "daemonset", "deployment", "instance",
-    "job", "node", "pod", "service", "statefulset", "target",
-}
-// 键是白名单而不是"全部标签"：alertname/severity/team 这类标签不是运行对象，
-// 拿它们做 target 会让护栏形同虚设。
-```
-
-「LLM 说的目标必须在证据里出现过」这条规则，实现时的关键是**哪些字段算「运行对象」**。用全部标签等于没有护栏。
+**6. 可信事实按固定字段提取。** `store.ExecutionMembersFromAlerts` 从当前成员告警提取 fingerprint/name/status，以及 `container`、`service` 标签；`incident.FiringFingerprints` 要求 service=sub2api、container=配置目标、name=Sub2APIDown。不是模型说“可验证”就可验证，也不是任意标签碰巧含目标名就算来源可信。
 
 ## 可迁移的经验
 
 - **规则表模式**：规则 = 谓词 + 动作 + 名字 + 原因；不要散落的 if。
 - **护栏返回原因字符串，不返回 bool**：拒绝理由要能直接给人看。
-- **Fail closed 铁律**：不知道 = 不允许（counter 为 nil、查库出错、白名单为空，全部拒绝）。
-- **爆炸半径硬约束**：拦截通配符、多对象与宽范围实体。
+- **Fail closed 铁律**：限频未知不允许自动执行，目标/范围未知不允许发布变更审批。
+- **共同前置条件先于审批**：不支持的目标/故障不能通过人工裁决放行。
 - **指纹双向归一化**：两侧走同一归一化函数，执行前重算防篡改。
 - **可信提取需白名单**：明确定义哪些字段算数，不能放任所有标签充当目标。
 
@@ -641,105 +605,43 @@ var targetLabelKeys = []string{
 
 | 文件 | 行号 | 内容 |
 |---|---|---|
-| `internal/approval/executor.go` | 19-45 | 四个收窄接口 |
-| `internal/approval/executor.go` | 101-198 | `drain` + `executeOne` |
-| `internal/approval/executor.go` | 200-250 | `maybeCommitMemory` |
-| `internal/diagnose/verify.go` | 28-36, 83-103 | 三态结论 ★★ |
-| `internal/diagnose/verify.go` | 55-75, 182-188 | 脱离取消的 ctx |
-| `internal/diagnose/retry.go` | 46-100 | 重试预算 |
-| `internal/store/execution.go` | 165-222 | 中断恢复 |
+| `internal/approval/executor.go` | `RunOnce` / `execute` / `persist` | 只执行动作，提交失败只重试结果 |
+| `internal/store/execution.go` | `FinishExecution` / `RecoverExecutingApprovals` | 结果/验证任务原子落库与中断恢复 |
+| `internal/diagnose/verify.go` / `health.go` | `Check` / `readHTTPHealth` | 单次有界只读健康观测 |
+| `internal/diagnose/verification_worker.go` | `RunOnce` / `evaluateVerification` / `prepareEffects` | 持久调度、三态终结与后续变化准备 |
+| `internal/store/verification.go` | `FinalizeVerification` | 验证结论、审计、记忆与必要重诊同事务 |
+| `internal/store/runrequest.go` | `checkRetryBudget` | retry_of 链校验与最多两次自动预算 |
 
 ## 看什么
 
-**1. 三态而非二态 —— 全项目最好的一个决策。** `verify.go:28-36`：
+**1. 执行和恢复是两件事。** Executor 只领取、复验、执行和调用 `FinishExecution`；不持有 Verifier、记忆写入或重诊调度接口。真实成功提交 `executed + verify_task(pending)`，演练提交 `simulated` 且不调用工具、不创建验证任务。
 
-```go
-// VerifyResult 是一次恢复验证的结论。
-// Inconclusive 表示"没能判定"，区别于"判定为没恢复"：取消、读库失败、
-// 没有可复查的成员都属于这一类。不可判定不能触发重诊或记忆降级 ——
-// 那是拿运行环境的问题去惩罚诊断结论，只能升级人工核查。
-type VerifyResult struct {
-    Passed       bool
-    Inconclusive bool
-    Detail       string
-}
-```
+**2. 观测和结论也要区分。** `Verifier.Check` 只检查一次快照绑定的 `/health`，不 sleep、不写库、不调用 LLM。Collector 和 Verifier 共用 `health.go`，不跟随重定向：2xx 是 healthy，非 2xx 是 unhealthy，请求/读取失败是 unavailable。Worker 才按固定 deadline 与观测新鲜度准备终态：
 
-配合 `verify.go:88-92`：
+| 结论 | 条件 | 后续同事务变化 |
+|---|---|---|
+| `passed` | 截止前完成健康观测 | 满足门槛才写成功记忆，不直接 resolve Incident |
+| `failed` | 窗口结束时仍有新鲜的截止前不健康观测 | memory_hit 才降级记忆；必要自动重诊或人工升级 |
+| `inconclusive` | 没有新鲜结论、配置漂移或故障范围不再支持 | 持久人工核查，不改记忆、不自动重诊 |
 
-```go
-// 没有成员 = 没有任何可复查的对象。这不是"全部恢复"：空集合判成功
-// 会让任何动作都被标记为已修复，并把它送进记忆提交流程。
-if len(members) == 0 {
-    return VerifyResult{Inconclusive: true, Detail: "incident has no members to recheck"}
-}
-```
+一次健康结果不能代表吞吐、延迟或所有依赖恢复；新故障/空成员也不能套用“全部通过”。告警 resolved 是否到达不是健康判断的必要条件，Incident 状态仍由告警成员驱动。
 
-**空集合不是成功。** 这是所有「检查全部 X 是否满足 Y」的代码都会踩的坑 —— `for` 循环跑零次自然「全部通过」。想清楚**零元素时的语义**。
+**3. 不在执行队列里等待窗口。** `VerificationWorker.RunOnce` 每次只消费一个到期任务；未到终点就写 `next_check_at` 并释放领取。默认 10/120/5 秒来自审批快照，请求超时还受剩余窗口限制；迟到观测不用于通过。领取上限 30 秒，循环回收 stale running，提交比较 claimed_at，旧领取不能完成新任务。
 
-三态的下游行为在 `executor.go:165-188`：
+停机取消不是故障结论：Worker 传播取消/读库错误，保留可恢复领取，不脱离取消强行终结；恢复后仍使用原 deadline，不重新开始窗口。
 
-| 结论 | 记忆 | 重诊 | 动作 |
-|---|---|---|---|
-| `Passed` | 提交 | — | — |
-| `Inconclusive` | 不动 | 不触发 | 留痕等人工 |
-| `Failed` | 降级拉黑 | 触发 | — |
+**4. 记忆提交要求明确证据。** `prepareEffects` 只准备变化，不直接写入：非重诊、非 memory_hit、高置信且存在明确“Guard 未改写”的成功审计才可提交记忆。Guard 记录缺失也不能默认 allow。失败只有 memory_hit 才降级对应记忆；执行错误或不可判定不证明原记忆错误。记忆键统一使用 `incident.FaultFingerprint`。
 
-**2. 脱离取消的收尾。** `verify.go:70-74` 和 `182-185`：
+**5. 重诊预算和人工升级必须持久化。** `FinalizeVerification` 在同一事务内终结任务，再复用 `requestRun`，不会被自己的 running task 阻塞，也不把记忆、结论、重诊分开提交。自动预算按 `retry_of` 链计算最多两次，父 Run 必须属于同一 Incident 且已终结；断链/读库失败不能重置预算。超限先持久化人工问题与 escalation 事件，再通知，IM 失败不撤销这些事实。
 
-```go
-// 复查查询用脱离取消的 ctx：调用方 ctx 在这一刻被取消时，
-// 查询会返回 context canceled，那会被误记成"故障没恢复"。
-checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyDetachedTimeout)
-...
-// 审计写入同样脱离取消：关闭中的进程也要留下这条结论。
-writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyDetachedTimeout)
-```
+**6. 中断恢复的取舍。** `FinishExecution` 的相同结果重提交不追加第二份历史/事件/任务；当前进程只重试结果事务，不重调外部动作。若进程死在 executing、结果未持久化，`RecoverExecutingApprovals` 标 failed + critical manual_check，绝不盲目重放。若 executed 与任务已提交，则只恢复验证。
 
-`context.WithoutCancel` + 自己的超时。**关机不能把「没查成」变成「查到失败」，也不能把结论丢掉，但也不许无限期挂住关闭流程。** 三个约束同时满足。
-
-这是 Go 1.21+ 的 `WithoutCancel` 最好的用例之一，值得记住。
-
-**3. 记忆提交的门槛叠加。** `executor.go:200-226`，四道门全过才入库：
-
-```go
-if run.RetryOf != nil || run.Mode == "memory_hit" { return }   // 非重诊、非记忆命中
-if plan.Confidence != "high" { return }                        // 高置信
-// Guard 改写过的案例不降格入库：被规则改过的计划不是"被验证的原计划"。
-if strings.Contains(string(*step.OutputJSON), "overridden=true") { return }
-```
-
-第三条尤其好：**被规则修正过的计划，验证成功也不算「这个计划对」** —— 成功的是修正后的版本，不是原计划。
-
-**4. 重试预算按链长算，不按总数。** `retry.go:56-63`：
-
-```go
-// 预算按 retry_of 链长算，不按 incident 总 run 数：
-// 人工手动重诊（retry_of 为空）不吃自动重试预算。
-chainLen, err := s.chainLength(ctx, failedRunID)
-```
-
-**自动行为的预算和人工行为的预算要分开计。** 否则人点两下就把自动重试额度用光了。
-
-`chainLength` 还有个防御，`retry.go:83-100`：循环上限 `maxRetries + 2`，父 run 读不到就当链断了 —— **宁可少重试也不多重试**。
-
-**5. 升级失败必须报错。** `retry.go:102-104`：
-
-```go
-// escalate 升级人工：通知带失败原因和完整 run 链。升级失败也是返回 error，
-// 由调用方记日志 —— 升级丢了比 run 失败更危险，绝不能静默吞掉。
-```
-
-**6. 中断恢复的取舍。** `execution.go:165-222`：进程死在执行中途 → 状态标 `failed` + 开一个 `manual_check` **critical** 问题，**不自动重放外部动作**。
-
-因为「重启命令发出去了但没收到响应」和「没发出去」在数据库层面不可区分。**外部副作用不可幂等重放时，正确做法是升级人工，不是重试。**
-
-（注意：这里的具体实现有个问题，见 `design-review.md` A3 —— 但**决策本身**是对的，值得学。）
+「命令发出但未记账」和「未发出」不能仅靠数据库区分，所以不承诺外部动作 exactly-once。这里仍要求单实例，不把任务 CAS 宣传成多实例安全。
 
 ## 可迁移的经验
 
-- **三态原则**：成功 / 失败 / 无法判定。空集合属于第三种。
-- **`context.WithoutCancel` + 独立超时**：关机时也能正确收尾。
+- **分清事实**：动作完成、健康观测、验证结论与告警恢复分别表达。
+- **取消不伪造终态**：持久任务回收后继续，原 deadline 不变。
 - **多道门槛叠加**：被修正过的成功不算原方案成功。
 - **预算隔离**：自动预算和人工预算分开计。
 - **升级告警不静默**：升级链路的失败绝不能吞掉。
@@ -747,7 +649,7 @@ chainLen, err := s.chainLength(ctx, failedRunID)
 
 ## 自测
 
-1. incident 一个成员都没有时 Verify 返回什么？为什么不能返回 `Passed`？
+1. 验证任务已过 deadline 且没有新鲜观测时，为什么应 inconclusive，而不是 failed？
 2. 进程在「docker restart 已发出、结果未回」时被 kill，系统怎么处理？
 
 ---
@@ -758,18 +660,18 @@ chainLen, err := s.chainLength(ctx, failedRunID)
 
 | 文件 | 行号 | 内容 |
 |---|---|---|
-| `internal/diagnose/pipeline.go` | 26-101 | 七个收窄接口 ★ |
-| `internal/diagnose/pipeline.go` | 411-427 | `withStep` ★ |
-| `internal/diagnose/pipeline.go` | 110-283 | `Run` 通读 |
-| `internal/diagnose/pipeline.go` | 371-409 | seq 分段 + 工具 step |
-| `internal/store/runstep.go` | 91-127 | `CompleteRun` |
+| `internal/diagnose/pipeline.go` | 消费方接口 | 包括只准备草稿的 approvalCreator |
+| `internal/diagnose/pipeline.go` | `withStep` / `appendStartedEvent` | 开始/完成审计错误传播 |
+| `internal/diagnose/pipeline.go` | `Run` | 原子发布审批后再通知 |
+| `internal/diagnose/pipeline.go` | `recordToolSteps` | seq 分段、工具步骤审计与错误传播 |
+| `internal/store/runstep.go` | `CompleteRun` | 诊断终态、审批和相关事件同事务 |
 | `internal/api/stream.go` | 59-71, 163-205 | SSE |
 | `internal/notify/notifier.go` | 1-70 | provider 中立接口 |
 | `internal/eventlog/types.go` | 全部 | 事件常量 |
 
 ## 看什么
 
-**1. 收窄接口 —— 全项目最一致的做法。** `pipeline.go:26-101` 七个接口：
+**1. 收窄接口 —— 全项目最一致的做法。** `pipeline.go` 的消费方接口：
 
 ```go
 type reasoner interface {
@@ -782,37 +684,37 @@ type runStore interface {
 }
 ```
 
-关键点：**接口定义在消费方，且只包含消费方真正用到的方法**。`*store.DB` 有 71 个方法，Pipeline 的 `runStore` 只声明它用的 6 个。
+关键点：**接口定义在消费方，且只包含消费方真正用到的方法**。Pipeline 的 `runStore` 只声明自己所需的持久化与查询操作；审批依赖只准备草稿，不独立写库。
 
 但这把刀有两面：收窄接口用来**表达真实依赖**是对的，用来**给每个依赖机械地切一刀**就成了负担。判断标准是「少一个方法会不会编译失败」—— 应该会。这个项目此前有一批「可选接口 + 类型断言」（`if x, ok := db.(someFinder); ok`），漏配依赖时不报错、只在运行时静默降级，2026-08-24 已全部收敛为必需契约。
 
 三个好处：
-- 单测换假实现只需实现 6 个方法（看 `ingest/worker_test.go:26-71` 的 fake，手写结构体 + `sync.Mutex` + 切片记录调用，**不用任何 mock 框架**）
+- 单测 fake 只实现消费方契约（例如 `ingest/worker_test.go` 中手写结构体 + `sync.Mutex` + 切片记录调用，**不用任何 mock 框架**）
 - 依赖关系在类型上可见 —— 读接口就知道这个模块碰哪些数据
 - 换实现不用改消费方
 
 这是 Go 「accept interfaces, return structs」的正确用法，全项目 `ingest` / `diagnose` / `approval` / `memory` / `conversation` 都是这个模式。**这一条学会了，比学会这个项目其它所有东西加起来都值。**
 
-**2. `withStep` —— 短事务的模板。** `pipeline.go:411-427`：
+**2. `withStep` —— 短事务与审计推进关口。** `pipeline.go:withStep`（节选）：
 
 ```go
 // withStep executes the external stage outside SQL and commits one step plus
 // its completion/failure event and fixed problem mutations in one short tx.
 func (p *Pipeline) withStep(...) (string, error) {
     started := time.Now().UTC()
-    p.appendStartedEvent(ctx, incidentID, runID, kind, name, started)
-    output, err := fn()                          // ← 外部调用在事务外
-    finished := time.Now().UTC()
-    events := []store.IncidentEvent{{...}}
+    if err := p.appendStartedEvent(ctx, incidentID, runID, kind, name, started); err != nil {
+        return "", err                           // ← 开始事件失败，不执行阶段
+    }
+    output, err := fn()                           // ← 外部调用在事务外
     ...
-    p.appendStepRecord(ctx, store.RunStepRecord{Step: ..., Events: events, Problems: problems})
-    return output, err                           // ← step+event+problem 一个短事务
+    auditErr := p.appendStepRecord(ctx, store.RunStepRecord{Step: ..., Events: events, Problems: problems})
+    return output, errors.Join(err, auditErr)     // ← step+event+problem 一个短事务
 }
 ```
 
-**LLM 调用、HTTP 请求、Docker 命令绝不在事务里。** 事务只包住最后那几行写入。一个 8 步 ReAct 可能跑 2 分钟，你不能让一个 MySQL 事务开 2 分钟。
+**LLM 调用、HTTP 请求、Docker 命令绝不在事务里。** 事务只包写入；开始事件、普通步骤或工具步骤写入失败都要传播，停止发布可执行审批，不能只记日志继续推进。
 
-**3. seq 分段。** `pipeline.go:371-377`：
+**3. seq 分段。** `pipeline.go:toolStepSeqBase`：
 
 ```go
 // toolStepSeqBase 是 Reasoner 工具调用的 seq 段。主链占 1-6，verify 占 90，
@@ -824,24 +726,23 @@ const maxRecordedToolSteps = 60
 
 数量不定的子步骤要在固定序列里排序时，**分配号段**而不是用小数或子序号。而且上限和号段宽度**绑定**，越界不可能发生。
 
-**4. 截断要留痕。** `pipeline.go:384-387`：
+**4. 截断要留痕。** `pipeline.go:recordToolSteps`（节选）：
 
 ```go
 if i >= maxRecordedToolSteps {
-    p.appendStep(ctx, ..., "tool_calls_truncated",
+    return p.appendStep(ctx, ..., "tool_calls_truncated",
         fmt.Sprintf("total=%d", len(steps)),
         fmt.Sprintf("recorded=%d dropped=%d", maxRecordedToolSteps, len(steps)-maxRecordedToolSteps), nil)
-    return
 }
 ```
 
 **丢数据必须留下「我丢了多少」的记录。** 静默截断的审计比没有审计更危险 —— 你会以为你看到的是全部。同样的做法在 `tools.Truncate` 追加 `…[truncated]` 标记、`EvidenceItem.Truncated` 字段。
 
-**5. 终态与事件同事务。** `pipeline.go:276-281` + `runstep.go:91-127`：
+**5. 终态、审批与事件同事务。** `Pipeline.Run` + `store.CompleteRun`：
 
 ```go
-// 终态必须与 run.succeeded 同一短事务提交。
-if err := p.db.CompleteRun(ctx, store.RunCompletion{... Status: "succeeded", Events: [...]}); err != nil {
+// draft 只是 Prepare 的内存草稿，直到 CompleteRun 提交才发布。
+if err := p.db.CompleteRun(ctx, store.RunCompletion{... Status: "succeeded", Approval: draft, Events: [...]}); err != nil {
 ```
 
 `CompleteRun` 里还有两处防御：
@@ -856,7 +757,7 @@ if run.Status != "pending" && run.Status != "running" {                  // 终�
 }
 ```
 
-**审计记录一旦写成终态就不可改写。**
+**Run 终态不可覆写，审批不能先于诊断结论发布。** Store 锁 Incident/Run，检查当前 firing 与审批范围，任一审计或审批写入失败会回滚整个提交。
 
 **6. Provider 中立的通知边界。** `notify/notifier.go:20-58`：
 
@@ -877,7 +778,7 @@ type Notifier interface {
 `Webhook providers cannot return a message ID, so MessageID may be empty.`
 —— **接口要容纳能力弱的实现**，而不是假设所有 provider 一样强。
 
-配合 `pipeline.go:267-272`：通知失败**单独记录，不改变 run 终态**。「通知没发出去」和「诊断失败了」是两件事。
+`Pipeline.Run` 在 `CompleteRun` 提交后通知，通知失败**单独记录，不改变 run 终态**；VerificationWorker 同样只通知已提交的结论。「通知没发出去」和「业务失败了」是两件事，不保证 IM 必达。
 
 **7. 事件类型集中定义。** `eventlog/types.go` 三十多个常量，`metrics.go` 同样一个 const 块（注释：「一处列全，防止散落拼写漂移」）。字符串字面量散在各处 = 早晚打错一个字母且没人发现。
 
@@ -922,31 +823,28 @@ func (h *StreamAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {  // 标�
 | 2 | 落库 → 唤醒 → 返回 | `alertmanager.go:59-69` | 内存 channel 只是提示，不是真相 |
 | 3 | 失败分类 | `ingest/worker.go:131-139` | 重试有意义 vs 没意义，后者必须能出队 |
 | 4 | 行锁 + 条件更新领取 | `agentrun.go:256-262` | 抢不到不是 error |
-| 5 | 三态结论 | `verify.go:28-36` | 成功 / 失败 / **无法判定**；空集合属第三种 |
-| 6 | 护栏返回原因字符串 | `policy.go:141-184` | 拒绝理由要能直接给人看 |
-| 7 | Fail closed | `policy.go:173-179` | 不知道 = 不允许 |
-| 8 | 内容指纹双向校验 | `policy.go:220-242` | 两侧同一归一化函数，执行前重算 |
+| 5 | 三态结论 | `verification_worker.go:evaluateVerification` | 成功 / 失败 / **无法判定**；按 deadline 和新鲜度判断 |
+| 6 | 护栏返回原因字符串 | `policy.go:l2Guardrails` | 拒绝理由要能直接给人看 |
+| 7 | Fail closed | `policy.go:Decide` | 不知道 = 不允许 |
+| 8 | 内容指纹双向校验 | `incident/execution.go:PlanHash` | 绑定工具、参数和执行上下文；两侧归一化 |
 | 9 | 权限面 = 工具面 | `registry.go:110-120` | 不靠 prompt 约束，靠调不到 |
-| 10 | 外部调用在事务外 | `pipeline.go:411-427` | 事务只包住写入 |
-| 11 | 截断留痕 | `pipeline.go:384-387` | 静默截断比没审计更危险 |
-| 12 | `WithoutCancel` 收尾 | `verify.go:70-74` | 关机也要正确落结论 |
+| 10 | 外部调用在事务外 | `pipeline.go:withStep` | 事务只包住写入，关键审计错误要传播 |
+| 11 | 截断留痕 | `pipeline.go:recordToolSteps` | 静默截断比没审计更危险 |
+| 12 | 只读任务可恢复 | `verification_worker.go:RunOnce` | 取消不终结，过期领取回队，deadline 不延长 |
 
 ---
 
 # 反过来：这些地方别学
 
-详见 `docs/design-review.md`。读代码时如果觉得某处"怪怪的"，先来这里对一下：
+历史评审见 `docs/design-review.md`，其中旧实现问题不能直接当作当前代码结论。当前阅读时仍需注意：
 
 | 你会看到 | 别学，因为 |
 |---|---|
 | `api.Console` 无条件放行所有控制台读写 | 匿名身份掌握变更执行权（评审 B1）。注意这是**明确的设计选择**而非疏忽：原先那套 1200 行 OAuth/Session 从未接进路由，已于 2026-08-24 整体删除 |
-| `*store.DB` 上挂着 78 个方法（71 个直接在 `*DB` 上） | 上帝对象（B9）。2026-08-24 已按域拆成 13 个文件、单文件最大 439 行，但**方法仍全挂在同一个 `*DB` 上** —— 拆的是可读性，不是耦合。为什么不拆子包见 `internal/store/doc.go` |
-| `Verify` 只看告警是否 resolved | 判据与外部时序不匹配，几乎必然假失败（A2） |
-| `VerifyAfterExecution` 里的 `time.After` | 睡在执行队列主循环里（A3） |
-| `_ = p.db.AppendRunStepRecord(...)` | 审计声称可回放却是 best-effort（B10） |
-| `ingest` import `diagnose` | 依赖倒置，只为拿 `Sanitize`（B8） |
-| `CanonicalArgs` 只编 target 两个字段 | 动作空间被写死（B3） |
-| `helpers_test.go:43-48` 全部 `TEST_MYSQL_DSN` 门控 | 队列 CAS、事务回滚、恢复路径这些最该测的逻辑，默认 `go test ./...` 零覆盖（B9） |
+| `*store.DB` 是集中数据库边界 | 按域拆文件不等于缩小事务职责；共享事务不宜为了方法数量再拆多层转发，阅读调用边界见 `internal/store/doc.go` |
+| 当前只支持 Sub2APIDown 的受控 restart | 刻意收窄健康判据，不应把 `/health` 2xx 推广成 Slow/依赖故障已修复 |
+| `helpers_test.go:openIntegrationDB` 由 `TEST_MYSQL_DSN` 门控 | 普通 `go test ./...` 不代表 MySQL 集成测试已执行；CI 必须提供独立真库、全量迁移及触发器权限 |
+| 浏览器交互测试拦截 API | 可检查契约/交互，但不能代替真实后端、数据库、Docker、告警链路实验 |
 
 **这些也是好的学习材料** —— 对着评审看「为什么这是问题、怎么改」，比看对的代码收获更大。
 
@@ -965,20 +863,24 @@ func (h *StreamAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {  // 标�
  6. ingest/worker.go:154-170            重算 fingerprint / severity / alert_hash
  7. store/rawevent.go:114-147           ApplyRawEvent 单事务
  8. ingest/correlate.go:73-101          Assign → 归并或新建 incident
- 9. ingest/worker.go:238-278            promote → 按 severity 落 agent_run
-10. diagnose/worker.go:88-116           claim pending → running
-11. diagnose/pipeline.go:126-149        memory.Lookup
+ 9. ingest/worker.go + store/runrequest.go  promote → 统一准入 → 按 severity 落 agent_run
+10. diagnose/worker.go                 claim pending → running
+11. diagnose/pipeline.go:Run            memory.Lookup
 12. diagnose/builder.go:47-54           BuildForIncident → 7 个 collector
 13. diagnose/evidence.go:76-107         Render（脱敏 + 围栏）
 14. llm/reasoner.go:94-142              ReAct（最多 8 步，只有 L1 工具）
 15. diagnose/guard.go:44-95             确定性规则
-16. approval/policy.go:94-130           等级判定 + L2 护栏
-17. approval/service.go:37-49           落 pending 审批单
-18. api/approval.go / feishu/callback   人工决策
-19. approval/executor.go:124-198        重算 hash → Execute
-20. diagnose/verify.go:55-103           延时复查 → 三态
-21. executor.go:171-187                 记忆提交 / 降级 / 重诊 / 升级
+16. approval/policy.go:Decide           故障范围 + 执行快照 + Hash + L2 自动护栏
+17. approval/service.go:Prepare         草稿 → store.CompleteRun 原子发布结论/审批/事件
+18. api/approval.go / feishu/callback   人工提交 Hash → 锁内裁决
+19. approval/executor.go                复验领取 → Execute → FinishExecution（或 simulated）
+20. diagnose/verification_worker.go     消费持久 verify_task → Verifier 单次健康检查
+21. store/verification.go              结论 / 审计 / 记忆 / RequestRun 重诊同事务
 ```
 
 **每一步都问自己：这一步失败了会怎样？** 项目里绝大多数注释回答的正是这个问题。
-21 步都能答上来，这个项目你就读透了。
+21 步都能答上来，再检查“结果已执行但未记账”和“验证已落库但通知失败”两个边界。
+
+升级与验证操作见[执行安全升级说明](execution-trust-upgrade.md)：仅在停机、停止外部写入并备份后运行 `MYSQL_DSN=... go run ./cmd/retire-approvals -apply`。命令在 009 前/后都可退役旧 pending/approved（expired + 事件）与结果未知的旧 executing（failed + manual_check），不改现代快照；新服务需要全部 001–011 迁移。
+
+CI 保留 gofmt/vet/build/race 与前端 typecheck/build/交互测试；Go 构建前先生成前端产物。除了全量迁移后的业务测试库，还分别创建新库显式运行 empty/legacy 升级测试，避免默认模式门控跳过。独立 MySQL 故障注入用条件 trigger + SIGNAL，测试应用账号需 TRIGGER，binlog trust 只在可丢弃 CI 实例由 root 开启，不是生产配置。浏览器测试拦截 API，不能据此宣称 [T1–T17](execution-trust-design.md) 或真实故障验收全部完成。

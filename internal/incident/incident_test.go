@@ -65,16 +65,37 @@ func TestNewQueueRun(t *testing.T) {
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 
 	pending := NewQueueRun(42, ModeFull, now)
-	if pending.IncidentID != 42 || pending.Mode != ModeFull || pending.Status != "pending" || pending.FinishedAt != nil {
+	if pending.IncidentID != 42 || pending.Mode != ModeFull || pending.Status != "pending" || pending.Finished {
 		t.Fatalf("NewQueueRun(full) = %#v", pending)
 	}
-	if pending.RetryOf != nil {
-		t.Fatalf("NewQueueRun() RetryOf = %v, want nil", pending.RetryOf)
+	if !pending.StartedAt.Equal(now) {
+		t.Fatalf("NewQueueRun() StartedAt = %v, want %v", pending.StartedAt, now)
 	}
 
 	// skip 直接落 succeeded：留一行可统计，但不占诊断队列。
 	skipped := NewQueueRun(42, ModeSkip, now)
-	if skipped.Status != "succeeded" || skipped.FinishedAt == nil || !skipped.FinishedAt.Equal(now) {
+	if skipped.Status != "succeeded" || !skipped.Finished {
 		t.Fatalf("NewQueueRun(skip) = %#v", skipped)
+	}
+
+	// 入参带时区的时间要归一到 UTC，否则落库时间基准会漂。
+	shanghai := time.FixedZone("CST", 8*3600)
+	local := NewQueueRun(42, ModeFull, now.In(shanghai))
+	if local.StartedAt.Location() != time.UTC || !local.StartedAt.Equal(now) {
+		t.Fatalf("NewQueueRun() StartedAt = %v, want UTC %v", local.StartedAt, now)
+	}
+}
+
+func TestIsOpen(t *testing.T) {
+	for _, status := range []string{StatusCandidate, StatusFiring} {
+		if !IsOpen(status) {
+			t.Errorf("IsOpen(%q) = false, want true", status)
+		}
+	}
+	// acknowledged 是人工接管，resolved 是已关单：两者都不该被自动路径改写。
+	for _, status := range []string{StatusAcknowledged, StatusResolved, "", "unknown"} {
+		if IsOpen(status) {
+			t.Errorf("IsOpen(%q) = true, want false", status)
+		}
 	}
 }

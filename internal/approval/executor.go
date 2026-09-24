@@ -3,83 +3,64 @@ package approval
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
-	"oncall-agent/internal/memory"
+	"time"
+
+	"oncall-agent/internal/incident"
 	"oncall-agent/internal/metrics"
 	"oncall-agent/internal/store"
 	"oncall-agent/internal/tools"
-	"strings"
-	"time"
 )
 
-const executionResultMaxRunes = 4096
-
-// execStore 是执行器对存储层的收窄接口。
+// execStore owns locked revalidation and atomic execution/task/event/history writes.
 type execStore interface {
-	NextApprovedApproval(ctx context.Context, now time.Time) (store.Approval, bool, error)
-	ClaimApprovalExecution(ctx context.Context, id uint64, now time.Time) (bool, error)
-	FinishApprovalExecution(ctx context.Context, id uint64, status string, resultJSON []byte) error
-	RecoverExecutingApprovals(ctx context.Context, now time.Time) (int64, error)
-	InsertFaultCmdHistory(ctx context.Context, row store.FaultCmdHistory) error
-	GetIncident(ctx context.Context, id uint64) (store.Incident, error)
-	ListIncidentMembers(ctx context.Context, incidentID uint64) ([]store.IncidentMember, error)
-	GetAgentRun(ctx context.Context, id uint64) (store.AgentRun, error)
-	ListRunSteps(ctx context.Context, runID uint64) ([]store.AgentRunStep, error)
+	NextApprovedApproval(context.Context, time.Time) (store.Approval, bool, error)
+	ClaimApprovalExecution(context.Context, uint64, time.Time, incident.ExecutionBinding) (store.Approval, bool, error)
+	FinishExecution(context.Context, store.ExecutionCompletion) error
+	RecoverExecutingApprovals(context.Context, time.Time) (int64, error)
 }
 
-// verifier 是执行器对 Verify 的收窄接口。
-type verifier interface {
-	VerifyAfterExecution(ctx context.Context, runID, incidentID uint64, delay time.Duration) VerifyOutcome
-}
-
-// retryScheduler 是执行器对 D12 重诊调度的收窄接口。
-type retryScheduler interface {
-	ScheduleRetry(ctx context.Context, incidentID, failedRunID uint64, reason string) (bool, error)
-}
-
-// memoryWriter 是执行器对故障记忆的收窄接口（D13）。
-type memoryWriter interface {
-	Commit(ctx context.Context, entry store.FaultMemory) error
-	Demote(ctx context.Context, fingerprint string) error
-}
-
-// VerifyOutcome 与 diagnose.VerifyResult 同构，避免 approval → diagnose 依赖。
-// Inconclusive = 没能判定（取消、读库失败、无可复查对象）：既不算成功也不算失败，
-// 不触发记忆提交/降级和重诊，只记录并等人工核查。
-type VerifyOutcome struct {
-	Passed       bool
-	Inconclusive bool
-	Detail       string
-}
-
-// Executor 消费 approved 审批单：领取 → 校验 → 执行 → 回写 → 记忆 → 验证。
+// Executor claims approved mutations and persists their results. Recovery
+// verification is independent: this worker never waits for a health observation.
 type Executor struct {
-	db          execStore
-	registry    *tools.Registry
-	dryRun      bool
-	verifyDelay time.Duration
-	verify      verifier
-	retry       retryScheduler
-	memory      memoryWriter
-	logger      *log.Logger
-	done        chan struct{}
+	db       execStore
+	registry *tools.Registry
+	binding  incident.ExecutionBinding
+	logger   *log.Logger
+	done     chan struct{}
 }
 
-func NewExecutor(db execStore, registry *tools.Registry, dryRun bool, verifyDelay time.Duration, v verifier, retry retryScheduler, memory memoryWriter, logger *log.Logger) *Executor {
+func NewExecutor(db execStore, registry *tools.Registry, binding incident.ExecutionBinding, logger *log.Logger) *Executor {
 	if logger == nil {
 		logger = log.Default()
 	}
-	return &Executor{db: db, registry: registry, dryRun: dryRun, verifyDelay: verifyDelay, verify: v, retry: retry, memory: memory, logger: logger, done: make(chan struct{})}
+	return &Executor{db: db, registry: registry, binding: binding, logger: logger, done: make(chan struct{})}
 }
 
-func (e *Executor) Start(ctx context.Context) {
-	if recovered, err := e.db.RecoverExecutingApprovals(ctx, time.Now().UTC()); err != nil {
-		e.logger.Printf("executor: recover executing approvals: %v", err)
-	} else if recovered > 0 {
-		e.logger.Printf("executor: recovered %d interrupted approvals", recovered)
+// Start is called once, before accepting requests. Interrupted external actions
+// are recovered conservatively by the store, never replayed. Wait also returns
+// after failed startup; the host must not start overlapping executor instances.
+func (e *Executor) Start(ctx context.Context) error {
+	if e.db == nil || e.registry == nil {
+		close(e.done)
+		return errors.New("executor: store and registry are required")
+	}
+	if _, _, err := e.db.NextApprovedApproval(ctx, time.Now().UTC()); err != nil {
+		close(e.done)
+		return fmt.Errorf("executor: preflight approved queue: %w", err)
+	}
+	recovered, err := e.db.RecoverExecutingApprovals(ctx, time.Now().UTC())
+	if err != nil {
+		close(e.done)
+		return fmt.Errorf("executor: recover interrupted executions: %w", err)
+	}
+	if recovered > 0 {
+		e.logger.Printf("executor: recovered %d interrupted approvals; manual check required", recovered)
 	}
 	go e.loop(ctx)
+	return nil
 }
 
 func (e *Executor) Wait() { <-e.done }
@@ -89,7 +70,9 @@ func (e *Executor) loop(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
-		e.drain(ctx)
+		if err := e.RunOnce(ctx); err != nil && ctx.Err() == nil {
+			e.logger.Printf("executor: %v", err)
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -98,218 +81,131 @@ func (e *Executor) loop(ctx context.Context) {
 	}
 }
 
-func (e *Executor) drain(ctx context.Context) {
+// RunOnce drains currently approved work without waiting for verification. It
+// may also be called by a host-owned polling loop, but not concurrently with Start
+// or another RunOnce. A persistence retry holds the result, not the action.
+func (e *Executor) RunOnce(ctx context.Context) error {
+	if e.db == nil || e.registry == nil {
+		return errors.New("executor: store and registry are required")
+	}
 	for {
-		approval, found, err := e.db.NextApprovedApproval(ctx, time.Now().UTC())
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		candidate, found, err := e.db.NextApprovedApproval(ctx, time.Now().UTC())
 		if err != nil {
-			e.logger.Printf("executor: poll approved: %v", err)
-			return
+			return fmt.Errorf("executor: poll approved: %w", err)
 		}
 		if !found {
-			return
+			return nil
 		}
-		claimed, err := e.db.ClaimApprovalExecution(ctx, approval.ID, time.Now().UTC())
+		// An absent or newly forbidden tool must invalidate the stored approval
+		// under the store's locks, not inherit a stale constructor safety level.
+		row, claimed, err := e.db.ClaimApprovalExecution(ctx, candidate.ID, time.Now().UTC(), e.currentBinding(candidate.ToolName))
 		if err != nil {
-			e.logger.Printf("executor: claim %d: %v", approval.ID, err)
-			return
+			return fmt.Errorf("executor: claim approval %d: %w", candidate.ID, err)
 		}
 		if !claimed {
 			continue
 		}
-		e.executeOne(ctx, approval)
+		// TTL belongs to the committed claim. Rechecking a later clock here can
+		// abandon executing work solely because the claim response crossed expiry.
+		if row.ID == 0 || row.ID != candidate.ID || row.IncidentID == 0 || row.RunID == 0 || row.Status != "executing" {
+			return fmt.Errorf("executor: invalid claimed approval %d", candidate.ID)
+		}
+		if err := e.execute(ctx, row); err != nil {
+			return fmt.Errorf("executor: approval %d: %w", row.ID, err)
+		}
 	}
 }
 
-// executeOne 执行一张审批单的全部后处理。任何失败都写回 failed —— 不静默。
-func (e *Executor) executeOne(ctx context.Context, approval store.Approval) {
-	// 执行前最终校验：plan_hash 必须等于 tool+args 的重算值，
-	// 审批单内容在批准后被篡改在这里失配（GC-13）。
-	if PlanHash(approval.ToolName, json.RawMessage(approval.ArgsJSON)) != approval.PlanHash {
-		e.finishWithError(ctx, approval, nil, "plan hash mismatch, refusing to execute")
-		return
+func (e *Executor) currentBinding(tool string) incident.ExecutionBinding {
+	binding := e.binding
+	// Get returns a zero ToolSpec for an unregistered tool, clearing the level.
+	spec, _ := e.registry.Get(tool)
+	binding.SafetyLevel = string(spec.Level)
+	return binding
+}
+
+func (e *Executor) execute(ctx context.Context, row store.Approval) error {
+	// Use only the fresh claimed row. These checks fail closed even if a broken
+	// store hands us invalid content; current incident/member scope is checked
+	// atomically by ClaimApprovalExecution, not with a second unlocked read here.
+	snapshot, err := incident.ParseExecutionContext(row.ExecutionContext)
+	if err != nil {
+		return err
 	}
-	if _, ok := e.registry.Get(approval.ToolName); !ok {
-		// 审批单上的工具必须在册（GC-12），不论等级。
-		e.finishWithError(ctx, approval, nil, fmt.Sprintf("tool %q is not registered", approval.ToolName))
-		return
+	hash, err := incident.PlanHash(row.ToolName, row.ArgsJSON, row.ExecutionContext)
+	if err != nil || hash != row.PlanHash {
+		return errors.New("approved execution content does not match plan hash")
+	}
+	binding := e.currentBinding(row.ToolName)
+	if binding.SafetyLevel != string(tools.L2LowRisk) && binding.SafetyLevel != string(tools.L3Approval) {
+		return errors.New("approved mutation tool is unregistered or forbidden")
+	}
+	if err := snapshot.ValidateBinding(binding, true); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
-	var output string
-	var execErr error
-	if e.dryRun {
-		output = fmt.Sprintf(`{"dry_run":true,"tool":%q}`, approval.ToolName)
-		e.logger.Printf("executor: dry-run approval %d tool %s", approval.ID, approval.ToolName)
-	} else {
-		output, execErr = e.registry.Execute(ctx, approval.ToolName, json.RawMessage(approval.ArgsJSON))
+	status, output, message := "simulated", "", ""
+	if !snapshot.DryRun {
+		status = "executed"
+		output, err = e.registry.Execute(ctx, row.ToolName, json.RawMessage(row.ArgsJSON))
+		if err != nil {
+			status, message = "failed", err.Error()
+		}
 	}
-
-	// Registry.Execute normally enforces each tool's MaxOutput. Keep the
-	// approval result bounded as a second boundary before it reaches the store,
-	// including dry-run and custom registry implementations.
-	resultJSON, _ := json.Marshal(map[string]any{
-		"output":   tools.Truncate(output, executionResultMaxRunes),
-		"dry_run":  e.dryRun,
-		"tool":     approval.ToolName,
-		"executed": execErr == nil,
+	// At most 1280 runes of arbitrary text: even JSON's six-byte escaping,
+	// truncation markers and fixed fields remain below the store's 8 KiB cap.
+	// No timestamp goes in JSON: ambiguous commits must retry identical content.
+	result, _ := json.Marshal(struct {
+		Tool        string `json:"tool"`
+		Output      string `json:"output"`
+		Error       string `json:"error,omitempty"`
+		DryRun      bool   `json:"dry_run"`
+		Executed    bool   `json:"executed"`
+		ManualCheck bool   `json:"manual_check,omitempty"`
+	}{
+		Tool: row.ToolName, Output: tools.Truncate(output, 1024), Error: tools.Truncate(message, 256),
+		DryRun: snapshot.DryRun, Executed: status == "executed", ManualCheck: status == "failed",
 	})
-	if execErr != nil {
-		e.finishWithError(ctx, approval, resultJSON, execErr.Error())
+	if err := e.persist(ctx, store.ExecutionCompletion{ApprovalID: row.ID, Status: status, ResultJSON: result}); err != nil {
+		return err
+	}
+	switch status {
+	case "executed":
+		metrics.Inc(metrics.ApprovalExecuted)
+	case "failed":
 		metrics.Inc(metrics.ApprovalFailedExec)
-		return
 	}
-	// 独立验证（GC-15）。dry_run 没有真实变更，跳过验证。
-	if !e.dryRun && e.verify != nil {
-		result := e.verify.VerifyAfterExecution(ctx, approval.RunID, approval.IncidentID, e.verifyDelay)
-		e.logger.Printf("executor: verify approval %d: passed=%v inconclusive=%v %s",
-			approval.ID, result.Passed, result.Inconclusive, result.Detail)
-		switch {
-		case result.Inconclusive:
-			// 不可判定不进记忆、不重诊：动作已经执行，恢复情况未知，
-			// 只能留痕等人工核查（step 由 Verifier 落库）。
-			metrics.Inc(metrics.VerifyInconclusive)
-			e.logger.Printf("executor: approval %d executed but verification is inconclusive; manual check required", approval.ID)
-		case result.Passed:
-			metrics.Inc(metrics.VerifyPassed)
-			// D13：验证成功且够格的案例写入故障记忆。
-			e.maybeCommitMemory(ctx, approval)
-		default:
-			metrics.Inc(metrics.VerifyFailed)
-			// D13：memory_hit 验证失败 → 记忆降级拉黑（防循环命中）。
-			e.demoteMemoryIfHit(ctx, approval)
-			// D12：Verify 失败 → 有限重诊或升级人工。
-			if e.retry != nil {
-				created, err := e.retry.ScheduleRetry(ctx, approval.IncidentID, approval.RunID, "verify failed: "+result.Detail)
-				if err != nil {
-					e.logger.Printf("executor: schedule retry for incident %d: %v", approval.IncidentID, err)
-				} else if created {
-					e.logger.Printf("executor: incident %d retry run enqueued (after run %d)", approval.IncidentID, approval.RunID)
-				}
-			}
+	return nil
+}
+
+func (e *Executor) persist(ctx context.Context, completion store.ExecutionCompletion) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-	}
-	// Verify 完成后才落 executed，避免进程在“已执行但尚未验证”窗口丢失验证结论。
-	if err := e.db.FinishApprovalExecution(ctx, approval.ID, "executed", resultJSON); err != nil {
-		e.logger.Printf("executor: finish %d: %v", approval.ID, err)
-		return
-	}
-	metrics.Inc(metrics.ApprovalExecuted)
-	// 命令历史：已审批动作的结果写入故障记忆候选（D13 的注入源）。
-	e.recordCmdHistory(ctx, approval, execErr == nil, output)
-}
-
-// maybeCommitMemory 只收"干净"的成功案例（GC-16）：
-// 非重诊、非记忆命中、confidence=high、Guard 未改写。
-func (e *Executor) maybeCommitMemory(ctx context.Context, approval store.Approval) {
-	if e.memory == nil {
-		return
-	}
-	run, err := e.db.GetAgentRun(ctx, approval.RunID)
-	if err != nil || run.PlanJSON == nil {
-		return
-	}
-	if run.RetryOf != nil || run.Mode == "memory_hit" {
-		return
-	}
-	var plan struct {
-		Confidence string `json:"confidence"`
-	}
-	if err := json.Unmarshal([]byte(*run.PlanJSON), &plan); err != nil || plan.Confidence != "high" {
-		return
-	}
-	// Guard 改写过的案例不降格入库：被规则改过的计划不是"被验证的原计划"。
-	if steps, err := e.db.ListRunSteps(ctx, approval.RunID); err == nil {
-		for _, step := range steps {
-			if step.Kind == "guard" && step.OutputJSON != nil && strings.Contains(string(*step.OutputJSON), "overridden=true") {
-				return
-			}
+		// Only an uncommitted attempt gets a newer verification window start.
+		// FinishExecution leaves already committed results/tasks unchanged.
+		completion.FinishedAt = time.Now().UTC().Truncate(time.Millisecond)
+		err := e.db.FinishExecution(ctx, completion)
+		if err == nil {
+			return nil
 		}
-	}
-	incident, err := e.db.GetIncident(ctx, approval.IncidentID)
-	if err != nil {
-		return
-	}
-	alertName := ""
-	if members, err := e.db.ListIncidentMembers(ctx, approval.IncidentID); err == nil && len(members) > 0 {
-		alertName = members[0].Name
-	}
-	rca := ""
-	if run.RCAText != nil {
-		rca = *run.RCAText
-	}
-	entry := store.FaultMemory{
-		Fingerprint: memory.FaultFingerprint(incident.GroupKey, alertName),
-		GroupKey:    incident.GroupKey,
-		AlertName:   alertName,
-		RCAText:     rca,
-		PlanJSON:    *run.PlanJSON,
-		Confidence:  "high",
-	}
-	if err := e.memory.Commit(ctx, entry); err != nil {
-		e.logger.Printf("executor: memory commit for run %d: %v", run.ID, err)
-	}
-}
-
-// demoteMemoryIfHit 在 memory_hit 验证失败时降级该记忆。
-func (e *Executor) demoteMemoryIfHit(ctx context.Context, approval store.Approval) {
-	if e.memory == nil {
-		return
-	}
-	run, err := e.db.GetAgentRun(ctx, approval.RunID)
-	if err != nil || run.Mode != "memory_hit" {
-		return
-	}
-	incident, err := e.db.GetIncident(ctx, approval.IncidentID)
-	if err != nil {
-		return
-	}
-	alertName := ""
-	if members, err := e.db.ListIncidentMembers(ctx, approval.IncidentID); err == nil && len(members) > 0 {
-		alertName = members[0].Name
-	}
-	if err := e.memory.Demote(ctx, memory.FaultFingerprint(incident.GroupKey, alertName)); err != nil {
-		e.logger.Printf("executor: memory demote for run %d: %v", run.ID, err)
-	}
-}
-
-func (e *Executor) finishWithError(ctx context.Context, approval store.Approval, resultJSON []byte, message string) {
-	if len(resultJSON) == 0 {
-		resultJSON, _ = json.Marshal(map[string]any{"error": tools.Truncate(message, executionResultMaxRunes)})
-	}
-	if err := e.db.FinishApprovalExecution(ctx, approval.ID, "failed", resultJSON); err != nil {
-		e.logger.Printf("executor: mark %d failed: %v (cause: %s)", approval.ID, err, message)
-		return
-	}
-	e.logger.Printf("executor: approval %d failed: %s", approval.ID, message)
-}
-
-// recordCmdHistory 把执行结果写进 fault_cmd_history。
-// 键与故障记忆同源（md5(group_key + 首条告警名)[:12]）。
-func (e *Executor) recordCmdHistory(ctx context.Context, approval store.Approval, success bool, output string) {
-	incident, err := e.db.GetIncident(ctx, approval.IncidentID)
-	if err != nil {
-		e.logger.Printf("executor: load incident %d for cmd history: %v", approval.IncidentID, err)
-		return
-	}
-	alertName := ""
-	if members, err := e.db.ListIncidentMembers(ctx, approval.IncidentID); err == nil && len(members) > 0 {
-		alertName = members[0].Name
-	}
-	brief := output
-	if !success {
-		brief = "failed"
-	}
-	if runes := []rune(brief); len(runes) > 1024 {
-		brief = string(runes[:1024])
-	}
-	row := store.FaultCmdHistory{
-		Fingerprint: memory.FaultFingerprint(incident.GroupKey, alertName),
-		ToolName:    approval.ToolName,
-		ArgsJSON:    approval.ArgsJSON,
-		ResultBrief: brief,
-		ApprovalID:  &approval.ID,
-		CreatedAt:   time.Now().UTC(),
-	}
-	if err := e.db.InsertFaultCmdHistory(ctx, row); err != nil {
-		e.logger.Printf("executor: record cmd history: %v", err)
+		if errors.Is(err, store.ErrApprovalConflict) || errors.Is(err, store.ErrApprovalNotFound) {
+			return fmt.Errorf("execution result commit rejected: %w", err)
+		}
+		e.logger.Printf("executor: approval %d result commit failed; retrying persistence only: %v", completion.ApprovalID, err)
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
 }

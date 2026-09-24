@@ -1,10 +1,13 @@
 # D01 示例。敏感值使用 ${ENV} 占位符；IM webhook 可选，Web 控制台为公开操作面。
 # 最小配置只写 mysql.dsn 时只需 MYSQL_DSN；配置 web.base_url 后启用匿名控制台。
 # validate() 除了要求 mysql.dsn 非空，还会校验全部数值字段的边界。
-# （超时、TTL、Verify 延迟、诊断预算、限频等）：写 0 或负数直接启动失败，
-# 不留"立即超时 / 审批立即过期 / 跳过 Verify"这类静默失效。
+# （超时、TTL、验证窗口、诊断预算、限频等）：无效值直接启动失败。
+# 未知/已删除配置键和多个 YAML 文档也会被拒绝。
 server:
-  port: 8080
+  # 独立运行默认 127.0.0.1；此处为 Compose 的 host.docker.internal 显式绑定所有网卡。
+  # 必须用宿主防火墙限制整个 listener 到可信来源；匿名控制台、写接口和 /metrics 禁止暴露公网。
+  listen_addr: "0.0.0.0"
+  port: 18080
   auth_token: "${AUTH_TOKEN}"
 mysql:
   dsn: "${MYSQL_DSN}"
@@ -13,13 +16,15 @@ llm:
     reasoner:
       base_url: "https://your-openai-compatible-endpoint"
       api_key: "${ARK_KEY}"
-      model: "your-model"
+      model: "deepseek-v4-flash"
       max_tokens: 8192
       thinking:
         enabled: false
   # 运行时切换只能从此 allowlist 选择；不要加入未经授权的模型。
   models:
-    - id: "your-model"
+    - id: "deepseek-v4-flash"
+      # 官方标称 1M；第三方网关可能有更低限制，应按实际接入能力配置。
+      context_window_tokens: 1000000
       thinking:
         enabled: false
 ingest:
@@ -32,8 +37,9 @@ correlate:
   min_alerts: 1
 diagnose:
   budget:
-    full_steps: 8
-    light_steps: 3
+    # 图执行步数只作异常兜底；模型和工具批次各占一步。
+    full_steps: 32
+    light_steps: 16
   severity_route:
     critical: full
     high: full
@@ -50,6 +56,11 @@ diagnose:
     docker_socket: /var/run/docker.sock
     timeout_seconds: 5
     log_max_lines: 200
+  # 恢复验证超时独立于 evidence；要求 0 < timeout < interval < window，且 timeout < 30 秒。
+  verification:
+    interval_seconds: 10
+    window_seconds: 120
+    timeout_seconds: 5
 memory:
   ttl_seconds: 3600
   only_high_confidence: true
@@ -58,7 +69,6 @@ approval:
   ttl_minutes: 30
   auto_execute_l2: false
   dry_run: true
-  verify_delay_seconds: 30
   # L2 自动路径限频：同一 target+action 在窗口内最多自动执行 l2_max_per_window 次，
   # 超限降级为人工审批。
   l2_rate_window_minutes: 60
@@ -95,6 +105,6 @@ notify:
     #   chat_id: "${FEISHU_CHAT_ID}"
     #   web_base_url: "https://oncall.example.com"
 web:
-  base_url: "http://127.0.0.1:8080"  # 非空即启用公开控制台
+  base_url: "http://127.0.0.1:18080"  # 非空即启用匿名控制台；不是监听地址或访问控制
   # 飞书审批卡片的操作人 open_id 白名单（仅约束飞书回调，不影响公开控制台）。
   operator_allowlist: []

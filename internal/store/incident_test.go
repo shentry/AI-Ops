@@ -207,15 +207,15 @@ func TestIncidentQueryMethods(t *testing.T) {
 	}
 
 	// 手动重诊：落 pending run；缺字段拒绝。
-	run, err := db.CreateAgentRun(ctx, AgentRun{IncidentID: incidentID, Mode: "light", Status: "pending", StartedAt: base})
+	run, _, err := db.RequestRun(ctx, RunRequest{IncidentID: incidentID, Mode: "light", Trigger: RunTriggerManual, RequestedAt: base})
 	if err != nil {
-		t.Fatalf("CreateAgentRun() error = %v", err)
+		t.Fatalf("RequestRun() error = %v", err)
 	}
 	defer db.Where("id = ?", run.ID).Delete(&AgentRun{})
 	if run.ID == 0 || run.RetryOf != nil || run.Status != "pending" {
-		t.Fatalf("CreateAgentRun() = %#v", run)
+		t.Fatalf("RequestRun() = %#v", run)
 	}
-	if _, err := db.CreateAgentRun(ctx, AgentRun{Mode: "light", Status: "pending", StartedAt: base}); err == nil {
-		t.Fatal("CreateAgentRun() error = nil, want validation failure")
+	if _, _, err := db.RequestRun(ctx, RunRequest{Mode: "light", Trigger: RunTriggerManual, RequestedAt: base}); err == nil {
+		t.Fatal("RequestRun() error = nil, want validation failure")
 	}
 }

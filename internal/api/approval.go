@@ -3,9 +3,7 @@ package api
 import (
 	"context"
 	"crypto/subtle"
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strings"
 
@@ -17,7 +15,7 @@ import (
 
 // approvalService 是审批 API 对审批层的收窄接口。
 type approvalService interface {
-	Decide(ctx context.Context, id uint64, approve bool, decidedBy, decisionReason, decisionSource string) (store.Approval, error)
+	Decide(ctx context.Context, id uint64, approve bool, expectedPlanHash, decidedBy, decisionReason, decisionSource string) (store.Approval, error)
 	List(ctx context.Context, status string) ([]store.Approval, error)
 	Get(ctx context.Context, id uint64) (store.Approval, error)
 }
@@ -114,12 +112,15 @@ func (h *ApprovalAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "X-Operator header is required")
 		return
 	}
-	reason, err := decodeDecisionReason(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid decision reason")
+	var input struct {
+		PlanHash string  `json:"plan_hash"`
+		Reason   *string `json:"reason"`
+	}
+	if err := decodeBoundedJSON(r, &input, 64<<10); err != nil || strings.TrimSpace(input.PlanHash) == "" || input.Reason == nil {
+		writeError(w, http.StatusBadRequest, "plan_hash and reason are required")
 		return
 	}
-	h.decide(w, r, id, parts[1] == "approve", operator, reason, source, web)
+	h.decide(w, r, id, parts[1] == "approve", strings.TrimSpace(input.PlanHash), operator, *input.Reason, source)
 }
 
 // authenticate reports whether the caller is allowed and whether the request
@@ -135,8 +136,8 @@ func (h *ApprovalAPI) authenticate(r *http.Request) (web bool, ok bool) {
 	return true, true
 }
 
-func (h *ApprovalAPI) decide(w http.ResponseWriter, r *http.Request, id uint64, approve bool, operator, reason, source string, web bool) {
-	approval, err := h.svc.Decide(r.Context(), id, approve, operator, reason, source)
+func (h *ApprovalAPI) decide(w http.ResponseWriter, r *http.Request, id uint64, approve bool, planHash, operator, reason, source string) {
+	approval, err := h.svc.Decide(r.Context(), id, approve, planHash, operator, reason, source)
 	switch {
 	case err == nil:
 		writeJSON(w, http.StatusOK, approvalDTO(approval))
@@ -144,28 +145,8 @@ func (h *ApprovalAPI) decide(w http.ResponseWriter, r *http.Request, id uint64, 
 	case errors.Is(err, store.ErrApprovalNotFound):
 		writeError(w, http.StatusNotFound, "approval not found")
 	case errors.Is(err, store.ErrApprovalConflict):
-		writeError(w, http.StatusConflict, "approval already decided or expired")
+		writeError(w, http.StatusConflict, "approval changed, already decided or expired")
 	default:
 		writeError(w, http.StatusServiceUnavailable, "decide approval failed")
 	}
-}
-
-func decodeDecisionReason(r *http.Request) (string, error) {
-	if r.Body == nil {
-		return "", nil
-	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
-	if err != nil {
-		return "", err
-	}
-	if len(strings.TrimSpace(string(body))) == 0 {
-		return "", nil
-	}
-	var input struct {
-		Reason string `json:"reason"`
-	}
-	if err := json.Unmarshal(body, &input); err != nil {
-		return "", err
-	}
-	return input.Reason, nil
 }

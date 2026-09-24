@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"oncall-agent/internal/diagnose"
@@ -69,8 +70,11 @@ func BuildCard(n notify.Notification) map[string]any {
 		keys  []string
 	}{
 		{label: "Action", keys: []string{"action", "plan_action"}},
-		{label: "Target", keys: []string{"target", "plan_target"}},
+		{label: "Target", keys: []string{"target"}},
+		{label: "Scope", keys: []string{"scope"}},
+		{label: "Tool safety level", keys: []string{"safety_level"}},
 		{label: "Reason", keys: []string{"reason", "plan_reason"}},
+		{label: "Expires at", keys: []string{"expires_at"}},
 		{label: "RCA", keys: []string{"rca"}},
 		{label: "Confidence", keys: []string{"confidence"}},
 		{label: "Result", keys: []string{"result", "result_summary"}},
@@ -80,6 +84,19 @@ func BuildCard(n notify.Notification) map[string]any {
 		if value := payloadFirstText(n.Payload, field.keys...); value != "" {
 			lines = append(lines, "**"+field.label+":** "+truncate(value, maxCardTextRunes))
 		}
+	}
+
+	approvalID, hasApproval := notificationApprovalID(n)
+	if _, hasMode := n.Payload["dry_run"]; hasMode || hasApproval {
+		mode := "unknown (execution context incomplete)"
+		if dryRun, ok := n.Payload["dry_run"].(bool); ok {
+			mode = strconv.FormatBool(dryRun)
+		}
+		lines = append(lines, "**Dry run:** "+mode)
+	}
+	decisionReady := approvalCardReady(n.Payload)
+	if hasApproval && !decisionReady {
+		lines = append(lines, "执行上下文不完整，无法批准；请在 Web 控制室查看并重新诊断。")
 	}
 
 	elements := make([]any, 0, len(lines)+2)
@@ -102,12 +119,13 @@ func BuildCard(n notify.Notification) map[string]any {
 			}},
 		})
 	}
-	if approvalID, ok := notificationApprovalID(n); ok {
-		planHash := payloadFirstText(n.Payload, "plan_hash")
-		buttons := []any{
-			ApprovalButton("approve", "批准", approvalID, planHash, webURL, "primary"),
-			ApprovalButton("deny", "拒绝", approvalID, planHash, webURL, "danger"),
+	planHash, _ := n.Payload["plan_hash"].(string)
+	if hasApproval && strings.TrimSpace(planHash) != "" {
+		buttons := make([]any, 0, 2)
+		if decisionReady {
+			buttons = append(buttons, ApprovalButton("approve", "批准", approvalID, planHash, "primary"))
 		}
+		buttons = append(buttons, ApprovalButton("deny", "拒绝", approvalID, planHash, "danger"))
 		elements = append(elements, map[string]any{
 			"tag":       "column_set",
 			"flex_mode": "none",
@@ -178,17 +196,12 @@ func MarshalCard(card any) ([]byte, error) {
 // ApprovalButton returns a Card 2.0 callback button. Its callback value is
 // deliberately limited to immutable references; executable arguments and
 // credentials never travel through the card.
-func ApprovalButton(action, label string, approvalID uint64, planHash, webURL, buttonType string) map[string]any {
+func ApprovalButton(action, label string, approvalID uint64, planHash, buttonType string) map[string]any {
 	value := map[string]any{
 		"action":      action,
 		"approval_id": approvalID,
 	}
-	if strings.TrimSpace(planHash) != "" {
-		value["plan_hash"] = truncate(planHash, 256)
-	}
-	if strings.TrimSpace(webURL) != "" {
-		value["web_url"] = truncate(webURL, maxCardTextRunes)
-	}
+	value["plan_hash"] = planHash
 	return map[string]any{
 		"tag":  "button",
 		"text": map[string]any{"tag": "plain_text", "content": truncate(label, maxCardTextRunes)},
@@ -198,6 +211,21 @@ func ApprovalButton(action, label string, approvalID uint64, planHash, webURL, b
 			"value": value,
 		}},
 	}
+}
+
+// A bool assertion is intentional: missing/null/string false is not approval
+// for a real change. Display-only payloads cannot recreate a legacy snapshot.
+func approvalCardReady(payload map[string]any) bool {
+	action, _ := payload["action"].(string)
+	target, _ := payload["target"].(string)
+	scope, _ := payload["scope"].(string)
+	level, _ := payload["safety_level"].(string)
+	_, hasMode := payload["dry_run"].(bool)
+	hash, _ := payload["plan_hash"].(string)
+	reason, _ := payload["reason"].(string)
+	expires, _ := payload["expires_at"].(string)
+	expiresAt, err := time.Parse(time.RFC3339, expires)
+	return action == "docker_restart" && strings.HasPrefix(target, "container/") && strings.TrimPrefix(target, "container/") != "" && scope == "single_container" && (level == "L2" || level == "L3") && hasMode && strings.TrimSpace(hash) != "" && strings.TrimSpace(reason) != "" && err == nil && !expiresAt.IsZero()
 }
 
 func notificationApprovalID(n notify.Notification) (uint64, bool) {

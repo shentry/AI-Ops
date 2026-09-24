@@ -4,135 +4,136 @@ import (
 	"context"
 	"errors"
 	"io"
-	"log"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
-	"oncall-agent/internal/store"
+	"oncall-agent/internal/incident"
 )
 
-type fakeVerifyStore struct {
-	members  []store.IncidentMember
-	steps    []store.AgentRunStep
-	stepErr  error
-	listErr  error
-	listCtxs []context.Context
-}
-
-func (f *fakeVerifyStore) ListIncidentMembers(ctx context.Context, _ uint64) ([]store.IncidentMember, error) {
-	f.listCtxs = append(f.listCtxs, ctx)
-	if f.listErr != nil {
-		return nil, f.listErr
-	}
-	return f.members, nil
-}
-
-func (f *fakeVerifyStore) AppendRunStepRecord(_ context.Context, record store.RunStepRecord) error {
-	f.steps = append(f.steps, record.Step)
-	return f.stepErr
-}
-
-func TestVerifyPassesWhenAllResolved(t *testing.T) {
-	db := &fakeVerifyStore{members: []store.IncidentMember{
-		{Fingerprint: "a", Status: "resolved"},
-		{Fingerprint: "b", Status: "resolved"},
+func verificationSnapshot(base string) incident.ExecutionContext {
+	return incident.ExecutionContext{SafetyLevel: "L2", Verification: incident.VerificationSpec{
+		Kind: incident.HealthVerification, TargetName: "sub2api", BaseURL: base,
+		MemberFingerprints: []string{"fp"}, IntervalSeconds: 10, WindowSeconds: 120, TimeoutSeconds: 5,
 	}}
-	verifier := NewVerifier(db, discardLogger())
-	result := verifier.VerifyAfterExecution(context.Background(), 11, 7, 0)
-	if !result.Passed {
-		t.Fatalf("result = %+v, want passed", result)
-	}
-	if len(db.steps) != 1 || db.steps[0].Kind != "verify" || db.steps[0].RunID != 11 {
-		t.Fatalf("steps = %+v", db.steps)
-	}
-	if !strings.Contains(string(*db.steps[0].OutputJSON), "passed=true") {
-		t.Fatalf("step output = %v", *db.steps[0].OutputJSON)
+}
+
+func verificationBinding(base string) incident.ExecutionBinding {
+	return incident.ExecutionBinding{Container: "sub2api", BaseURL: base, AllowedContainers: []string{"sub2api"}, SafetyLevel: "L2"}
+}
+
+func TestVerifierDirectHealth(t *testing.T) {
+	for _, status := range []int{200, 204, 299, 302, 503} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if r.URL.Path != "/health" || r.Method != http.MethodGet || r.Header.Get("Authorization") != "" {
+					t.Errorf("unexpected request: %v", r)
+				}
+				w.Header().Set("Location", "/other")
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+			got := NewVerifier(verificationBinding(server.URL)).Check(context.Background(), verificationSnapshot(server.URL), time.Minute)
+			want := "healthy"
+			if status >= 300 {
+				want = "unhealthy"
+			}
+			if got.Observation != want || calls != 1 {
+				t.Fatalf("result=%+v calls=%d", got, calls)
+			}
+		})
 	}
 }
 
-func TestVerifyFailsWhileFiring(t *testing.T) {
-	db := &fakeVerifyStore{members: []store.IncidentMember{
-		{Fingerprint: "a", Status: "resolved"},
-		{Fingerprint: "b", Status: "firing"},
-	}}
-	result := NewVerifier(db, discardLogger()).VerifyAfterExecution(context.Background(), 11, 7, 0)
-	if result.Passed || result.Inconclusive || !strings.Contains(result.Detail, "1/2") {
-		t.Fatalf("result = %+v, want failed", result)
+func TestVerifierRejectsDriftAndUnsafeURLsWithoutRequest(t *testing.T) {
+	for _, change := range []struct {
+		name  string
+		apply func(*incident.ExecutionContext, *incident.ExecutionBinding)
+	}{
+		{"address", func(_ *incident.ExecutionContext, b *incident.ExecutionBinding) { b.BaseURL = "http://new.invalid" }},
+		{"container", func(_ *incident.ExecutionContext, b *incident.ExecutionBinding) { b.Container = "other" }},
+		{"allowlist", func(_ *incident.ExecutionContext, b *incident.ExecutionBinding) { b.AllowedContainers = nil }},
+		{"level", func(_ *incident.ExecutionContext, b *incident.ExecutionBinding) { b.SafetyLevel = "L3" }},
+		{"credentials", func(s *incident.ExecutionContext, b *incident.ExecutionBinding) {
+			s.Verification.BaseURL = "http://user:secret@host"
+			b.BaseURL = s.Verification.BaseURL
+		}},
+		{"unsupported", func(s *incident.ExecutionContext, _ *incident.ExecutionBinding) { s.Verification.Kind = "other" }},
+		{"dry_run", func(s *incident.ExecutionContext, _ *incident.ExecutionBinding) { s.DryRun = true }},
+	} {
+		t.Run(change.name, func(t *testing.T) {
+			snapshot := verificationSnapshot("http://approved.invalid")
+			binding := verificationBinding(snapshot.Verification.BaseURL)
+			change.apply(&snapshot, &binding)
+			v := NewVerifier(binding)
+			v.httpClient.Transport = healthRoundTripFunc(func(*http.Request) (*http.Response, error) { t.Fatal("unexpected request"); return nil, nil })
+			if got := v.Check(context.Background(), snapshot, time.Minute); got.Observation != "unavailable" {
+				t.Fatalf("got %+v", got)
+			}
+		})
 	}
 }
 
-// 空成员列表不是"全部恢复"：没有可复查对象时必须判不可判定，
-// 否则任何动作都会被标记成功并进记忆提交流程。
-func TestVerifyEmptyMembersIsInconclusive(t *testing.T) {
-	db := &fakeVerifyStore{}
-	result := NewVerifier(db, discardLogger()).VerifyAfterExecution(context.Background(), 11, 7, 0)
-	if result.Passed || !result.Inconclusive {
-		t.Fatalf("result = %+v, want inconclusive", result)
-	}
-	if !strings.Contains(result.Detail, "no members") {
-		t.Fatalf("detail = %q", result.Detail)
-	}
-	if len(db.steps) != 1 || !strings.Contains(string(*db.steps[0].OutputJSON), "inconclusive=true") {
-		t.Fatalf("steps = %+v", db.steps)
-	}
-}
-
-// 读库失败同样是不可判定，不能被当成"故障没恢复"。
-func TestVerifyReadFailureIsInconclusive(t *testing.T) {
-	db := &fakeVerifyStore{listErr: errors.New("db down")}
-	result := NewVerifier(db, discardLogger()).VerifyAfterExecution(context.Background(), 11, 7, 0)
-	if result.Passed || !result.Inconclusive {
-		t.Fatalf("result = %+v, want inconclusive", result)
+func TestVerifierBoundsTimeoutBySnapshotAndRemainingWindow(t *testing.T) {
+	for _, remaining := range []time.Duration{time.Minute, 2 * time.Second} {
+		v := NewVerifier(verificationBinding("http://approved.invalid"))
+		v.httpClient.Transport = healthRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+			deadline, ok := r.Context().Deadline()
+			want := min(5*time.Second, remaining)
+			if !ok || time.Until(deadline) > want || time.Until(deadline) < want-time.Second {
+				t.Errorf("deadline=%v want duration=%v", deadline, want)
+			}
+			return nil, context.DeadlineExceeded
+		})
+		got := v.Check(context.Background(), verificationSnapshot("http://approved.invalid"), remaining)
+		if got.Observation != "unavailable" || strings.Contains(got.Detail, "approved.invalid") {
+			t.Fatalf("got %+v", got)
+		}
 	}
 }
 
-func TestVerifyDelayRespectsContext(t *testing.T) {
-	db := &fakeVerifyStore{}
-	verifier := NewVerifier(db, discardLogger())
+func TestVerifierConnectionAndReadErrorsAreUnavailable(t *testing.T) {
+	for _, transport := range []healthRoundTripFunc{
+		func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("secret response from http://private.internal")
+		},
+		func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Body: brokenHealthBody{}}, nil
+		},
+	} {
+		v := NewVerifier(verificationBinding("http://approved.invalid"))
+		v.httpClient.Transport = transport
+		got := v.Check(context.Background(), verificationSnapshot("http://approved.invalid"), time.Minute)
+		if got.Observation != "unavailable" || strings.Contains(got.Detail, "private.internal") || strings.Contains(got.Detail, "secret") {
+			t.Fatalf("got %+v", got)
+		}
+	}
+}
+
+func TestVerifierExpiredOrCanceledDoesNotRequest(t *testing.T) {
+	v := NewVerifier(verificationBinding("http://approved.invalid"))
+	v.httpClient.Transport = healthRoundTripFunc(func(*http.Request) (*http.Response, error) { t.Fatal("unexpected request"); return nil, nil })
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	result := verifier.VerifyAfterExecution(ctx, 11, 7, time.Hour)
-	if result.Passed || !result.Inconclusive || !strings.Contains(result.Detail, "canceled") {
-		t.Fatalf("result = %+v, want canceled", result)
-	}
-	// 取消的路径也落 step。
-	if len(db.steps) != 1 {
-		t.Fatalf("steps = %d, want 1", len(db.steps))
-	}
-}
-
-// 调用方 ctx 已取消时（进程正在关闭），复查查询不能带着取消的 ctx 去读库 ——
-// 那会返回 context canceled 并被误记成"故障没恢复"；审计 step 也必须照样写进去。
-func TestVerifyDetachesContextFromCancellation(t *testing.T) {
-	db := &fakeVerifyStore{members: []store.IncidentMember{{Fingerprint: "a", Status: "resolved"}}}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	// delay=0：跳过等待分支，直接进入复查。
-	result := NewVerifier(db, discardLogger()).VerifyAfterExecution(ctx, 11, 7, 0)
-	if !result.Inconclusive {
-		t.Fatalf("result = %+v, want inconclusive on canceled ctx", result)
-	}
-	if len(db.steps) != 1 {
-		t.Fatalf("steps = %d, want the verdict recorded anyway", len(db.steps))
+	for _, tc := range []struct {
+		ctx       context.Context
+		remaining time.Duration
+	}{{ctx, time.Minute}, {context.Background(), 0}} {
+		if got := v.Check(tc.ctx, verificationSnapshot("http://approved.invalid"), tc.remaining); got.Observation != "unavailable" {
+			t.Fatalf("got %+v", got)
+		}
 	}
 }
 
-// 写 step 失败不能静默：结论必须出现在日志里，否则回放时分不清
-// 是"没跑 verify"还是"跑了没写进去"。
-func TestVerifyLogsStepWriteFailure(t *testing.T) {
-	db := &fakeVerifyStore{
-		members: []store.IncidentMember{{Fingerprint: "a", Status: "resolved"}},
-		stepErr: errors.New("insert failed"),
-	}
-	var logs strings.Builder
-	result := NewVerifier(db, log.New(&logs, "", 0)).VerifyAfterExecution(context.Background(), 11, 7, 0)
-	if !result.Passed {
-		t.Fatalf("result = %+v", result)
-	}
-	if !strings.Contains(logs.String(), "insert failed") || !strings.Contains(logs.String(), "passed=true") {
-		t.Fatalf("log = %q, want the write failure and the verdict", logs.String())
-	}
-}
+type healthRoundTripFunc func(*http.Request) (*http.Response, error)
 
-func discardLogger() *log.Logger { return log.New(io.Discard, "", 0) }
+func (f healthRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type brokenHealthBody struct{}
+
+func (brokenHealthBody) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+func (brokenHealthBody) Close() error             { return nil }

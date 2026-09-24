@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cloudwego/eino/components/tool"
@@ -43,6 +44,7 @@ type DiagnoseResult struct {
 	TokensIn     int
 	TokensOut    int
 	Steps        []StepLog
+	Context      ContextStats
 }
 
 // StepLog 记录一次工具调用，供审计回放（GC-18）。
@@ -91,11 +93,21 @@ func (r *Reasoner) maxSteps(mode string) int {
 // 任何失败都不会产生 Plan 副作用 —— Plan 只是数据，执行决策在 D09+。
 // 失败时返回的 *DiagnoseResult 可能非空（只带 Steps/token，供审计），
 // 调用方必须先判 error 再看内容。
-func (r *Reasoner) Diagnose(ctx context.Context, evidence string, mode string) (*DiagnoseResult, error) {
+func (r *Reasoner) Diagnose(ctx context.Context, evidence string, mode string) (result *DiagnoseResult, err error) {
+	// Context compaction permits longer investigations; keep the entire run,
+	// including contract retry, below the worker's five-minute stale threshold.
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	stats := &ContextStats{}
+	defer func() {
+		if result != nil {
+			result.Context = *stats
+		}
+	}()
 	if strings.TrimSpace(evidence) == "" {
 		return nil, errors.New("llm: evidence is empty")
 	}
-	chatModel, err := r.factory.Build()
+	chatModel, inputLimit, err := r.factory.buildForDiagnosis()
 	if err != nil {
 		return nil, err
 	}
@@ -106,9 +118,10 @@ func (r *Reasoner) Diagnose(ctx context.Context, evidence string, mode string) (
 		return nil, err
 	}
 	agent, err := react.NewAgent(ctx, &react.AgentConfig{
-		ToolCallingModel: wrapUsageModel(chatModel, counter),
-		ToolsConfig:      compose.ToolsNodeConfig{Tools: agentTools},
-		MaxStep:          r.maxSteps(mode),
+		ToolCallingModel: &diagnosisModel{ToolCallingChatModel: wrapUsageModel(chatModel, counter), maxSteps: r.maxSteps(mode),
+			context: contextBudget{inputLimit: inputLimit, stats: stats, estimator: &tokenEstimator{}}},
+		ToolsConfig: compose.ToolsNodeConfig{Tools: agentTools},
+		MaxStep:     r.maxSteps(mode),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("llm: build react agent: %w", err)
@@ -118,7 +131,7 @@ func (r *Reasoner) Diagnose(ctx context.Context, evidence string, mode string) (
 		schema.SystemMessage(systemPrompt),
 		schema.UserMessage(evidence),
 	}
-	result, err := r.runOnce(ctx, agent, messages, recorder)
+	result, err = r.runOnce(ctx, agent, messages, recorder)
 	if err == nil {
 		result.TokensIn, result.TokensOut = counter.in, counter.out
 		return result, nil
@@ -203,6 +216,11 @@ func parseContract(raw string) (*diagnoseContract, error) {
 	default:
 		return nil, &contractError{raw: raw, err: fmt.Errorf("llm: invalid confidence %q", contract.Confidence)}
 	}
+	// These are the currently supported remediation suggestions. Policy still
+	// validates registration, target, scope and approval before any execution.
+	if contract.Plan.Action != "none" && contract.Plan.Action != tools.ToolDockerRestart {
+		return nil, &contractError{raw: raw, err: errors.New("llm: plan.action must be none or docker_restart")}
+	}
 	return &contract, nil
 }
 
@@ -225,10 +243,16 @@ func stripJSONFence(raw string) string {
 	return strings.TrimSpace(strings.Join(body, "\n"))
 }
 
-// stepRecorder 记录一次 Diagnose 里的工具调用。ReAct 单 goroutine
-// 顺序执行工具，recorder 不需要锁。
+// stepRecorder records calls from a tool batch, which Eino executes concurrently.
 type stepRecorder struct {
+	mu    sync.Mutex
 	steps []StepLog
+}
+
+func (r *stepRecorder) record(step StepLog) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.steps = append(r.steps, step)
 }
 
 // agentTools 把 Registry.ForLLM() 的 L1 工具适配成 Eino InvokableTool。
@@ -276,10 +300,10 @@ func (t *registryTool) InvokableRun(ctx context.Context, argumentsInJSON string,
 		// Prometheus 抖一下不该让这次诊断归零，模型看到失败后
 		// 可以基于其余证据出低置信结论。StepLog 里仍记 Err 供审计。
 		entry.Err = err.Error()
-		t.recorder.steps = append(t.recorder.steps, entry)
+		t.recorder.record(entry)
 		return "tool error: " + err.Error(), nil
 	}
 	entry.Output = output
-	t.recorder.steps = append(t.recorder.steps, entry)
+	t.recorder.record(entry)
 	return output, nil
 }

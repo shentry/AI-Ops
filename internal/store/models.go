@@ -113,24 +113,41 @@ func (FaultCmdHistory) TableName() string { return "fault_cmd_history" }
 
 // Approval 是 D10 的 L3 变更动作状态机。
 type Approval struct {
-	ID             uint64          `gorm:"column:id;primaryKey;autoIncrement"`
-	IncidentID     uint64          `gorm:"column:incident_id;not null"`
-	RunID          uint64          `gorm:"column:run_id;not null"`
-	ToolName       string          `gorm:"column:tool_name;size:128;not null"`
-	ArgsJSON       datatypes.JSON  `gorm:"column:args_json;type:json;not null"`
-	Reason         string          `gorm:"column:reason;type:text;not null"`
-	PlanHash       string          `gorm:"column:plan_hash;size:64;not null"`
-	Status         string          `gorm:"column:status;size:9;not null"`
-	ExpiresAt      time.Time       `gorm:"column:expires_at;not null"`
-	DecidedBy      *string         `gorm:"column:decided_by;size:64"`
-	DecidedAt      *time.Time      `gorm:"column:decided_at"`
-	DecisionReason *string         `gorm:"column:decision_reason;type:text"`
-	DecisionSource *string         `gorm:"column:decision_source;size:16"`
-	ResultJSON     *datatypes.JSON `gorm:"column:result_json;type:json"`
-	CreatedAt      time.Time       `gorm:"column:created_at;not null"`
+	ID               uint64          `gorm:"column:id;primaryKey;autoIncrement"`
+	IncidentID       uint64          `gorm:"column:incident_id;not null"`
+	RunID            uint64          `gorm:"column:run_id;not null"`
+	ToolName         string          `gorm:"column:tool_name;size:128;not null"`
+	ArgsJSON         datatypes.JSON  `gorm:"column:args_json;type:json;not null"`
+	Reason           string          `gorm:"column:reason;type:text;not null"`
+	PlanHash         string          `gorm:"column:plan_hash;size:64;not null"`
+	ExecutionContext datatypes.JSON  `gorm:"column:execution_context;type:json"`
+	Status           string          `gorm:"column:status;size:9;not null"`
+	ExpiresAt        time.Time       `gorm:"column:expires_at;not null"`
+	DecidedBy        *string         `gorm:"column:decided_by;size:64"`
+	DecidedAt        *time.Time      `gorm:"column:decided_at"`
+	DecisionReason   *string         `gorm:"column:decision_reason;type:text"`
+	DecisionSource   *string         `gorm:"column:decision_source;size:16"`
+	ResultJSON       *datatypes.JSON `gorm:"column:result_json;type:json"`
+	CreatedAt        time.Time       `gorm:"column:created_at;not null"`
+	Verification     *VerifyTask     `gorm:"foreignKey:ApprovalID;references:ID" json:"-"`
 }
 
 func (Approval) TableName() string { return "approval" }
+
+// VerifyTask is the durable read-only recovery queue. Execution remains on Approval.
+type VerifyTask struct {
+	ApprovalID     uint64         `gorm:"column:approval_id;primaryKey;autoIncrement:false"`
+	Status         string         `gorm:"column:status;size:12;not null"`
+	NextCheckAt    time.Time      `gorm:"column:next_check_at;not null"`
+	DeadlineAt     time.Time      `gorm:"column:deadline_at;not null"`
+	ClaimedAt      *time.Time     `gorm:"column:claimed_at"`
+	LastCheckedAt  *time.Time     `gorm:"column:last_checked_at"`
+	LastResultJSON datatypes.JSON `gorm:"column:last_result_json;type:json"`
+	CreatedAt      time.Time      `gorm:"column:created_at;not null"`
+	FinishedAt     *time.Time     `gorm:"column:finished_at"`
+}
+
+func (VerifyTask) TableName() string { return "verify_task" }
 
 // AgentRun 是一次诊断尝试，也是 D05 诊断 worker 的队列行。
 type AgentRun struct {
@@ -245,6 +262,8 @@ type IntegrationEventReceipt struct {
 	ProcessedAt time.Time `gorm:"column:processed_at;not null"`
 	Result      string    `gorm:"column:result;size:32;not null"`
 }
+
+func (IntegrationEventReceipt) TableName() string { return "integration_event_receipt" }
 
 // LLMModelSelection 是唯一的全局当前模型记录。模型 allowlist、端点和
 // 凭据始终留在配置文件；此表只保存已选择的安全模型 ID。

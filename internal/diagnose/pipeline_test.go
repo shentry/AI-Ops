@@ -2,6 +2,7 @@ package diagnose
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -11,6 +12,7 @@ import (
 	"gorm.io/datatypes"
 
 	"oncall-agent/internal/approval"
+	"oncall-agent/internal/incident"
 	"oncall-agent/internal/llm"
 	"oncall-agent/internal/store"
 )
@@ -23,6 +25,11 @@ type fakeRunStore struct {
 	completeRCA map[uint64]string
 	tokensIn    map[uint64]int
 	runs        map[uint64]store.AgentRun // 预置的重诊上下文数据
+	completions []store.RunCompletion
+	order       []string
+	failStep    string
+	failEvent   string
+	completeErr error
 }
 
 func newFakeRunStore() *fakeRunStore {
@@ -37,23 +44,35 @@ func (f *fakeRunStore) AppendRunStep(_ context.Context, step store.AgentRunStep)
 }
 
 func (f *fakeRunStore) AppendRunStepRecord(ctx context.Context, record store.RunStepRecord) error {
+	f.order = append(f.order, "step:"+record.Step.Name)
+	if record.Step.Name == f.failStep {
+		return errors.New("audit step failed: " + f.failStep)
+	}
 	return f.AppendRunStep(ctx, record.Step)
 }
 
-func (f *fakeRunStore) CompleteAgentRun(_ context.Context, id uint64, rca string, _ []byte, tokensIn, _ int, status string, _ time.Time) error {
+func (f *fakeRunStore) CompleteRun(ctx context.Context, completion store.RunCompletion) error {
+	f.order = append(f.order, "complete:"+completion.Status)
+	f.completions = append(f.completions, completion)
+	if f.completeErr != nil {
+		return f.completeErr
+	}
+	if completion.Approval != nil {
+		completion.Approval.ID = 42
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.completed[id] = status
-	f.completeRCA[id] = rca
-	f.tokensIn[id] = tokensIn
+	f.completed[completion.RunID] = completion.Status
+	f.completeRCA[completion.RunID] = completion.RCA
+	f.tokensIn[completion.RunID] = completion.TokensIn
 	return nil
 }
 
-func (f *fakeRunStore) CompleteRun(ctx context.Context, completion store.RunCompletion) error {
-	return f.CompleteAgentRun(ctx, completion.RunID, completion.RCA, completion.PlanJSON, completion.TokensIn, completion.TokensOut, completion.Status, completion.FinishedAt)
-}
-
 func (f *fakeRunStore) AppendIncidentEvent(_ context.Context, event store.IncidentEvent) (store.IncidentEvent, error) {
+	f.order = append(f.order, "event:"+event.EventType)
+	if event.EventType == f.failEvent {
+		return store.IncidentEvent{}, errors.New("audit event failed: " + f.failEvent)
+	}
 	return event, nil
 }
 
@@ -88,9 +107,13 @@ type fakeEvidenceBuilder struct {
 	evidence Evidence
 	err      error
 	target   Target
+	calls    *int
 }
 
 func (f fakeEvidenceBuilder) BuildForIncident(context.Context, uint64) (Evidence, error) {
+	if f.calls != nil {
+		*f.calls++
+	}
 	return f.evidence, f.err
 }
 
@@ -115,12 +138,16 @@ func (f *fakeReasoner) Diagnose(context.Context, string, string) (*llm.DiagnoseR
 }
 
 type fakeReporter struct {
-	calls int
-	err   error
+	calls    int
+	err      error
+	onNotify func(DiagnosisReport)
 }
 
-func (f *fakeReporter) NotifyDiagnosis(context.Context, DiagnosisReport) error {
+func (f *fakeReporter) NotifyDiagnosis(_ context.Context, report DiagnosisReport) error {
 	f.calls++
+	if f.onNotify != nil {
+		f.onNotify(report)
+	}
 	return f.err
 }
 
@@ -136,26 +163,23 @@ func (f *fakePolicy) Decide(_ context.Context, _ llm.Plan, input approval.Policy
 }
 
 type fakeApprovals struct {
-	created []store.Approval
-	err     error
+	created   []store.Approval
+	err       error
+	onPrepare func()
 }
 
-func (f *fakeApprovals) Create(_ context.Context, incidentID, runID uint64, decision approval.Decision, reason string) (store.Approval, error) {
+func (f *fakeApprovals) Prepare(incidentID, runID uint64, decision approval.Decision, reason string) (store.Approval, error) {
+	if f.onPrepare != nil {
+		f.onPrepare()
+	}
 	if f.err != nil {
 		return store.Approval{}, f.err
 	}
-	created := store.Approval{ID: uint64(len(f.created) + 1), IncidentID: incidentID, RunID: runID, ToolName: decision.ToolName, Reason: reason, Status: "pending"}
-	f.created = append(f.created, created)
-	return created, nil
-}
-
-func (f *fakeApprovals) CreateSystemApproved(ctx context.Context, incidentID, runID uint64, decision approval.Decision, reason string) (store.Approval, error) {
-	created, err := f.Create(ctx, incidentID, runID, decision, reason)
-	if err != nil {
-		return store.Approval{}, err
+	created := store.Approval{IncidentID: incidentID, RunID: runID, ToolName: decision.ToolName, Reason: reason, Status: "pending", PlanHash: decision.PlanHash, ArgsJSON: datatypes.JSON(decision.Args), ExecutionContext: datatypes.JSON(decision.ExecutionContext)}
+	if decision.Kind == approval.DecisionAutoL2 {
+		created.Status = "approved"
 	}
-	created.Status = "approved"
-	f.created[len(f.created)-1].Status = "approved"
+	f.created = append(f.created, created)
 	return created, nil
 }
 
@@ -280,8 +304,7 @@ func TestPipelineRecordsToolStepsOnReasonFailure(t *testing.T) {
 	}
 }
 
-// Policy 收到的护栏输入必须来自 incident 上下文：可信 target 来自告警标签，
-// 可验证性来自"有成员告警可复查"。
+// Policy receives member facts from current alerts, not model-provided provenance.
 func TestPipelinePassesPolicyGuardrailInput(t *testing.T) {
 	db := newFakeRunStore()
 	reasoner := &fakeReasoner{result: &llm.DiagnoseResult{
@@ -290,8 +313,8 @@ func TestPipelinePassesPolicyGuardrailInput(t *testing.T) {
 	}}
 	builder := fakeEvidenceBuilder{evidence: testEvidence(), target: Target{
 		Incident: store.Incident{ID: 7, GroupKey: "payments"},
-		Members:  []store.IncidentMember{{Fingerprint: "fp1", Name: "HighCPU", Status: "firing"}},
-		Alerts:   []store.Alert{{Name: "HighCPU", Labels: []byte(`{"alertname":"HighCPU","container":"sub2api"}`)}},
+		Members:  []store.IncidentMember{{Fingerprint: "stale-member", Name: "HighCPU", Status: "firing"}},
+		Alerts:   []store.Alert{{Fingerprint: "fp1", Name: incident.SupportedAlert, Status: "firing", Labels: []byte(`{"container":"sub2api","service":"sub2api"}`)}},
 	}}
 	policy := allowPolicy()
 	pipeline := NewPipeline(db, builder, reasoner, policy, &fakeApprovals{}, &fakeReporter{}, nil, 0)
@@ -301,11 +324,9 @@ func TestPipelinePassesPolicyGuardrailInput(t *testing.T) {
 	if policy.lastInput == nil {
 		t.Fatal("policy did not receive guardrail input")
 	}
-	if !policy.lastInput.Verifiable {
-		t.Fatal("Verifiable = false, want true for an incident with members")
-	}
-	if len(policy.lastInput.KnownTargets) != 1 || policy.lastInput.KnownTargets[0] != "sub2api" {
-		t.Fatalf("KnownTargets = %v, want [sub2api] from the alert labels", policy.lastInput.KnownTargets)
+	members := policy.lastInput.Members
+	if len(members) != 1 || members[0] != (incident.ExecutionMember{Fingerprint: "fp1", Name: incident.SupportedAlert, Status: "firing", Container: "sub2api", Service: "sub2api"}) {
+		t.Fatalf("Members = %+v, want current alert facts", members)
 	}
 }
 
@@ -318,8 +339,8 @@ func TestPipelineMarksUnverifiableWithoutMembers(t *testing.T) {
 	if err := pipeline.Run(context.Background(), store.AgentRun{ID: 24, IncidentID: 7, Mode: "full", Status: "running"}); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if policy.lastInput == nil || policy.lastInput.Verifiable {
-		t.Fatalf("input = %+v, want Verifiable=false", policy.lastInput)
+	if policy.lastInput == nil || len(policy.lastInput.Members) != 0 {
+		t.Fatalf("input = %+v, want no members", policy.lastInput)
 	}
 }
 
@@ -374,8 +395,8 @@ func TestPipelineNotifyFailureKeepsRunSucceeded(t *testing.T) {
 	if err := pipeline.Run(context.Background(), run); err != nil {
 		t.Fatalf("Run() error = %v, want nil (notify failure is independent)", err)
 	}
-	if db.completed[14] != "succeeded" {
-		t.Fatalf("final status = %q, want succeeded", db.completed[14])
+	if db.completed[14] != "succeeded" || len(db.completions) != 1 {
+		t.Fatalf("final status = %q, completions=%d; want exactly one succeeded commit", db.completed[14], len(db.completions))
 	}
 	// notify step 带错误记录。
 	notifyStep := db.steps[len(db.steps)-1]
@@ -476,7 +497,7 @@ func TestPipelineMemoryHitSkipsLLM(t *testing.T) {
 	reasoner := &fakeReasoner{}
 	builder := fakeEvidenceBuilder{target: Target{
 		Incident: store.Incident{ID: 7, GroupKey: "payments"},
-		Alerts:   []store.Alert{{Name: "HighCPU"}},
+		Alerts:   []store.Alert{{Name: "HighCPU", Labels: []byte(`{}`)}},
 	}}
 	pipeline := NewPipeline(db, builder, reasoner, allowPolicy(), &fakeApprovals{}, &fakeReporter{}, mem, 5)
 	run := store.AgentRun{ID: 20, IncidentID: 7, Mode: "full", Status: "running"}
@@ -518,7 +539,7 @@ func TestPipelineRetrySkipsMemoryLookup(t *testing.T) {
 	mem := &fakeMemory{hit: true, entry: store.FaultMemory{RCAText: "旧记忆", Confidence: "high", PlanJSON: []byte(`{"action":"none"}`)}}
 	builder := fakeEvidenceBuilder{evidence: testEvidence(), target: Target{
 		Incident: store.Incident{ID: 7, GroupKey: "payments"},
-		Alerts:   []store.Alert{{Name: "HighCPU"}},
+		Alerts:   []store.Alert{{Name: "HighCPU", Labels: []byte(`{}`)}},
 	}}
 	pipeline := NewPipeline(db, builder, reasoner, allowPolicy(), &fakeApprovals{}, &fakeReporter{}, mem, 5)
 	retryOf := uint64(10)
@@ -543,7 +564,7 @@ func TestPipelineMissInjectsCmdHistory(t *testing.T) {
 	mem := &fakeMemory{history: []store.FaultCmdHistory{{ToolName: "docker_restart", ArgsJSON: []byte(`{"target_name":"sub2api"}`), ResultBrief: "ok", CreatedAt: time.Now()}}}
 	builder := fakeEvidenceBuilder{evidence: testEvidence(), target: Target{
 		Incident: store.Incident{ID: 7, GroupKey: "payments"},
-		Alerts:   []store.Alert{{Name: "HighCPU"}},
+		Alerts:   []store.Alert{{Name: "HighCPU", Labels: []byte(`{}`)}},
 	}}
 	// 包一层 reasoner 捕获输入。
 	capturing := &capturingReasoner{inner: reasoner, out: &gotEvidence}
@@ -565,4 +586,140 @@ type capturingReasoner struct {
 func (c *capturingReasoner) Diagnose(ctx context.Context, evidence string, mode string) (*llm.DiagnoseResult, error) {
 	*c.out = evidence
 	return c.inner.Diagnose(ctx, evidence, mode)
+}
+
+func TestPipelineCriticalAuditFailurePreventsApprovalPublication(t *testing.T) {
+	for _, kind := range []string{approval.DecisionApproval, approval.DecisionAutoL2} {
+		for _, stage := range []struct{ name, event, step string }{
+			{"memory", "", "memory_lookup"},
+			{"evidence start", "collector.started", ""},
+			{"evidence completion", "", "collect"},
+			{"LLM start", "llm.started", ""},
+			{"LLM completion", "", "reason"},
+			{"tool audit", "", "docker_logs"},
+			{"guard", "", "rules"},
+			{"policy", "", "policy"},
+		} {
+			t.Run(kind+"/"+stage.name, func(t *testing.T) {
+				db := newFakeRunStore()
+				db.failStep, db.failEvent = stage.step, stage.event
+				r := &fakeReasoner{result: &llm.DiagnoseResult{RCA: "容器退出", Confidence: "high", Plan: llm.Plan{Action: incident.RestartAction, Target: llm.PlanTarget{Kind: "container", Name: "sub2api"}}, Steps: []llm.StepLog{{Name: "docker_logs"}}}}
+				builds := 0
+				builder := fakeEvidenceBuilder{calls: &builds, evidence: testEvidence(), target: Target{Incident: store.Incident{ID: 7, GroupKey: "sub2api"}, Alerts: []store.Alert{{Name: incident.SupportedAlert, Labels: []byte(`{}`)}}}}
+				approvals, reporter := &fakeApprovals{}, &fakeReporter{}
+				policy := &fakePolicy{decision: approval.Decision{Kind: kind, ToolName: incident.RestartAction}}
+				pipeline := NewPipeline(db, builder, r, policy, approvals, reporter, &fakeMemory{}, 0)
+				err := pipeline.Run(context.Background(), store.AgentRun{ID: 31, IncidentID: 7, Mode: "full", Status: "running"})
+				if err == nil || !strings.Contains(err.Error(), "audit") {
+					t.Fatalf("Run error = %v", err)
+				}
+				if len(approvals.created) != 0 || reporter.calls != 0 {
+					t.Fatalf("approval prepared or notification sent after %s", stage.name)
+				}
+				for _, completion := range db.completions {
+					if completion.Approval != nil || completion.Status != "failed" {
+						t.Fatalf("unsafe completion = %+v", completion)
+					}
+				}
+				if (stage.name == "memory" || stage.name == "evidence start") && builds != 0 {
+					t.Fatal("collector called after earlier audit failure")
+				}
+				if (stage.name == "memory" || stage.name == "evidence start" || stage.name == "evidence completion" || stage.name == "LLM start") && r.calls != 0 {
+					t.Fatalf("LLM called after earlier audit failure")
+				}
+			})
+		}
+	}
+}
+
+func TestPipelineDraftCommitNotifyOrder(t *testing.T) {
+	for _, kind := range []string{approval.DecisionApproval, approval.DecisionAutoL2} {
+		t.Run(kind, func(t *testing.T) {
+			db := newFakeRunStore()
+			approvals := &fakeApprovals{onPrepare: func() {
+				if len(db.completions) != 0 || db.order[len(db.order)-1] != "step:policy" {
+					t.Fatalf("prepare order = %v", db.order)
+				}
+				db.order = append(db.order, "prepare")
+			}}
+			reporter := &fakeReporter{onNotify: func(report DiagnosisReport) {
+				if len(db.completions) != 1 || db.completed[31] != "succeeded" {
+					t.Fatalf("notification before commit: %v", db.order)
+				}
+				if report.Approval == nil || report.Approval.ID != 42 || report.Approval != db.completions[0].Approval {
+					t.Fatalf("report lost committed approval: %+v", report)
+				}
+				db.order = append(db.order, "notify")
+			}}
+			policy := &fakePolicy{decision: approval.Decision{Kind: kind, ToolName: incident.RestartAction, PlanHash: "snapshot-hash"}}
+			pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, &fakeReasoner{result: &llm.DiagnoseResult{RCA: "ok"}}, policy, approvals, reporter, nil, 0)
+			if err := pipeline.Run(context.Background(), store.AgentRun{ID: 31, IncidentID: 7, Mode: "full"}); err != nil {
+				t.Fatal(err)
+			}
+			if len(approvals.created) != 1 || approvals.created[0].ID != 0 {
+				t.Fatalf("Prepare wrote an approval: %+v", approvals.created)
+			}
+			if got := strings.Join(db.order, ","); !strings.Contains(got, "prepare,complete:succeeded,notify,step:notify") {
+				t.Fatal(got)
+			}
+		})
+	}
+}
+
+func TestPipelineCompletionFailureDoesNotNotifyOrRewriteRun(t *testing.T) {
+	db := newFakeRunStore()
+	db.completeErr = errors.New("commit failed")
+	reporter := &fakeReporter{}
+	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, &fakeReasoner{result: &llm.DiagnoseResult{RCA: "ok"}},
+		&fakePolicy{decision: approval.Decision{Kind: approval.DecisionApproval}}, &fakeApprovals{}, reporter, nil, 0)
+	err := pipeline.Run(context.Background(), store.AgentRun{ID: 31, IncidentID: 7, Mode: "full"})
+	if !errors.Is(err, db.completeErr) || reporter.calls != 0 || len(db.completions) != 1 || db.completions[0].Approval == nil || db.completions[0].Approval.ID != 0 {
+		t.Fatalf("err=%v calls=%d completions=%+v", err, reporter.calls, db.completions)
+	}
+}
+
+func TestPipelineNotificationAuditFailurePropagatesWithoutRewritingRun(t *testing.T) {
+	db := newFakeRunStore()
+	db.failStep = "notify"
+	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, &fakeReasoner{result: &llm.DiagnoseResult{RCA: "ok"}},
+		&fakePolicy{decision: approval.Decision{Kind: approval.DecisionAutoL2}}, &fakeApprovals{}, &fakeReporter{err: errors.New("IM unavailable")}, nil, 0)
+	err := pipeline.Run(context.Background(), store.AgentRun{ID: 31, IncidentID: 7, Mode: "full"})
+	if err == nil || !strings.Contains(err.Error(), "audit step failed") {
+		t.Fatalf("err=%v", err)
+	}
+	if len(db.completions) != 1 || db.completed[31] != "succeeded" || db.completions[0].Approval == nil {
+		t.Fatalf("notification failure rewrote run: %+v", db.completions)
+	}
+}
+
+func TestPipelineRejectsMalformedApprovalBeforeCompletion(t *testing.T) {
+	db := newFakeRunStore()
+	policy := &fakePolicy{decision: approval.Decision{Kind: approval.DecisionApproval, ToolName: incident.RestartAction, PlanHash: "invalid", Reason: "manual", ExecutionContext: []byte(`{"dry_run":false}`)}}
+	reporter := &fakeReporter{}
+	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, &fakeReasoner{result: &llm.DiagnoseResult{RCA: "ok"}}, policy, approval.NewService(nil, 30), reporter, nil, 0)
+	if err := pipeline.Run(context.Background(), store.AgentRun{ID: 31, IncidentID: 7, Mode: "full"}); err == nil {
+		t.Fatal("malformed approval accepted")
+	}
+	if len(db.completions) != 1 || db.completions[0].Approval != nil || db.completions[0].Status != "failed" || reporter.calls != 0 {
+		t.Fatalf("unsafe completion = %+v", db.completions)
+	}
+}
+
+func TestPipelineGuardAuditRetainsVerificationMemoryContract(t *testing.T) {
+	db := newFakeRunStore()
+	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, &fakeReasoner{result: &llm.DiagnoseResult{RCA: "容器退出", Plan: llm.Plan{Action: incident.RestartAction, Target: llm.PlanTarget{Kind: "container", Name: "sub2api"}}}}, allowPolicy(), &fakeApprovals{}, &fakeReporter{}, nil, 0)
+	if err := pipeline.Run(context.Background(), store.AgentRun{ID: 31, IncidentID: 7, Mode: "full"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range db.steps {
+		if step.Kind != "guard" {
+			continue
+		}
+		var output string
+		if err := json.Unmarshal(*step.OutputJSON, &output); err != nil || !strings.HasPrefix(output, "decision=allow overridden=false reason=") {
+			t.Fatalf("guard output = %v, err=%v", step.OutputJSON, err)
+		}
+		return
+	}
+	t.Fatal("guard step missing")
 }

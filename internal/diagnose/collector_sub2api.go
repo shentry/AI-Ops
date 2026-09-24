@@ -3,10 +3,9 @@ package diagnose
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -56,28 +55,12 @@ func (c *sub2apiCollector) Collect(ctx context.Context, _ Target) EvidenceItem {
 }
 
 func (c *sub2apiCollector) collectHealth(ctx context.Context, body *strings.Builder) error {
-	base, err := url.Parse(c.cfg.Sub2APIBaseURL)
-	if err != nil {
-		return fmt.Errorf("invalid sub2api base_url")
+	result := readHTTPHealth(ctx, c.httpClient, c.cfg.Sub2APIBaseURL)
+	if result.statusCode != 0 {
+		fmt.Fprintf(body, "  status=%d latency_ms=%d body=%q\n", result.statusCode, result.latencyMS, result.excerpt)
 	}
-	endpoint := base.ResolveReference(&url.URL{Path: "/health"})
-	started := time.Now()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
-	if err != nil {
-		return fmt.Errorf("build request: %w", err)
-	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("health request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	// /health 响应体只需要知道"通不通、什么码"，读前 512 字节留个痕迹即可。
-	excerpt, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-	fmt.Fprintf(body, "  status=%d latency_ms=%d body=%q\n",
-		resp.StatusCode, time.Since(started).Milliseconds(), ToSafeText(string(excerpt)))
-	// 非 2xx 是网关不健康的直接结论，不只是正文里的一个数字。
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("health returned HTTP %d", resp.StatusCode)
+	if result.Observation != "healthy" {
+		return errors.New(result.Detail)
 	}
 	return nil
 }

@@ -101,10 +101,16 @@ export interface ApprovalDTO {
   tool_name: string;
   plan_hash: string;
   reason: string;
-  target?: string | null;
-  risk?: string | null;
-  scope?: string | null;
-  dry_run?: boolean | null;
+  target: string;
+  safety_level: string;
+  scope: string;
+  dry_run: boolean | null;
+  verification: {
+    status: string;
+    last_checked_at?: string | null;
+    deadline_at?: string | null;
+    detail?: string;
+  };
   status: string;
   expires_at: string;
   created_at?: string;
@@ -160,6 +166,7 @@ export interface ControlRoom {
   flow_nodes: FlowNode[];
   open_problems: ProblemDTO[];
   pending_approval: ApprovalDTO | null;
+  latest_action: ApprovalDTO | null;
   recent_events: EventDTO[];
 }
 
@@ -346,19 +353,29 @@ function toProblem(value: unknown): ProblemDTO {
 }
 
 function toApproval(value: unknown): ApprovalDTO {
+  const source = object(value);
+  // Decision fields use the exact contract: never coerce unknown values into consent.
+  const field = (key: string): string => typeof source[key] === "string" ? source[key] : "";
+  const verification = object(source.verification);
   return {
-    id: number(read(value, "id")),
-    incident_id: number(read(value, "incident_id", "incidentId")),
-    run_id: optionalNumber(read(value, "run_id", "runId")),
-    tool_name: text(read(value, "tool_name", "toolName")),
-    plan_hash: text(read(value, "plan_hash", "planHash")),
-    reason: text(read(value, "reason")),
-    target: optionalText(read(value, "target")),
-    risk: optionalText(read(value, "risk")),
-    scope: optionalText(read(value, "scope")),
-    dry_run: read(value, "dry_run", "dryRun") === undefined ? undefined : boolean(read(value, "dry_run", "dryRun")),
-    status: text(read(value, "status"), "pending"),
-    expires_at: text(read(value, "expires_at", "expiresAt")),
+    id: number(source.id),
+    incident_id: number(source.incident_id),
+    run_id: optionalNumber(source.run_id),
+    tool_name: field("tool_name"),
+    plan_hash: field("plan_hash"),
+    reason: field("reason"),
+    target: field("target"),
+    safety_level: field("safety_level"),
+    scope: field("scope"),
+    dry_run: typeof source.dry_run === "boolean" ? source.dry_run : null,
+    verification: {
+      status: text(verification.status, "unknown"),
+      last_checked_at: optionalText(verification.last_checked_at),
+      deadline_at: optionalText(verification.deadline_at),
+      detail: optionalText(verification.detail) ?? undefined,
+    },
+    status: field("status"),
+    expires_at: field("expires_at"),
     created_at: optionalText(read(value, "created_at", "createdAt")) ?? undefined,
     decided_by: optionalText(read(value, "decided_by", "decidedBy")),
     decided_at: optionalText(read(value, "decided_at", "decidedAt")),
@@ -468,6 +485,7 @@ export async function getControlRoom(incidentID: number): Promise<ControlRoom> {
   const currentRunValue = read(body, "current_run", "currentRun");
   const currentRun = currentRunValue && Object.keys(object(currentRunValue)).length ? toRun(currentRunValue) : null;
   const approvalValue = read(body, "pending_approval", "pendingApproval");
+  const latestActionValue = read(body, "latest_action");
   return {
     incident,
     members: list(body, "members").map(toMember),
@@ -475,6 +493,7 @@ export async function getControlRoom(incidentID: number): Promise<ControlRoom> {
     flow_nodes: list(body, "flow_nodes").map(toFlowNode),
     open_problems: list(body, "open_problems").map(toProblem),
     pending_approval: approvalValue && Object.keys(object(approvalValue)).length ? toApproval(approvalValue) : null,
+    latest_action: latestActionValue && Object.keys(object(latestActionValue)).length ? toApproval(latestActionValue) : null,
     recent_events: list(body, "recent_events").map(toEvent).filter((event) => event.id > 0),
   };
 }
@@ -579,10 +598,10 @@ export async function requestEvidence(incidentID: number, requestText = "Collect
   });
 }
 
-export async function decideApproval(approvalID: number, approve: boolean, reason = ""): Promise<ApprovalDTO> {
+export async function decideApproval(approvalID: number, approve: boolean, planHash: string, reason: string): Promise<ApprovalDTO> {
   const body = await request<unknown>(`/api/v1/approvals/${approvalID}/${approve ? "approve" : "deny"}`, {
     method: "POST",
-    body: JSON.stringify({ reason }),
+    body: JSON.stringify({ plan_hash: planHash, reason }),
   });
   return toApproval(unwrap(body, "approval"));
 }
@@ -614,7 +633,7 @@ export function subscribeIncident(incidentID: number, options: IncidentStreamOpt
 		"incident.created", "incident.promoted", "incident.resolved", "run.queued", "run.started", "run.succeeded", "run.failed", "run.stalled",
 		"collector.started", "collector.completed", "collector.failed", "llm.started", "llm.tool_called", "llm.completed", "llm.failed",
 		"guard.evaluated", "guard.overridden", "policy.evaluated", "policy.degraded", "approval.created", "approval.approved", "approval.denied", "approval.expired",
-		"execution.started", "execution.completed", "execution.failed", "verify.passed", "verify.failed", "verify.inconclusive", "retry.scheduled", "escalation.required",
+		"execution.started", "execution.completed", "execution.failed", "execution.simulated", "verify.queued", "verify.started", "verify.checked", "verify.passed", "verify.failed", "verify.inconclusive", "retry.scheduled", "escalation.required",
 		"notification.sent", "notification.failed", "conversation.asked", "conversation.answered", "conversation.failed", "incident.event",
 	];
 	for (const eventName of eventNames) source.addEventListener(eventName, consume);

@@ -1,11 +1,10 @@
 import { MessagesSquare, OctagonAlert, Radar, RefreshCw, RotateCcw } from "lucide-react";
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
 	ApiError,
 	ControlRoom,
 	EventDTO,
-	Incident,
 	ModelState,
 	decideApproval,
 	getControlRoom,
@@ -15,6 +14,7 @@ import {
 	rediagnose,
 	subscribeIncident,
 } from "../api";
+import { ActionPanel } from "../components/ActionPanel";
 import { ApprovalPanel } from "../components/ApprovalPanel";
 import { ConversationPanel } from "../components/ConversationPanel";
 import { EventTimeline } from "../components/EventTimeline";
@@ -29,18 +29,6 @@ interface IncidentRoomProps {
   actorName?: string;
   modelState: ModelState | null;
   onModelChanged: (state: ModelState) => void;
-}
-
-function eventToStatus(event: EventDTO): string | undefined {
-  if (event.event_type === "run.queued") return "queued";
-  if (event.event_type === "run.started") return "running";
-  if (event.event_type === "run.succeeded") return "succeeded";
-  if (event.event_type === "run.failed") return "failed";
-  if (event.event_type.endsWith(".failed")) return "failed";
-  if (event.event_type.endsWith(".completed")) return "succeeded";
-  if (event.event_type.endsWith(".started")) return "running";
-  if (event.event_type === "verify.inconclusive") return "inconclusive";
-  return undefined;
 }
 
 function mergeEvents(previous: EventDTO[], incoming: EventDTO[]): EventDTO[] {
@@ -172,6 +160,7 @@ export function IncidentRoom({ incidentId, actorName, modelState, onModelChanged
       setActionMessage(success);
     } catch (cause) {
       setActionMessage(cause instanceof ApiError ? cause.message : "操作没有完成");
+      if (cause instanceof ApiError && cause.status === 409) await refresh(true);
       return;
     }
     try {
@@ -212,7 +201,7 @@ export function IncidentRoom({ incidentId, actorName, modelState, onModelChanged
   }
 
   const incident = room.incident;
-  const latestStatus = room.current_run?.status ?? incident.status;
+  const latestStatus = room.current_run?.status;
 
   return (
     <main className="shell room-shell">
@@ -277,7 +266,7 @@ export function IncidentRoom({ incidentId, actorName, modelState, onModelChanged
       {actionMessage && <div className="inline-notice" role="status">{actionMessage}</div>}
 
       <section className="summary-strip" aria-label="Incident 概览">
-        <SummaryMetric label="当前诊断" value={statusLabel(latestStatus)} tone={latestStatus} />
+        <SummaryMetric label="当前诊断" value={latestStatus === "succeeded" ? "诊断完成" : statusLabel(latestStatus, "尚未诊断")} tone={latestStatus} />
         <SummaryMetric label="待处理问题" value={String(room.open_problems.length)} tone={room.open_problems.length ? "failed" : "succeeded"} />
         <SummaryMetric label="待审批" value={room.pending_approval ? "1 个" : "无"} tone={room.pending_approval ? "blocked" : "succeeded"} />
         <SummaryMetric label="事件数" value={String(events.length)} tone="neutral" />
@@ -292,14 +281,15 @@ export function IncidentRoom({ incidentId, actorName, modelState, onModelChanged
           <ProblemPanel problems={room.open_problems} />
           <ApprovalPanel
             approval={room.pending_approval}
-            onDecide={(approvalID, approve, reason) =>
+            onDecide={(approvalID, approve, planHash, reason) =>
               handleAction(
-                () => decideApproval(approvalID, approve, reason),
+                () => decideApproval(approvalID, approve, planHash, reason),
                 approve ? "已批准，执行器会接管。" : "已拒绝。",
               )
             }
             onRequestEvidence={() => void handleAction(() => requestEvidence(incident.id), "已请求补充证据。")}
           />
+          <ActionPanel action={room.latest_action} incidentStatus={incident.status} />
           <StepInspector step={selectedStep} />
         </aside>
       </section>

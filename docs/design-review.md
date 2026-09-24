@@ -9,7 +9,8 @@
 > |---|---|
 > | **B1** 建议「把已写好的 auth 接进路由」 | **已按相反方向处理**：`internal/auth`、`internal/api/auth_feishu.go`、`Login.tsx` 已整体删除，控制台确认为公开匿名面。见下方补记。 |
 > | **B6** `conversation_message` 缺 `status` 索引 | 已不成立：`migrations/006` 的 `idx_conversation_claim (status, claimed_at)` 已覆盖该查询。`approval` 的索引建议仍然成立。 |
-> | **B9** `store.go` 2818 行上帝对象 | **部分处理**：已按告警链路阶段拆成 13 个文件（最大 439 行），但 78 个方法仍挂在同一个 `*DB` 上，业务规则也未移出。见下方补记。 |
+> | **B9** `store.go` 2818 行上帝对象 | **部分处理**：已按告警链路阶段拆成 13 个文件（最大 439 行）；业务规则已上提到 `internal/incident`（覆盖率 100%，不需 MySQL）；CI 已建。但 78 个方法仍挂在同一个 `*DB` 上。见下方两条补记。 |
+> | **C 组** 无 CI | 已不成立：`.github/workflows/ci.yml` 跑 gofmt/vet/build/`test -race`，起 MySQL service 并设 `TEST_MYSQL_DSN`（store 集成测试在 CI 里真跑），Web 侧 typecheck+build。C 组其余各条仍成立。 |
 > | 各处 `file:line` | 大部分已偏移。定位请按符号名搜索，不要直接按行号跳。`internal/store/store.go` 已不存在 —— 文件地图见 `internal/store/doc.go`。 |
 >
 > A 组（会真的出事的四个）与 B2/B3/B4/B5/B7/B8 未受本次重构影响，结论依然有效。
@@ -385,6 +386,42 @@ func openIntegrationDB(t *testing.T) *DB {
 > 可行的方向是先把业务规则上提到领域层（让 store 只剩 ORM + 队列原语），
 > 而不是横着切表。这仍是「下一版架构」的题目。
 
+> **补记二（2026-08-24，业务规则上提 + CI）**：上一条补记里的第 2、3 项已处理。
+>
+> **业务规则移出存储层**。上一条补记指的方向已经走完：
+>
+> - `internal/incident` 不再 import `store`（原来 `NewQueueRun` 返回
+>   `store.AgentRun`，依赖是反的）。改成返回纯值 `incident.QueueRun`，
+>   由 ingest worker 组装表结构。依赖方向掉头之后 store 才能单向依赖它。
+> - `merge.go` 承载归并判定：`Validate` / `Cutoff` / `NewCandidate` / `Merge` /
+>   `Promoted` / `Heartbeat` / `CanResolve`。时间窗、severity 只升不降、
+>   last_seen_at 只前进、candidate→firing 的时机、resolve_on=ALL 全在这里。
+> - `retry.go` 承载重诊准入：`RetryRequest.Validate`、`NormalizeRetryReason`、
+>   两条事件摘要的构造与截断。
+> - `store.AssignIncident` / `TouchIncident` / `ResolveIncident` /
+>   `CreateRetryAgentRun` 只剩行锁、写库和事务边界。
+>
+> **等价性是验证过的，不是声称的**：把拆分前的判定逻辑逐字抄成一份参照实现，
+> 对 status × severity × 成员数 × 输入级别 × 时间（含带时区）× 是否新成员 ×
+> minAlerts 的全组合枚举 **8652 个用例**，新旧输出逐字节一致。
+>
+> **默认覆盖率不再是零**。`internal/incident` 语句覆盖率 **100%**，且不需要
+> MySQL —— 这正是上一条补记说的「让队列逻辑能脱离真 MySQL 测」的那部分。
+> `store` 包另加一条不依赖库的 `incidentrule_test.go`，守住 `IncidentInput` →
+> `MergeInput` 的直接类型转换（三个 string 字段换位不会编译失败，只会静默串位）。
+>
+> **CI 已建**（`.github/workflows/ci.yml`）：Go 侧起 MySQL 8.0 service、
+> 按序跑全部 migrations、gofmt/vet/build/`go test -race`，并且**设了
+> `TEST_MYSQL_DSN`** —— store 的集成测试在 CI 里是真跑的，这是队列 CAS、
+> 事务回滚、恢复路径第一次被自动执行。Web 侧 npm ci + typecheck + build。
+> 顺带解决了 C 组的「无 CI」和「migrations 无版本表」里可验证的那半
+> （每次从空库全量重放，至少保证这些 SQL 在干净库上跑得通）。
+>
+> **仍未做**：第 1 项照旧 —— 78 个方法仍全挂在同一个 `*DB` 上。搬走的是
+> 「什么时候该升级/该关单/该放行重诊」这类判定，**不是**跨域事务本身。
+> `FinishApprovalExecution` 和 `CompleteRun` 的跨表收尾一行没动，
+> 「为什么不拆子包」的结论也没变。
+
 ---
 
 ### B10. 审计写入是 best-effort，但审计声称可回放
@@ -407,8 +444,8 @@ func (p *Pipeline) appendStepRecord(ctx context.Context, record store.RunStepRec
 
 | 问题 | 事实 |
 |---|---|
-| **无 CI / 无 Makefile / 无 Dockerfile** | 一个值班自愈系统自己没有可复现的部署产物和重启保护；`oncall-agent` 不在 compose 里、裸跑在宿主机 |
-| **migrations 手工执行、无版本表** | 7 个 SQL 文件，到 `007` 已有 `ALTER TABLE`，没人能确定某环境跑到第几个 |
+| ~~**无 CI**~~ / 无 Makefile / 无 Dockerfile | CI 已建（`.github/workflows/ci.yml`，2026-08-24）。**Makefile / Dockerfile 仍然没有**：一个值班自愈系统自己没有可复现的部署产物和重启保护；`oncall-agent` 不在 compose 里、裸跑在宿主机 |
+| **migrations 手工执行、无版本表** | 8 个 SQL 文件，到 `007` 已有 `ALTER TABLE`，没人能确定某环境跑到第几个。CI 每次从空库全量重放，至少保证这些 SQL 在干净库上跑得通 —— 但**线上仍然无版本表** |
 | **`web/dist` 构建产物提交进 git** | `.gitignore` 专门开了 `!web/dist/`，靠 `go:embed` 嵌入。前端改完忘记 rebuild+commit → 二进制里是旧界面，没有任何检查会发现 |
 | **Prometheus 不抓自己的 `/metrics`** | `prometheus.yml` 只有 node-exporter / blackbox / sub2api-* job |
 | **metrics 自研无标签** | 只有 counter/gauge（`metrics/metrics.go`），没有标签和直方图 → 「诊断耗时分布」「按 incident 的失败率」结构上无法表达 |

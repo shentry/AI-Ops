@@ -611,6 +611,9 @@ a { color: inherit; }
 .event-blocked { border-color: rgb(255 200 107 / 28%); background: rgb(255 200 107 / 8%); color: var(--warning); }
 
 /* ---------- 审批面板 ---------- */
+.approval-error { margin: 0 16px 16px; }
+.action-details { padding: 8px 16px 16px; }
+.action-note { margin: 12px 0 0; color: var(--subtle); font-size: 12px; line-height: 1.6; }
 .approval-card {
   margin: 16px;
   border: 1px solid rgb(255 200 107 / 24%);

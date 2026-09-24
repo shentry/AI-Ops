@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -59,12 +61,16 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if err := db.CheckExecutionReady(ctx); err != nil {
+		return fmt.Errorf("server: execution schema/upgrade check: %w", err)
+	}
 	worker := ingest.NewWorker(db, cfg.Ingest, cfg.Correlate, cfg.Diagnose.SeverityRoute, log.Default())
 	if err := worker.Start(ctx); err != nil {
 		return err
 	}
 	var expiryWorker *approval.ExpiryWorker
 	var executor *approval.Executor
+	var verificationWorker *diagnose.VerificationWorker
 	var diagnoseWorker *diagnose.Worker
 	var conversationWorker *conversation.Worker
 	// Every worker is started only after its dependency has been assembled. A
@@ -76,6 +82,9 @@ func run() error {
 		}
 		if diagnoseWorker != nil {
 			diagnoseWorker.Wait()
+		}
+		if verificationWorker != nil {
+			verificationWorker.Wait()
 		}
 		if executor != nil {
 			executor.Wait()
@@ -126,6 +135,9 @@ func run() error {
 		AutoExecuteL2:  cfg.Approval.AutoExecuteL2,
 		DryRun:         cfg.Approval.DryRun,
 		AllowedTargets: cfg.Tools.Docker.AllowedContainers,
+		Container:      cfg.Diagnose.Evidence.DockerContainer,
+		HealthBaseURL:  cfg.Diagnose.Evidence.Sub2APIBaseURL,
+		Verification:   cfg.Diagnose.Verification,
 		RateWindow:     time.Duration(cfg.Approval.L2RateWindowMinutes) * time.Minute,
 		MaxPerWindow:   cfg.Approval.L2MaxPerWindow,
 	}, db)
@@ -135,7 +147,6 @@ func run() error {
 
 	// D11：执行器消费 approved 审批单。Provider selection is explicit: the
 	// enterprise Feishu app never falls back to a legacy webhook or Noop.
-	verifier := diagnose.NewVerifier(db, log.Default())
 	var notifier notify.Notifier = notify.NoopNotifier{Logf: log.Printf}
 	provider := strings.ToLower(strings.TrimSpace(cfg.Notify.IM.Provider))
 	var feishuClient *feishu.Client
@@ -152,10 +163,21 @@ func run() error {
 	} else {
 		notifier = webhookNotifier
 	}
-	retryScheduler := diagnose.NewRetryScheduler(db, notifier, 2)
 	faultMemory := memory.NewStore(db, cfg.Memory.TTLSeconds, cfg.Memory.OnlyHighConfidence)
-	executor = approval.NewExecutor(db, registry, cfg.Approval.DryRun,
-		time.Duration(cfg.Approval.VerifyDelaySeconds)*time.Second, verifyAdapter{v: verifier}, retryScheduler, faultMemory, log.Default())
+	binding := incident.ExecutionBinding{Container: cfg.Diagnose.Evidence.DockerContainer, BaseURL: cfg.Diagnose.Evidence.Sub2APIBaseURL, AllowedContainers: cfg.Tools.Docker.AllowedContainers, DryRun: cfg.Approval.DryRun}
+	if spec, ok := registry.Get(tools.ToolDockerRestart); ok {
+		binding.SafetyLevel = string(spec.Level)
+	}
+	execution := approval.NewExecutor(db, registry, binding, log.Default())
+	if err := execution.Start(ctx); err != nil {
+		return fmt.Errorf("server: start executor: %w", err)
+	}
+	executor = execution
+	verification := diagnose.NewVerificationWorker(db, diagnose.NewVerifier(binding), cfg.Memory.TTLSeconds, notifier, log.Default())
+	if err := verification.Start(ctx); err != nil {
+		return fmt.Errorf("server: start verification worker: %w", err)
+	}
+	verificationWorker = verification
 
 	// D14：pending 队列深度 gauge，抓取时现算。
 	metrics.RegisterGauge(metrics.PendingRawEvents, func() int64 {
@@ -172,7 +194,6 @@ func run() error {
 		}
 		return count
 	})
-	executor.Start(ctx)
 
 	// The Web surface is intentionally public: console requests carry a stable
 	// anonymous actor and require no login or CSRF token. Assembly stays opt-in
@@ -221,24 +242,26 @@ func run() error {
 		reasoner := llm.NewReasoner(llmFactory, registry, cfg.Diagnose.Budget)
 		pipeline := diagnose.NewPipeline(db, evidenceBuilder, reasoner, policy, approvalSvc,
 			diagnose.NewNotifyReporter(notifier, notificationWebURL(cfg)), faultMemory, cfg.Memory.CmdHistoryInject)
-		diagnoseWorker = diagnose.NewWorker(db, pipeline, log.Default())
-		if err := diagnoseWorker.Start(ctx); err != nil {
+		diagnosis := diagnose.NewWorker(db, pipeline, log.Default())
+		if err := diagnosis.Start(ctx); err != nil {
 			return fmt.Errorf("server: start diagnose worker: %w", err)
 		}
+		diagnoseWorker = diagnosis
 	}
 	if conversationService != nil {
 		questioner := llm.NewQuestioner(llmFactory, registry, cfg.Diagnose.Budget)
-		conversationWorker = conversation.NewWorker(db, questioner, log.Default())
+		questions := conversation.NewWorker(db, questioner, log.Default())
 		if feishuClient != nil {
-			conversationWorker.SetThreadReply(feishuThreadReply{client: feishuClient}, "feishu_app")
+			questions.SetThreadReply(feishuThreadReply{client: feishuClient}, "feishu_app")
 		}
-		if err := conversationWorker.Start(ctx); err != nil {
+		if err := questions.Start(ctx); err != nil {
 			return fmt.Errorf("server: start conversation worker: %w", err)
 		}
+		conversationWorker = questions
 	}
 
 	server := g.Server()
-	server.SetPort(cfg.Server.Port)
+	server.SetAddr(net.JoinHostPort(cfg.Server.ListenAddr, strconv.Itoa(cfg.Server.Port)))
 	server.SetGraceful(true)
 	server.BindHandler("/webhook/alertmanager", api.NewAlertmanagerWebhook(db, worker, cfg.Server.AuthToken).Handle)
 	incidentAPI := api.NewIncidentAPI(db, cfg.Server.AuthToken, cfg.Diagnose.SeverityRoute)
@@ -322,12 +345,10 @@ func (s *incidentActionService) Rediagnose(ctx context.Context, incidentID uint6
 	if mode == incident.ModeSkip {
 		mode = incident.ModeLight
 	}
-	return s.db.CreateAgentRun(ctx, store.AgentRun{
-		IncidentID: incidentID,
-		Mode:       mode,
-		Status:     "pending",
-		StartedAt:  time.Now().UTC(),
+	run, _, err := s.db.RequestRun(ctx, store.RunRequest{
+		IncidentID: incidentID, Mode: mode, Trigger: store.RunTriggerManual, RequestedAt: time.Now().UTC(),
 	})
+	return run, err
 }
 
 func (s *incidentActionService) RequestEvidence(ctx context.Context, incidentID uint64, actor api.Actor, request string) error {
@@ -344,11 +365,6 @@ func (s *incidentActionService) RequestEvidence(ctx context.Context, incidentID 
 	return err
 }
 
-// （两包互不依赖，转换只在组装层发生）。
-type verifyAdapter struct {
-	v *diagnose.Verifier
-}
-
 type feishuThreadReply struct {
 	client *feishu.Client
 }
@@ -359,9 +375,4 @@ func (r feishuThreadReply) Reply(ctx context.Context, parentMessageID, content s
 	}
 	_, err := r.client.Reply(ctx, parentMessageID, content)
 	return err
-}
-
-func (a verifyAdapter) VerifyAfterExecution(ctx context.Context, runID, incidentID uint64, delay time.Duration) approval.VerifyOutcome {
-	result := a.v.VerifyAfterExecution(ctx, runID, incidentID, delay)
-	return approval.VerifyOutcome{Passed: result.Passed, Inconclusive: result.Inconclusive, Detail: result.Detail}
 }

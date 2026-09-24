@@ -17,17 +17,25 @@ import (
 // Factory 创建并缓存 reasoner 模型客户端。进程内复用（GC：不重复建连接池），
 // 密钥只进 client 配置，不进日志、不进错误文本。
 type Factory struct {
-	cfg    config.LLMConfig
-	mu     sync.Mutex
-	cached model.ToolCallingChatModel
+	cfg                 config.LLMConfig
+	mu                  sync.Mutex
+	cached              model.ToolCallingChatModel
+	contextWindowTokens int
 }
 
 func NewFactory(cfg config.LLMConfig) *Factory {
-	return &Factory{cfg: cfg}
+	window := config.DefaultContextWindowTokens
+	for _, profile := range cfg.Models {
+		if strings.TrimSpace(profile.ID) == strings.TrimSpace(cfg.Roles.Reasoner.Model) {
+			window = profile.ContextWindow()
+			break
+		}
+	}
+	return &Factory{cfg: cfg, contextWindowTokens: window}
 }
 
 // SelectModel applies a configured model profile while preserving the
-// configured endpoint, credential and token limits. Existing in-flight callers
+// configured endpoint, credential and output limit. Existing in-flight callers
 // retain their model; later Build calls receive a new client.
 func (f *Factory) SelectModel(profile config.ModelProfile) error {
 	if f == nil {
@@ -39,8 +47,12 @@ func (f *Factory) SelectModel(profile config.ModelProfile) error {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if profile.ContextWindow() <= f.cfg.Roles.Reasoner.MaxTokens || profile.ContextWindow()-f.cfg.Roles.Reasoner.MaxTokens < 1024 {
+		return fmt.Errorf("llm: model context window must reserve output plus at least 1024 input tokens")
+	}
 	f.cfg.Roles.Reasoner.Model = profile.ID
 	f.cfg.Roles.Reasoner.Thinking = profile.Thinking
+	f.contextWindowTokens = profile.ContextWindow()
 	f.cached = nil
 	return nil
 }
@@ -79,6 +91,19 @@ func (f *Factory) Validate() error {
 func (f *Factory) Build() (model.ToolCallingChatModel, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.buildLocked()
+}
+
+// buildForDiagnosis snapshots the client and its window under the same lock;
+// a concurrent model switch must not pair the old client with new limits.
+func (f *Factory) buildForDiagnosis() (model.ToolCallingChatModel, int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	client, err := f.buildLocked()
+	return client, f.contextWindowTokens - f.cfg.Roles.Reasoner.MaxTokens - 512, err
+}
+
+func (f *Factory) buildLocked() (model.ToolCallingChatModel, error) {
 	if f.cached != nil {
 		return f.cached, nil
 	}

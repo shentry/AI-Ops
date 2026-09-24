@@ -4,7 +4,10 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"regexp"
 	"strings"
@@ -42,8 +45,9 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Port      int    `yaml:"port"`
-	AuthToken string `yaml:"auth_token"`
+	ListenAddr string `yaml:"listen_addr"`
+	Port       int    `yaml:"port"`
+	AuthToken  string `yaml:"auth_token"`
 }
 
 type MySQLConfig struct {
@@ -58,8 +62,20 @@ type LLMConfig struct {
 // ModelProfile is one selectable model from the server-owned allowlist. The
 // endpoint and API key remain role configuration, never browser input.
 type ModelProfile struct {
-	ID       string         `yaml:"id"`
-	Thinking ThinkingConfig `yaml:"thinking"`
+	ID                  string         `yaml:"id"`
+	Thinking            ThinkingConfig `yaml:"thinking"`
+	ContextWindowTokens int            `yaml:"context_window_tokens"`
+}
+
+// DefaultContextWindowTokens is an application fallback for unspecified models,
+// not a claim about any provider's actual capacity. Set each profile explicitly.
+const DefaultContextWindowTokens = 131072
+
+func (p ModelProfile) ContextWindow() int {
+	if p.ContextWindowTokens == 0 {
+		return DefaultContextWindowTokens
+	}
+	return p.ContextWindowTokens
 }
 
 type LLMRoles struct {
@@ -96,9 +112,17 @@ type CorrelateConfig struct {
 }
 
 type DiagnoseConfig struct {
-	Budget        DiagnoseBudget    `yaml:"budget"`
-	SeverityRoute map[string]string `yaml:"severity_route"`
-	Evidence      EvidenceConfig    `yaml:"evidence"`
+	Budget        DiagnoseBudget     `yaml:"budget"`
+	SeverityRoute map[string]string  `yaml:"severity_route"`
+	Evidence      EvidenceConfig     `yaml:"evidence"`
+	Verification  VerificationConfig `yaml:"verification"`
+}
+
+// VerificationConfig 控制独立恢复验证的调度，不复用证据采集超时。
+type VerificationConfig struct {
+	IntervalSeconds int `yaml:"interval_seconds"`
+	WindowSeconds   int `yaml:"window_seconds"`
+	TimeoutSeconds  int `yaml:"timeout_seconds"`
 }
 
 // EvidenceConfig 是 D07 证据采集的数据源配置。地址类字段全部可空：
@@ -120,6 +144,10 @@ type DiagnoseBudget struct {
 	LightSteps int `yaml:"light_steps"`
 }
 
+func DefaultDiagnoseBudget() DiagnoseBudget {
+	return DiagnoseBudget{FullSteps: 32, LightSteps: 16}
+}
+
 type MemoryConfig struct {
 	TTLSeconds         int  `yaml:"ttl_seconds"`
 	OnlyHighConfidence bool `yaml:"only_high_confidence"`
@@ -132,8 +160,6 @@ type ApprovalConfig struct {
 	AutoExecuteL2 bool `yaml:"auto_execute_l2"`
 	// DryRun 为真时 L2 只演练不真实执行（执行层检查）。
 	DryRun bool `yaml:"dry_run"`
-	// VerifyDelaySeconds 是执行后 Verify 的复查延迟。
-	VerifyDelaySeconds int `yaml:"verify_delay_seconds"`
 	// L2RateWindowMinutes / L2MaxPerWindow 是 L2 自动路径的限频护栏：
 	// 同一 target+action（同 plan_hash）在窗口内最多执行 L2MaxPerWindow 次，
 	// 超限降级审批 —— 自动路径不许无限重复同一个动作。
@@ -219,15 +245,31 @@ func Load(path string) (Config, error) {
 	}
 
 	var document yaml.Node
-	if err := yaml.Unmarshal(contents, &document); err != nil {
+	parser := yaml.NewDecoder(bytes.NewReader(contents))
+	if err := parser.Decode(&document); err != nil {
 		return Config{}, fmt.Errorf("config: parse YAML: %w", err)
+	}
+	var extra yaml.Node
+	if err := parser.Decode(&extra); err != io.EOF {
+		if err != nil {
+			return Config{}, fmt.Errorf("config: parse YAML: %w", err)
+		}
+		return Config{}, fmt.Errorf("config: only one YAML document is allowed")
 	}
 	if err := expandEnvironment(&document); err != nil {
 		return Config{}, err
 	}
-
+	if err := rejectNullListenAddr(&document); err != nil {
+		return Config{}, err
+	}
+	encoded, err := yaml.Marshal(&document)
+	if err != nil {
+		return Config{}, fmt.Errorf("config: encode expanded YAML: %w", err)
+	}
 	cfg := defaultConfig()
-	if err := document.Decode(&cfg); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(encoded))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil {
 		return Config{}, fmt.Errorf("config: decode YAML: %w", err)
 	}
 	normalizeLLMModels(&cfg)
@@ -241,7 +283,7 @@ func Load(path string) (Config, error) {
 // DSN、token、webhook 保持空，缺密钥时不能默默跑起来。
 func defaultConfig() Config {
 	return Config{
-		Server: ServerConfig{Port: 8080},
+		Server: ServerConfig{ListenAddr: "127.0.0.1", Port: 8080},
 		LLM: LLMConfig{Roles: LLMRoles{
 			Reasoner: RoleConfig{MaxTokens: 2048},
 		}},
@@ -254,7 +296,7 @@ func defaultConfig() Config {
 			MinAlerts:     1,
 		},
 		Diagnose: DiagnoseConfig{
-			Budget: DiagnoseBudget{FullSteps: 8, LightSteps: 3},
+			Budget: DefaultDiagnoseBudget(),
 			SeverityRoute: map[string]string{
 				"critical": "full",
 				"high":     "full",
@@ -269,6 +311,7 @@ func defaultConfig() Config {
 				TimeoutSeconds:    5,
 				LogMaxLines:       200,
 			},
+			Verification: VerificationConfig{IntervalSeconds: 10, WindowSeconds: 120, TimeoutSeconds: 5},
 		},
 		Memory: MemoryConfig{
 			TTLSeconds:         3600,
@@ -276,7 +319,7 @@ func defaultConfig() Config {
 			CmdHistoryInject:   5,
 		},
 		Approval: ApprovalConfig{
-			TTLMinutes: 30, DryRun: true, VerifyDelaySeconds: 30,
+			TTLMinutes: 30, DryRun: true,
 			L2RateWindowMinutes: 60, L2MaxPerWindow: 1,
 		},
 		Tools: ToolsConfig{
@@ -343,12 +386,32 @@ func expandEnvironment(node *yaml.Node) error {
 	return nil
 }
 
+// YAML null 不会覆盖 string 默认值，必须在类型解码前拒绝显式空监听地址。
+func rejectNullListenAddr(node *yaml.Node) error {
+	if node.Kind == yaml.MappingNode {
+		for i := 0; i < len(node.Content); i += 2 {
+			if node.Content[i].Value == "listen_addr" && node.Content[i+1].ShortTag() == "!!null" {
+				return fmt.Errorf("config: server.listen_addr must be a valid IP address")
+			}
+		}
+	}
+	for _, child := range node.Content {
+		if err := rejectNullListenAddr(child); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // validate 是启动前的 fail-fast 关口。
 // 数值边界一律在这里挡住：0 或负数会在运行时变成"立即超时"、"审批立即过期"、
-// "跳过 Verify"这类静默失效行为 —— 那时候没人看得出是配置写错了。
+// "验证窗口失效"这类静默失效行为 —— 那时候没人看得出是配置写错了。
 func validate(cfg Config) error {
 	if strings.TrimSpace(cfg.MySQL.DSN) == "" {
 		return fmt.Errorf("config: mysql.dsn is required; set MYSQL_DSN or mysql.dsn")
+	}
+	if net.ParseIP(cfg.Server.ListenAddr) == nil {
+		return fmt.Errorf("config: server.listen_addr must be a valid IP address")
 	}
 	if cfg.Server.Port < 1 || cfg.Server.Port > 65535 {
 		return fmt.Errorf("config: server.port must be between 1 and 65535")
@@ -365,11 +428,6 @@ func validate(cfg Config) error {
 	if err := validatePositiveMinutes("approval.ttl_minutes", cfg.Approval.TTLMinutes); err != nil {
 		return err
 	}
-	// Verify 延迟允许 0（立即复查，单测和演示用），负数不允许 —— 负延迟会
-	// 静默跳过"给系统留出自愈时间"这一步。
-	if err := validateNonNegativeSeconds("approval.verify_delay_seconds", cfg.Approval.VerifyDelaySeconds); err != nil {
-		return err
-	}
 	if err := validatePositiveMinutes("approval.l2_rate_window_minutes", cfg.Approval.L2RateWindowMinutes); err != nil {
 		return err
 	}
@@ -378,6 +436,25 @@ func validate(cfg Config) error {
 	}
 	if err := validatePositiveSeconds("diagnose.evidence.timeout_seconds", cfg.Diagnose.Evidence.TimeoutSeconds); err != nil {
 		return err
+	}
+	v := cfg.Diagnose.Verification
+	if err := validatePositiveSeconds("diagnose.verification.timeout_seconds", v.TimeoutSeconds); err != nil {
+		return err
+	}
+	if err := validatePositiveSeconds("diagnose.verification.interval_seconds", v.IntervalSeconds); err != nil {
+		return err
+	}
+	if err := validatePositiveSeconds("diagnose.verification.window_seconds", v.WindowSeconds); err != nil {
+		return err
+	}
+	if v.TimeoutSeconds >= 30 {
+		return fmt.Errorf("config: diagnose.verification.timeout_seconds must be less than 30 (verification claim limit)")
+	}
+	if v.TimeoutSeconds >= v.IntervalSeconds {
+		return fmt.Errorf("config: diagnose.verification.timeout_seconds must be less than diagnose.verification.interval_seconds")
+	}
+	if v.IntervalSeconds >= v.WindowSeconds {
+		return fmt.Errorf("config: diagnose.verification.interval_seconds must be less than diagnose.verification.window_seconds")
 	}
 	if cfg.Diagnose.Evidence.LogMaxLines < 1 {
 		return fmt.Errorf("config: diagnose.evidence.log_max_lines must be at least 1")
@@ -469,6 +546,9 @@ func validateModelProfiles(cfg LLMConfig) error {
 			return fmt.Errorf("config: llm.models contains duplicate id %q", id)
 		}
 		seen[id] = struct{}{}
+		if profile.ContextWindow() <= cfg.Roles.Reasoner.MaxTokens || profile.ContextWindow()-cfg.Roles.Reasoner.MaxTokens < 1024 {
+			return fmt.Errorf("config: llm.models[%d].context_window_tokens must reserve max_tokens plus at least 1024 input tokens", index)
+		}
 		if id == selected {
 			selectedAllowed = true
 		}

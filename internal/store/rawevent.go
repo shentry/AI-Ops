@@ -197,6 +197,13 @@ func applyAlert(tx *gorm.DB, input AlertInput) (AlertApplyResult, error) {
 		last.LastSeen = input.ReceivedAt
 		return AlertApplyResult{Input: input, Dedup: DedupFull, Last: last}, nil
 	}
+	// A changed current alert also changes the scope of its existing Incident.
+	// Lock it even when the correlator will choose a different group afterward.
+	if last.IncidentID != nil {
+		if _, err := lockIncident(tx.Statement.Context, tx, *last.IncidentID); err != nil {
+			return AlertApplyResult{}, fmt.Errorf("lock incident before alert change: %w", err)
+		}
+	}
 	// 同指纹不同内容：追加一条新版本 alert，last_alert 改指到它。
 	// firing_count 用 SQL 原子自增（gorm.Expr）而不是读-改-写，并发下不丢计数。
 	if err := tx.Create(&alert).Error; err != nil {

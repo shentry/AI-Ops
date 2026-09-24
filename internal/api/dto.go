@@ -11,6 +11,7 @@ import (
 	"gorm.io/datatypes"
 
 	"oncall-agent/internal/diagnose"
+	"oncall-agent/internal/incident"
 	"oncall-agent/internal/store"
 )
 
@@ -146,19 +147,33 @@ type ProblemDTO struct {
 // ApprovalDTO omits ArgsJSON and ResultJSON. A plan hash is an immutable
 // reference, not an executable argument payload.
 type ApprovalDTO struct {
-	ID             uint64     `json:"id"`
-	IncidentID     uint64     `json:"incident_id"`
-	RunID          uint64     `json:"run_id"`
-	ToolName       string     `json:"tool_name"`
-	Reason         string     `json:"reason"`
-	PlanHash       string     `json:"plan_hash"`
-	Status         string     `json:"status"`
-	ExpiresAt      time.Time  `json:"expires_at"`
-	DecidedBy      *string    `json:"decided_by,omitempty"`
-	DecidedAt      *time.Time `json:"decided_at,omitempty"`
-	DecisionReason *string    `json:"decision_reason,omitempty"`
-	DecisionSource *string    `json:"decision_source,omitempty"`
-	CreatedAt      time.Time  `json:"created_at"`
+	ID             uint64          `json:"id"`
+	IncidentID     uint64          `json:"incident_id"`
+	RunID          uint64          `json:"run_id"`
+	ToolName       string          `json:"tool_name"`
+	Target         string          `json:"target,omitempty"`
+	Scope          string          `json:"scope,omitempty"`
+	SafetyLevel    string          `json:"safety_level,omitempty"`
+	DryRun         *bool           `json:"dry_run"`
+	Verification   VerificationDTO `json:"verification"`
+	Reason         string          `json:"reason"`
+	PlanHash       string          `json:"plan_hash"`
+	Status         string          `json:"status"`
+	ExpiresAt      time.Time       `json:"expires_at"`
+	DecidedBy      *string         `json:"decided_by,omitempty"`
+	DecidedAt      *time.Time      `json:"decided_at,omitempty"`
+	DecisionReason *string         `json:"decision_reason,omitempty"`
+	DecisionSource *string         `json:"decision_source,omitempty"`
+	CreatedAt      time.Time       `json:"created_at"`
+}
+
+// VerificationDTO exposes only task facts and a bounded, sanitised reason.
+// It never exposes the verification URL, snapshot or raw observation JSON.
+type VerificationDTO struct {
+	Status        string     `json:"status"`
+	LastCheckedAt *time.Time `json:"last_checked_at,omitempty"`
+	DeadlineAt    *time.Time `json:"deadline_at,omitempty"`
+	Detail        string     `json:"detail,omitempty"`
 }
 
 type ConversationMessageDTO struct {
@@ -266,6 +281,7 @@ type ControlRoomDTO struct {
 	FlowNodes       []FlowNodeDTO       `json:"flow_nodes"`
 	OpenProblems    []ProblemDTO        `json:"open_problems"`
 	PendingApproval *ApprovalDTO        `json:"pending_approval,omitempty"`
+	LatestAction    *ApprovalDTO        `json:"latest_action"`
 	RecentEvents    []EventDTO          `json:"recent_events"`
 }
 
@@ -364,7 +380,40 @@ func problemDTO(row store.IncidentProblem) ProblemDTO {
 }
 
 func approvalDTO(row store.Approval) ApprovalDTO {
-	return ApprovalDTO{ID: row.ID, IncidentID: row.IncidentID, RunID: row.RunID, ToolName: safeText(row.ToolName, 128), Reason: safeText(row.Reason, 2048), PlanHash: safeText(row.PlanHash, 128), Status: safeText(row.Status, 32), ExpiresAt: row.ExpiresAt.UTC(), DecidedBy: safePtr(row.DecidedBy, 128), DecidedAt: utcTimePtr(row.DecidedAt), DecisionReason: safePtr(row.DecisionReason, 2048), DecisionSource: safePtr(row.DecisionSource, 32), CreatedAt: row.CreatedAt.UTC()}
+	value := ApprovalDTO{ID: row.ID, IncidentID: row.IncidentID, RunID: row.RunID, ToolName: safeText(row.ToolName, 128), Reason: safeText(row.Reason, 2048), PlanHash: safeText(row.PlanHash, 128), Status: safeText(row.Status, 32), ExpiresAt: row.ExpiresAt.UTC(), DecidedBy: safePtr(row.DecidedBy, 128), DecidedAt: utcTimePtr(row.DecidedAt), DecisionReason: safePtr(row.DecisionReason, 2048), DecisionSource: safePtr(row.DecisionSource, 32), CreatedAt: row.CreatedAt.UTC(), Verification: VerificationDTO{Status: "unknown"}}
+	context, contextErr := incident.ParseExecutionContext(row.ExecutionContext)
+	hash, hashErr := incident.PlanHash(row.ToolName, row.ArgsJSON, row.ExecutionContext)
+	if contextErr == nil && hashErr == nil && hash == row.PlanHash {
+		target, _ := context.Target(row.ToolName, row.ArgsJSON) // PlanHash validated this binding.
+		value.Target = safeText(target.Kind+"/"+target.Name, 256)
+		value.Scope = "single_container"
+		value.SafetyLevel = context.SafetyLevel
+		value.DryRun = &context.DryRun
+		switch row.Status {
+		case "pending", "approved", "executing":
+			value.Verification.Status = "not_started"
+		case "simulated", "denied", "expired", "failed":
+			// These outcomes never queue automatic recovery verification.
+			// Failed/unknown executions still require manual checking of the target.
+			value.Verification.Status = "not_applicable"
+		case "executed":
+			// A modern successful execution must have a task; absent data is unknown.
+			value.Verification.Status = "unknown"
+		}
+	}
+	if task := row.Verification; task != nil {
+		value.Verification = VerificationDTO{Status: safeText(task.Status, 32), LastCheckedAt: utcTimePtr(task.LastCheckedAt)}
+		if !task.DeadlineAt.IsZero() {
+			value.Verification.DeadlineAt = utcTimePtr(&task.DeadlineAt)
+		}
+		var result struct {
+			Detail string `json:"detail"`
+		}
+		if json.Unmarshal(task.LastResultJSON, &result) == nil {
+			value.Verification.Detail = safeText(result.Detail, 2048)
+		}
+	}
+	return value
 }
 
 func conversationMessageDTO(row store.ConversationMessage) ConversationMessageDTO {

@@ -18,6 +18,8 @@ type fakeIncidentStore struct {
 	members     []store.IncidentMember
 	createdRun  store.AgentRun
 	createCalls int
+	request     store.RunRequest
+	requestErr  error
 }
 
 func (f *fakeIncidentStore) ListIncidents(_ context.Context, status string) ([]store.Incident, error) {
@@ -42,11 +44,15 @@ func (f *fakeIncidentStore) ListIncidentMembers(_ context.Context, incidentID ui
 	return f.members, nil
 }
 
-func (f *fakeIncidentStore) CreateAgentRun(_ context.Context, run store.AgentRun) (store.AgentRun, error) {
+func (f *fakeIncidentStore) RequestRun(_ context.Context, request store.RunRequest) (store.AgentRun, bool, error) {
 	f.createCalls++
-	run.ID = 100 + uint64(f.createCalls)
+	f.request = request
+	if f.requestErr != nil {
+		return store.AgentRun{}, false, f.requestErr
+	}
+	run := store.AgentRun{ID: 100 + uint64(f.createCalls), IncidentID: request.IncidentID, Mode: request.Mode, Status: "pending", StartedAt: request.RequestedAt}
 	f.createdRun = run
-	return run, nil
+	return run, true, nil
 }
 
 func incidentRequest(t *testing.T, api *IncidentAPI, method, path, token string) *httptest.ResponseRecorder {
@@ -131,6 +137,9 @@ func TestIncidentAPIDiagnoseCreatesPendingRun(t *testing.T) {
 	response := incidentRequest(t, api, http.MethodPost, "/api/v1/incidents/7/diagnose", "Bearer secret")
 	if response.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201", response.Code)
+	}
+	if fake.request.Trigger != store.RunTriggerManual || fake.request.RequestedAt.IsZero() || fake.request.RetryOf != nil {
+		t.Fatalf("manual admission request = %#v", fake.request)
 	}
 	// 手动重诊：pending、retry_of 为空、模式按 severity 路由。
 	if fake.createdRun.IncidentID != 7 || fake.createdRun.Mode != "full" || fake.createdRun.Status != "pending" || fake.createdRun.RetryOf != nil {

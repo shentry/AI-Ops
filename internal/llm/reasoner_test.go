@@ -104,7 +104,7 @@ const validPlanJSON = `{
   "confidence": "high",
   "evidence_refs": ["docker", "alert_snapshot"],
   "plan": {
-    "action": "restart_container",
+    "action": "docker_restart",
     "target": {"kind": "container", "name": "sub2api"},
     "reason": "进程退出且无配置错误迹象",
     "confidence": "high",
@@ -167,7 +167,7 @@ func TestReasonerDiagnoseStructuredOutput(t *testing.T) {
 	if result.RCA == "" || result.Confidence != "high" || len(result.EvidenceRefs) != 2 {
 		t.Fatalf("result = %+v", result)
 	}
-	if result.Plan.Action != "restart_container" || result.Plan.Target.Name != "sub2api" || result.Plan.Risk != "low" {
+	if result.Plan.Action != "docker_restart" || result.Plan.Target.Name != "sub2api" || result.Plan.Risk != "low" {
 		t.Fatalf("plan = %+v", result.Plan)
 	}
 	if result.TokensIn != 120 || result.TokensOut != 45 {
@@ -476,5 +476,90 @@ func TestReasonerNormalizesEmptyToolArgumentPlaceholder(t *testing.T) {
 	}
 	if len(result.Steps) != 1 || result.Steps[0].Err != "" {
 		t.Fatalf("steps = %+v", result.Steps)
+	}
+}
+
+// A model that keeps requesting evidence must still get a final answer turn
+// inside the existing graph budget (model + tools + model).
+func TestReasonerReservesFinalAnswerWithinBudget(t *testing.T) {
+	for _, steps := range []int{1, 2, 3, 8} {
+		t.Run(fmt.Sprint(steps), func(t *testing.T) {
+			fake := newFakeOpenAIServer(t, func(call int, body map[string]any) map[string]any {
+				if body["tool_choice"] == "none" {
+					return chatResponse(validPlanJSON, 10, 5)
+				}
+				return toolCallResponse(fmt.Sprint(call), tools.ToolPromSeriesMeta, `{"match":"up"}`)
+			})
+			r := testReasoner(t, fake.server.URL, stubLLMRegistry(t))
+			r.budget.LightSteps = steps
+			result, err := r.Diagnose(context.Background(), "evidence", "light")
+			if err != nil {
+				t.Fatalf("Diagnose() = %v", err)
+			}
+			wantCalls := (steps + 1) / 2
+			if got := int(fake.requests.Load()); got != wantCalls || len(result.Steps) != wantCalls-1 {
+				t.Fatalf("calls=%d tools=%d, want %d/%d", got, len(result.Steps), wantCalls, wantCalls-1)
+			}
+		})
+	}
+}
+
+func TestReasonerRejectsFreeTextAction(t *testing.T) {
+	fake := newFakeOpenAIServer(t, func(call int, body map[string]any) map[string]any {
+		return chatResponse(strings.Replace(validPlanJSON, `"docker_restart"`, `"提高内存或扩容"`, 1), 10, 5)
+	})
+	r := testReasoner(t, fake.server.URL, stubLLMRegistry(t))
+	if _, err := r.Diagnose(context.Background(), "evidence", "light"); err == nil {
+		t.Fatal("free-text action accepted")
+	}
+	if fake.requests.Load() != 2 {
+		t.Fatal("invalid action must use the existing single contract retry")
+	}
+}
+
+func TestReasonerFinalTurnRejectsMoreTools(t *testing.T) {
+	fake := newFakeOpenAIServer(t, func(call int, body map[string]any) map[string]any {
+		return toolCallResponse(fmt.Sprint(call), tools.ToolPromSeriesMeta, `{"match":"up"}`)
+	})
+	r := testReasoner(t, fake.server.URL, stubLLMRegistry(t))
+	result, err := r.Diagnose(context.Background(), "evidence", "light")
+	if err == nil || !strings.Contains(err.Error(), "evidence budget ended") {
+		t.Fatalf("error=%v, want tool budget rejection", err)
+	}
+	if result == nil || len(result.Steps) != 1 || result.Plan.Action != "" || result.TokensIn != 20 || fake.requests.Load() != 2 {
+		t.Fatalf("partial=%+v requests=%d", result, fake.requests.Load())
+	}
+}
+
+func TestReasonerBatchToolsPreservesEveryStep(t *testing.T) {
+	const batchSize = 8
+	fake := newFakeOpenAIServer(t, func(call int, body map[string]any) map[string]any {
+		if call > 1 {
+			if body["tool_choice"] != "none" {
+				t.Error("batch must count as one tool round")
+			}
+			return chatResponse(validPlanJSON, 10, 5)
+		}
+		response := toolCallResponse("unused", tools.ToolPromSeriesMeta, `{"match":"up"}`)
+		calls := make([]map[string]any, 0, batchSize)
+		for i := 0; i < batchSize; i++ {
+			calls = append(calls, map[string]any{"id": fmt.Sprint(i), "type": "function", "function": map[string]any{
+				"name": tools.ToolPromSeriesMeta, "arguments": fmt.Sprintf(`{"match":"metric_%d"}`, i),
+			}})
+		}
+		response["choices"].([]map[string]any)[0]["message"].(map[string]any)["tool_calls"] = calls
+		return response
+	})
+	r := testReasoner(t, fake.server.URL, stubLLMRegistry(t))
+	result, err := r.Diagnose(context.Background(), "evidence", "light")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string]bool)
+	for _, step := range result.Steps {
+		seen[step.Input] = true
+	}
+	if len(result.Steps) != batchSize || len(seen) != batchSize {
+		t.Fatalf("recorded %d steps (%d distinct), want %d", len(result.Steps), len(seen), batchSize)
 	}
 }

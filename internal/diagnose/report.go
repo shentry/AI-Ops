@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"oncall-agent/internal/incident"
 	"oncall-agent/internal/notify"
 )
 
@@ -30,21 +31,43 @@ func (r *NotifyReporter) NotifyDiagnosis(ctx context.Context, report DiagnosisRe
 		"decision":        report.Decision,
 		"overridden":      report.Overridden,
 		"guard_note":      report.GuardNote,
-		"plan_action":     report.Plan.Action,
-		"plan_target":     fmt.Sprintf("%s/%s", report.Plan.Target.Kind, report.Plan.Target.Name),
-		"plan_reason":     report.Plan.Reason,
 		"policy_decision": report.PolicyDecision,
-		"plan_hash":       report.PlanHash,
 		"base_url":        r.BaseURL,
 	}
 	notification := notify.Notification{
 		Kind:       notify.NotificationDiagnosisCompleted,
 		IncidentID: report.IncidentID,
 		RunID:      &runID,
-		ApprovalID: report.ApprovalID,
 		Title:      "诊断报告",
 		Summary:    report.RCA,
 		Payload:    payload,
+	}
+	if a := report.Approval; a != nil {
+		snapshot, err := incident.ParseExecutionContext(a.ExecutionContext)
+		if err != nil {
+			return fmt.Errorf("notify: invalid approval snapshot: %w", err)
+		}
+		hash, err := incident.PlanHash(a.ToolName, a.ArgsJSON, a.ExecutionContext)
+		if err != nil || hash != a.PlanHash || a.ID == 0 {
+			return fmt.Errorf("notify: approval content is not a committed immutable snapshot")
+		}
+		target, err := snapshot.Target(a.ToolName, a.ArgsJSON)
+		if err != nil {
+			return err
+		}
+		payload["action"], payload["tool_name"] = a.ToolName, a.ToolName
+		payload["target"], payload["scope"] = target.Kind+"/"+target.Name, "single_container"
+		payload["safety_level"], payload["dry_run"] = snapshot.SafetyLevel, snapshot.DryRun
+		payload["reason"], payload["plan_hash"] = a.Reason, a.PlanHash
+		payload["approval_status"], payload["expires_at"] = a.Status, a.ExpiresAt.UTC().Format(time.RFC3339)
+		if a.Status == "pending" {
+			notification.ApprovalID = &a.ID
+			notification.Kind = notify.NotificationApprovalRequired
+		}
+	} else {
+		payload["plan_action"] = report.Plan.Action
+		payload["plan_target"] = fmt.Sprintf("%s/%s", report.Plan.Target.Kind, report.Plan.Target.Name)
+		payload["plan_reason"] = report.Plan.Reason
 	}
 	var err error
 	for attempt := range 3 {

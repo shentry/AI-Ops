@@ -12,6 +12,7 @@ import (
 	"gorm.io/gorm/clause"
 
 	"oncall-agent/internal/eventlog"
+	"oncall-agent/internal/incident"
 )
 
 // approval 审批单生命周期：创建、人工/系统裁决、过期清理、查询。
@@ -22,7 +23,7 @@ func (db *DB) ListIncidentApprovals(ctx context.Context, incidentID uint64, stat
 	if incidentID == 0 {
 		return nil, errors.New("store: approval incident is required")
 	}
-	query := db.WithContext(ctx).Where("incident_id = ?", incidentID)
+	query := db.WithContext(ctx).Preload("Verification").Where("incident_id = ?", incidentID)
 	if strings.TrimSpace(status) != "" {
 		query = query.Where("status = ?", status)
 	}
@@ -53,6 +54,13 @@ func validateApprovalCreate(approval Approval) error {
 	}
 	if !json.Valid(approval.ArgsJSON) {
 		return errors.New("store: approval args must be valid JSON")
+	}
+	if strings.TrimSpace(approval.Reason) == "" || !approval.ExpiresAt.After(approval.CreatedAt) {
+		return errors.New("store: approval reason and valid expiry are required")
+	}
+	hash, err := incident.PlanHash(approval.ToolName, approval.ArgsJSON, approval.ExecutionContext)
+	if err != nil || hash != approval.PlanHash {
+		return errors.New("store: approval execution snapshot is invalid")
 	}
 	return nil
 }
@@ -101,7 +109,7 @@ func appendApprovalCreatedEvent(ctx context.Context, tx *gorm.DB, approval Appro
 
 // decideApprovalInTx 执行带行锁的 pending + expires_at CAS，并追加决定事件。
 // 调用方必须已经校验参数；所有修改和事件写入都在 tx 中完成。
-func decideApprovalInTx(ctx context.Context, tx *gorm.DB, id uint64, status, decidedBy, decisionReason, decisionSource string, now time.Time) (Approval, error) {
+func decideApprovalInTx(ctx context.Context, tx *gorm.DB, id uint64, status, expectedPlanHash, decidedBy, decisionReason, decisionSource string, now time.Time) (Approval, error) {
 	var approval Approval
 	query := tx.WithContext(ctx).
 		Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -113,6 +121,10 @@ func decideApprovalInTx(ctx context.Context, tx *gorm.DB, id uint64, status, dec
 		return Approval{}, fmt.Errorf("store: lock approval: %w", query.Error)
 	}
 	if approval.Status != "pending" || !approval.ExpiresAt.After(now) {
+		return Approval{}, ErrApprovalConflict
+	}
+	hash, err := incident.PlanHash(approval.ToolName, approval.ArgsJSON, approval.ExecutionContext)
+	if err != nil || expectedPlanHash == "" || hash != approval.PlanHash || hash != expectedPlanHash {
 		return Approval{}, ErrApprovalConflict
 	}
 
@@ -159,78 +171,10 @@ func decideApprovalInTx(ctx context.Context, tx *gorm.DB, id uint64, status, dec
 	return approval, nil
 }
 
-// CreateApproval 落一条 pending 审批单，并在同一事务写 approval.created。
-// 绑定 incident/run/tool/args/plan_hash 与过期时间 —— 审批通过的是"这份计划"，
-// 不是某个模糊意图（GC-13）。
-func (db *DB) CreateApproval(ctx context.Context, approval Approval) (Approval, error) {
-	if err := validateApprovalCreate(approval); err != nil {
-		return Approval{}, err
-	}
-	approval.Status = "pending"
-	approval.DecidedBy = nil
-	approval.DecidedAt = nil
-	approval.DecisionReason = nil
-	approval.DecisionSource = nil
-	approval.ResultJSON = nil
-	approval.CreatedAt = approval.CreatedAt.UTC()
-	approval.ExpiresAt = approval.ExpiresAt.UTC()
-	if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.WithContext(ctx).Create(&approval).Error; err != nil {
-			return fmt.Errorf("store: create approval: %w", err)
-		}
-		if err := appendApprovalCreatedEvent(ctx, tx, approval); err != nil {
-			return err
-		}
-		return nil
-	}); err != nil {
-		return Approval{}, err
-	}
-	return approval, nil
-}
-
-// CreateSystemApprovedApproval 原子创建并系统批准一张审批单。
-// approval.created、approval.approved 与两次状态写入必须同一事务提交。
-func (db *DB) CreateSystemApprovedApproval(ctx context.Context, approval Approval, decidedBy, decisionReason, decisionSource string, now time.Time) (Approval, error) {
-	if err := validateApprovalCreate(approval); err != nil {
-		return Approval{}, err
-	}
-	now = now.UTC()
-	if err := validateApprovalDecision("approved", decidedBy, decisionSource, now); err != nil {
-		return Approval{}, err
-	}
-	approval.Status = "pending"
-	approval.DecidedBy = nil
-	approval.DecidedAt = nil
-	approval.DecisionReason = nil
-	approval.DecisionSource = nil
-	approval.ResultJSON = nil
-	approval.CreatedAt = approval.CreatedAt.UTC()
-	approval.ExpiresAt = approval.ExpiresAt.UTC()
-	var decided Approval
-	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.WithContext(ctx).Create(&approval).Error; err != nil {
-			return fmt.Errorf("store: create system approval: %w", err)
-		}
-		if err := appendApprovalCreatedEvent(ctx, tx, approval); err != nil {
-			return err
-		}
-		var err error
-		decided, err = decideApprovalInTx(ctx, tx, approval.ID, "approved", decidedBy, decisionReason, decisionSource, now)
-		return err
-	})
-	if err != nil {
-		if errors.Is(err, ErrApprovalNotFound) || errors.Is(err, ErrApprovalConflict) {
-			return Approval{}, err
-		}
-		return Approval{}, fmt.Errorf("store: create system approval: %w", err)
-	}
-	return decided, nil
-}
-
 // GetApproval 按 id 取审批单。
 func (db *DB) GetApproval(ctx context.Context, id uint64) (Approval, error) {
 	var approval Approval
-	err := db.WithContext(ctx).First(&approval, id).Error
+	err := db.WithContext(ctx).Preload("Verification").First(&approval, id).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return Approval{}, ErrApprovalNotFound
 	}
@@ -243,7 +187,7 @@ func (db *DB) GetApproval(ctx context.Context, id uint64) (Approval, error) {
 // DecideApproval 以 pending + expires_at 为 CAS 条件决定审批，并在同一事务
 // 写入 decided_at/reason/source 与 approval.approved/denied 事件。冲突不会覆盖
 // 原操作者、时间或原因。
-func (db *DB) DecideApproval(ctx context.Context, id uint64, status, decidedBy, decisionReason, decisionSource string, now time.Time) (Approval, error) {
+func (db *DB) DecideApproval(ctx context.Context, id uint64, status, expectedPlanHash, decidedBy, decisionReason, decisionSource string, now time.Time) (Approval, error) {
 	if err := validateApprovalDecision(status, decidedBy, decisionSource, now); err != nil {
 		return Approval{}, err
 	}
@@ -251,7 +195,7 @@ func (db *DB) DecideApproval(ctx context.Context, id uint64, status, decidedBy, 
 	var decided Approval
 	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var err error
-		decided, err = decideApprovalInTx(ctx, tx, id, status, decidedBy, decisionReason, decisionSource, now)
+		decided, err = decideApprovalInTx(ctx, tx, id, status, expectedPlanHash, decidedBy, decisionReason, decisionSource, now)
 		return err
 	})
 	if err != nil {
@@ -331,7 +275,7 @@ func (db *DB) ExpireApprovals(ctx context.Context, now time.Time) (int64, error)
 
 // ListApprovals 按状态过滤列出审批单，id 倒序稳定排序。
 func (db *DB) ListApprovals(ctx context.Context, status string) ([]Approval, error) {
-	query := db.WithContext(ctx).Model(&Approval{})
+	query := db.WithContext(ctx).Preload("Verification").Model(&Approval{})
 	if status != "" {
 		query = query.Where("status = ?", status)
 	}
@@ -344,7 +288,7 @@ func (db *DB) ListApprovals(ctx context.Context, status string) ([]Approval, err
 
 // ListApprovalsPage 是审批列表的分页入口，缺省 20，最大 100。
 func (db *DB) ListApprovalsPage(ctx context.Context, status string, limit int) ([]Approval, error) {
-	query := db.WithContext(ctx).Model(&Approval{})
+	query := db.WithContext(ctx).Preload("Verification").Model(&Approval{})
 	if status != "" {
 		query = query.Where("status = ?", status)
 	}
@@ -353,4 +297,33 @@ func (db *DB) ListApprovalsPage(ctx context.Context, status string, limit int) (
 		return nil, fmt.Errorf("store: list approvals page: %w", err)
 	}
 	return approvals, nil
+}
+
+// insertApproval publishes a prepared draft only from the diagnosis transaction.
+func insertApproval(ctx context.Context, tx *gorm.DB, row Approval) (Approval, error) {
+	if err := validateApprovalCreate(row); err != nil {
+		return Approval{}, err
+	}
+	if row.Status != "pending" && row.Status != "approved" {
+		return Approval{}, errors.New("store: invalid prepared approval status")
+	}
+	if row.Status == "approved" && (row.DecidedBy == nil || *row.DecidedBy != "system:auto_l2" || row.DecisionSource == nil || *row.DecisionSource != "system" || row.DecidedAt == nil) {
+		return Approval{}, errors.New("store: automatic approval requires system decision metadata")
+	}
+	if row.Status == "pending" && (row.DecidedBy != nil || row.DecidedAt != nil || row.DecisionSource != nil) {
+		return Approval{}, errors.New("store: pending approval cannot have a decision")
+	}
+	row.Verification = nil
+	if err := tx.WithContext(ctx).Omit("Verification").Create(&row).Error; err != nil {
+		return Approval{}, err
+	}
+	if err := appendApprovalCreatedEvent(ctx, tx, row); err != nil {
+		return Approval{}, err
+	}
+	if row.Status == "approved" {
+		if err := appendApprovalEvent(ctx, tx, row, eventlog.EventApprovalApproved, "approved", "approval approved by system", *row.DecidedAt); err != nil {
+			return Approval{}, err
+		}
+	}
+	return row, nil
 }

@@ -21,11 +21,14 @@ type fakeApprovalService struct {
 	listStatus     string
 	getID          uint64
 	getErr         error
+	planHash       string
+	row            store.Approval
 }
 
-func (f *fakeApprovalService) Decide(_ context.Context, id uint64, approve bool, decidedBy, decisionReason, decisionSource string) (store.Approval, error) {
+func (f *fakeApprovalService) Decide(_ context.Context, id uint64, approve bool, expectedPlanHash, decidedBy, decisionReason, decisionSource string) (store.Approval, error) {
 	f.decidedIDs = append(f.decidedIDs, id)
 	f.approver = approve
+	f.planHash = expectedPlanHash
 	f.operator = decidedBy
 	f.decisionReason = decisionReason
 	f.decisionSource = decisionSource
@@ -33,13 +36,18 @@ func (f *fakeApprovalService) Decide(_ context.Context, id uint64, approve bool,
 	if approve {
 		status = "approved"
 	}
-	return store.Approval{ID: id, Status: status}, f.decideErr
+	row := f.row
+	row.ID, row.Status = id, status
+	return row, f.decideErr
 }
 
 func (f *fakeApprovalService) Get(_ context.Context, id uint64) (store.Approval, error) {
 	f.getID = id
 	if f.getErr != nil {
 		return store.Approval{}, f.getErr
+	}
+	if f.row.ID != 0 {
+		return f.row, nil
 	}
 	return store.Approval{ID: id, Status: "pending"}, nil
 }
@@ -50,7 +58,7 @@ func (f *fakeApprovalService) List(_ context.Context, status string) ([]store.Ap
 }
 func approvalRequest(t *testing.T, api *ApprovalAPI, method, path, token, operator string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(method, path, nil)
+	req := httptest.NewRequest(method, path, strings.NewReader(`{"plan_hash":"expected-snapshot","reason":""}`))
 	if token != "" {
 		req.Header.Set("Authorization", token)
 	}
@@ -85,13 +93,13 @@ func TestApprovalAPIAuthAndParams(t *testing.T) {
 }
 
 func TestApprovalAPIDecide(t *testing.T) {
-	svc := &fakeApprovalService{}
+	svc := &fakeApprovalService{row: completeApproval(t)}
 	api := NewApprovalAPI(svc, "secret", nil)
 	resp := approvalRequest(t, api, http.MethodPost, "/api/v1/approvals/7/approve", "Bearer secret", "ops-li")
 	if resp.Code != http.StatusOK {
 		t.Fatalf("approve = %d, want 200", resp.Code)
 	}
-	if len(svc.decidedIDs) != 1 || svc.decidedIDs[0] != 7 || !svc.approver || svc.operator != "ops-li" || svc.decisionReason != "" || svc.decisionSource != "api" {
+	if len(svc.decidedIDs) != 1 || svc.decidedIDs[0] != 7 || !svc.approver || svc.operator != "ops-li" || svc.decisionReason != "" || svc.decisionSource != "api" || svc.planHash != "expected-snapshot" {
 		t.Fatalf("svc state = %+v", svc)
 	}
 
@@ -134,14 +142,60 @@ func TestApprovalAPIList(t *testing.T) {
 func TestApprovalAPIAllowsAnonymousConsoleDecision(t *testing.T) {
 	svc := &fakeApprovalService{}
 	api := NewApprovalAPI(svc, "secret", NewConsole())
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/approvals/11/approve", strings.NewReader(`{"reason":"public console"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/approvals/11/approve", strings.NewReader(`{"plan_hash":"expected-snapshot","reason":"public console"}`))
 	req.Header.Set("Content-Type", "application/json")
 	resp := httptest.NewRecorder()
 	api.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
 		t.Fatalf("anonymous approve = %d body=%s", resp.Code, resp.Body.String())
 	}
-	if svc.operator != "anonymous" || svc.decisionSource != "web" || svc.decisionReason != "public console" {
+	if svc.operator != "anonymous" || svc.decisionSource != "web" || svc.decisionReason != "public console" || svc.planHash != "expected-snapshot" {
 		t.Fatalf("anonymous decision = %+v", svc)
+	}
+}
+
+func TestApprovalDecisionRequiresHashAndReasonBody(t *testing.T) {
+	for _, body := range []string{"", `null`, `{}`, `{"reason":"approve"}`, `{"plan_hash":"" ,"reason":""}`, `{"plan_hash":"   ","reason":""}`, `{"plan_hash":"abc"}`, `{"plan_hash":"abc","reason":null}`, `{"plan_hash":42,"reason":""}`, `{"plan_hash":"abc","reason":""} {}`, strings.Repeat(" ", 64<<10) + `{}`} {
+		for _, action := range []string{"approve", "deny"} {
+			svc := &fakeApprovalService{}
+			api := NewApprovalAPI(svc, "secret", NewConsole())
+			resp := httptest.NewRecorder()
+			api.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/api/v1/approvals/7/"+action, strings.NewReader(body)))
+			if resp.Code != http.StatusBadRequest || len(svc.decidedIDs) != 0 {
+				t.Fatalf("%s body %q: code=%d calls=%v", action, body, resp.Code, svc.decidedIDs)
+			}
+		}
+	}
+}
+
+func TestApprovalAPIPropagatesSnapshotConflicts(t *testing.T) {
+	for _, kind := range []string{"legacy", "changed_snapshot", "expired", "already_decided"} {
+		t.Run(kind, func(t *testing.T) {
+			row := completeApproval(t)
+			if kind == "legacy" {
+				row.ExecutionContext = nil
+			}
+			svc := &fakeApprovalService{row: row, decideErr: store.ErrApprovalConflict}
+			resp := approvalRequest(t, NewApprovalAPI(svc, "secret", NewConsole()), http.MethodPost, "/api/v1/approvals/7/approve", "", "")
+			if resp.Code != http.StatusConflict || svc.planHash != "expected-snapshot" || svc.getID != 0 {
+				t.Fatalf("conflict must be validated by Decide: %d service=%+v", resp.Code, svc)
+			}
+		})
+	}
+}
+
+func TestApprovalGetReturnsVerification(t *testing.T) {
+	row := completeApproval(t)
+	row.Status = "executed"
+	row.Verification = &store.VerifyTask{ApprovalID: row.ID, Status: "passed"}
+	svc := &fakeApprovalService{row: row}
+	resp := approvalRequest(t, NewApprovalAPI(svc, "secret", NewConsole()), http.MethodGet, "/api/v1/approvals/7", "", "")
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"verification":{"status":"passed"`) {
+		t.Fatalf("GET: %d %s", resp.Code, resp.Body.String())
+	}
+	for _, forbidden := range []string{"base_url", "private-target.invalid", "args_json", "execution_context"} {
+		if strings.Contains(resp.Body.String(), forbidden) {
+			t.Fatalf("leaked %s", forbidden)
+		}
 	}
 }

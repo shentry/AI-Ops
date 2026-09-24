@@ -5,8 +5,10 @@ go 1.24
 require (
 	github.com/cloudwego/eino v0.9.15
 	github.com/cloudwego/eino-ext/components/model/openai v0.1.13
+	github.com/go-sql-driver/mysql v1.8.1
 	github.com/gogf/gf/v2 v2.10.2
 	github.com/jackc/pgx/v5 v5.7.2
+	github.com/larksuite/oapi-sdk-go/v3 v3.9.10
 	github.com/redis/go-redis/v9 v9.7.0
 	gopkg.in/yaml.v3 v3.0.1
 	gorm.io/datatypes v1.2.7
@@ -35,7 +37,6 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
-	github.com/go-sql-driver/mysql v1.8.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/goph/emperror v0.17.2 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
@@ -47,7 +48,6 @@ require (
 	github.com/jinzhu/now v1.1.5 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.9 // indirect
-	github.com/larksuite/oapi-sdk-go/v3 v3.9.10 // indirect
 	github.com/magiconair/properties v1.8.10 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
