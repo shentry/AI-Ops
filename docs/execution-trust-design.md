@@ -14,9 +14,7 @@
 | 文档 | 职责 |
 |---|---|
 | [current-architecture.md](current-architecture.md) | 当前系统全貌；涉及最新重构时，以源码为准 |
-| [ai-opus-system-design.md](ai-opus-system-design.md) | 早期 V1 设计基线，不据其进度描述判断现状 |
 | [design-review.md](design-review.md) | 已发现的问题与历史取舍，不直接等同于本次改造方案 |
-| [web-feishu-control-room-design.md](web-feishu-control-room-design.md) | Web/飞书控制室原始设计 |
 | 本文 | 下一阶段采用什么方案、改哪里、如何迁移、如何验收 |
 
 ### 1.2 保留的前提
