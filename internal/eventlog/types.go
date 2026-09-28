@@ -43,6 +43,8 @@ const (
 	EventVerifyStable         EventType = "verify.stable"
 	EventVerifyRecurred       EventType = "verify.recurred"
 	EventReviewRecorded       EventType = "review.recorded"
+	EventKnowledgeAdded       EventType = "knowledge.added"
+	EventKnowledgeDeleted     EventType = "knowledge.deleted"
 	EventRetryScheduled       EventType = "retry.scheduled"
 	EventEscalationRequired   EventType = "escalation.required"
 	EventNotificationSent     EventType = "notification.sent"

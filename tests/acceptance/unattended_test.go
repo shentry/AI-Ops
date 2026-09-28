@@ -173,7 +173,7 @@ func TestUnattendedRestartThroughRealDockerAndMySQL(t *testing.T) {
 		t.Fatalf("run claim %v %v", ok, err)
 	}
 	builder := diagnose.NewEvidenceBuilder(db, []diagnose.Collector{diagnose.NewDockerInspectCollector(service, registry), diagnose.NewSub2APIHealthCollector(service, config.EvidenceConfig{TimeoutSeconds: 1}), diagnose.NewSub2APIMetricsCollector(registry)})
-	pipeline := diagnose.NewPipeline(db, builder, plannedRestart{name: name}, approval.NewPolicy(authority, registry, time.Minute, db), approval.NewService(db), quietReport{}, nil, 0)
+	pipeline := diagnose.NewPipeline(db, builder, plannedRestart{name: name}, approval.NewPolicy(authority, registry, time.Minute, db), approval.NewService(db), quietReport{}, nil, 0, nil)
 	if err := pipeline.Run(ctx, run); err != nil {
 		t.Fatal(err)
 	}

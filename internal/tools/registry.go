@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -22,6 +24,16 @@ type ParamSpec struct {
 	Name        string
 	Description string
 	Required    bool
+}
+
+// IntArg 是整数参数的唯一解析：schema 把参数都声明成字符串，模型写数字或
+// 数字字符串都会出现，两种都接。缺省、null 和空串返回 0。
+func IntArg(raw json.RawMessage) (int, error) {
+	text := strings.Trim(strings.TrimSpace(string(raw)), `"`)
+	if text == "" || text == "null" {
+		return 0, nil
+	}
+	return strconv.Atoi(text)
 }
 
 // ToolSpec 声明一个只读工具的完整契约：没有注册的工具不存在。

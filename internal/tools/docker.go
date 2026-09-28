@@ -242,9 +242,9 @@ func (c *DockerClient) Inspect(ctx context.Context, name string) (ContainerInspe
 }
 
 type dockerLogsArgs struct {
-	Name  string `json:"name"`
-	Tail  int    `json:"tail"`
-	Since string `json:"since"` // RFC3339
+	Name  string          `json:"name"`
+	Tail  json.RawMessage `json:"tail"`
+	Since string          `json:"since"` // RFC3339
 }
 
 // logs 读受限日志：tail 封顶、since 限窗口、绝不 follow，按模式聚合后返回。
@@ -258,8 +258,12 @@ func (c *DockerClient) logs(maxLogLines int) Handler {
 		if err := validContainerName(args.Name); err != nil {
 			return "", err
 		}
-		if args.Tail <= 0 || args.Tail > maxLogLines {
-			args.Tail = maxLogLines
+		tail, err := IntArg(args.Tail)
+		if err != nil {
+			return "", fmt.Errorf("tail must be an integer: %w", err)
+		}
+		if tail <= 0 || tail > maxLogLines {
+			tail = maxLogLines
 		}
 		// timestamps=1：每行带 Docker 记录的 RFC3339Nano 时间，
 		// 聚合日志模式时才有可信的首次/末次出现时间。
@@ -267,7 +271,7 @@ func (c *DockerClient) logs(maxLogLines int) Handler {
 			"stdout":     {"1"},
 			"stderr":     {"1"},
 			"timestamps": {"1"},
-			"tail":       {fmt.Sprintf("%d", args.Tail)},
+			"tail":       {fmt.Sprintf("%d", tail)},
 		}
 		if strings.TrimSpace(args.Since) != "" {
 			since, err := time.Parse(time.RFC3339, args.Since)

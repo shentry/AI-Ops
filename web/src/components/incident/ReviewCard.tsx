@@ -1,7 +1,7 @@
-import { ClipboardCheck } from "lucide-react";
+import { BookPlus, ClipboardCheck } from "lucide-react";
 import { useEffect, useState } from "react";
 
-import { ApiError, Review, ReviewInput, addReview, getReviews } from "../../api";
+import { ApiError, Review, ReviewInput, addIncidentKnowledge, addReview, getReviews } from "../../api";
 import { relativeTime, timeLabel } from "../../labels";
 import { Badge, Button, FieldLabel, Panel, SelectInput, TextArea, TextInput } from "../ui";
 
@@ -41,6 +41,21 @@ export function ReviewCard({ incidentID, runID, approvalID, readOnly }: ReviewCa
   }, [incidentID]);
 
   const target = subject === "action" ? approvalID : runID;
+  // Same rule as the server: only a confirmed root cause becomes knowledge.
+  const confirmed = reviews.some((review) => review.verdict === "correct" || (review.verdict !== "unknown" && review.root_cause.trim() !== ""));
+  const addToKnowledge = async () => {
+    if (busy || readOnly) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      await addIncidentKnowledge(incidentID);
+      setMessage("已加入知识库：诊断时模型可以用 knowledge_search 检索到这次复盘。");
+    } catch (cause) {
+      setMessage(cause instanceof ApiError ? cause.message : "没有加入知识库");
+    } finally {
+      setBusy(false);
+    }
+  };
   const submit = async () => {
     if (busy || readOnly || !target) return;
     setBusy(true);
@@ -63,7 +78,12 @@ export function ReviewCard({ incidentID, runID, approvalID, readOnly }: ReviewCa
   };
 
   return (
-    <Panel title="复盘标注" icon={<ClipboardCheck size={14} />} meta={<span className="tabular">{reviews.length} 条</span>}>
+    <Panel title="复盘标注" icon={<ClipboardCheck size={14} />} meta={<span className="tabular">{reviews.length} 条</span>}
+      actions={!readOnly && (
+        <Button size="xs" disabled={busy || !confirmed} title={confirmed ? "把最近一次确认过根因的复盘写入知识库" : "需要先有确认了根因的复盘"} onClick={() => void addToKnowledge()}>
+          <BookPlus size={13} aria-hidden="true" />加入知识库
+        </Button>
+      )}>
       {!readOnly && (
         <div className="space-y-2.5">
           <div className="grid grid-cols-2 gap-2">

@@ -1,0 +1,22 @@
+[
+  {"query": "应用连数据库提示密码不对是什么原因", "expected": ["dependencies.md#PostgreSQL 常见错误的含义"]},
+  {"query": "postgres 报 too many clients 连接满了", "expected": ["dependencies.md#PostgreSQL 常见错误的含义"]},
+  {"query": "redis 拒绝连接怎么判断是哪里的问题", "expected": ["dependencies.md#Redis 常见错误的含义"]},
+  {"query": "redis 内存满了写不进去", "expected": ["dependencies.md#Redis 常见错误的含义"]},
+  {"query": "数据库挂了能不能靠重启网关恢复", "expected": ["dependencies.md#依赖故障时的处置边界"]},
+  {"query": "pg_up 是 1 但应用还是连不上数据库", "expected": ["dependencies.md#监控方式", "dependencies.md#PostgreSQL 常见错误的含义"]},
+  {"query": "健康检查返回 ok 为什么用户请求还在失败", "expected": ["sub2api.md#健康检查的含义"]},
+  {"query": "sub2api 自己有没有 prometheus 指标", "expected": ["sub2api.md#指标从哪里来"]},
+  {"query": "错误率面板没数据是不是说明没有流量", "expected": ["monitoring.md#exporter 的 up 与服务的 up", "sub2api.md#指标从哪里来"]},
+  {"query": "怎么确认线上实际运行的是哪个版本", "expected": ["sub2api.md#版本、发布与数据库迁移", "postmortems.md#2026-09-25 运行版本与镜像标签不一致"]},
+  {"query": "回退到旧版本之前数据库要怎么处理", "expected": ["sub2api.md#版本、发布与数据库迁移"]},
+  {"query": "上游一直返回 429 限流该怎么办", "expected": ["upstream.md#错误类型怎么区分"]},
+  {"query": "什么情况下可以把一个上游账号停掉", "expected": ["upstream.md#上游隔离动作（upstream_quarantine）"]},
+  {"query": "某个分组里一个能用的账号都没有", "expected": ["upstream.md#调度模型", "postmortems.md#分组长期没有可调度账号"]},
+  {"query": "账号被临时停止调度是不是账号坏了", "expected": ["upstream.md#调度模型"]},
+  {"query": "容器重启次数和 OOM 的指标全都查不到", "expected": ["monitoring.md#容器指标依赖 cAdvisor", "postmortems.md#2026-09-28 容器指标全部缺失"]},
+  {"query": "日志丢弃告警一上线就响了", "expected": ["postmortems.md#2026-09-28 日志链路首次启动误报", "monitoring.md#日志采集范围与保留"]},
+  {"query": "容器重建之前的旧日志去哪里查", "expected": ["monitoring.md#日志采集范围与保留"]},
+  {"query": "诊断任务一直积压的告警是怎么回事", "expected": ["monitoring.md#Agent 自身的告警"]},
+  {"query": "磁盘写满时应用日志会报什么错", "expected": ["sub2api.md#常见日志模式", "dependencies.md#Redis 常见错误的含义"]}
+]

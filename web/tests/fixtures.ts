@@ -35,6 +35,7 @@ export async function openRoom(page: Page, initial = controlRoom(), role = "oper
     reviews: [] as Record<string, unknown>[],
     steps: [] as Record<string, unknown>[],
     feed: [] as Record<string, unknown>[],
+    knowledgeAdds: 0,
   };
   await page.route("**/api/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
@@ -60,6 +61,10 @@ export async function openRoom(page: Page, initial = controlRoom(), role = "oper
         return route.fulfill({ status: 201, json: { id: state.reviews.length, incident_id: 1, reviewer: "ops", created_at: "2026-08-24T12:10:00Z", ...body } });
       }
       return route.fulfill({ json: { reviews: [] } });
+    }
+    if (path.endsWith("/knowledge") && route.request().method() === "POST") {
+      state.knowledgeAdds += 1;
+      return route.fulfill({ status: 201, json: { id: 9, source: "incident", ref: "incident/1", title: "Incident #1 复盘", created_by: "ops", updated_at: "2026-08-24T12:11:00Z" } });
     }
     if (path.endsWith("/steps")) return route.fulfill({ json: { steps: state.steps } });
     if (path.endsWith("/conversation")) return route.fulfill({ json: { messages: [] } });

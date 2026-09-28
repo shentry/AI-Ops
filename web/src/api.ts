@@ -720,7 +720,7 @@ export function subscribeIncident(incidentID: number, options: IncidentStreamOpt
 		"incident.created", "incident.promoted", "incident.resolved", "run.queued", "run.started", "run.succeeded", "run.failed", "run.stalled",
 		"collector.started", "collector.completed", "collector.failed", "llm.started", "llm.tool_called", "llm.completed", "llm.failed",
 		"guard.evaluated", "guard.overridden", "policy.evaluated", "policy.degraded", "approval.created", "approval.approved", "approval.denied", "approval.expired",
-		"execution.started", "execution.completed", "execution.failed", "execution.aborted", "compensation.queued", "verify.queued", "verify.started", "verify.checked", "verify.passed", "verify.failed", "verify.inconclusive", "verify.stable", "verify.recurred", "retry.scheduled", "escalation.required", "review.recorded",
+		"execution.started", "execution.completed", "execution.failed", "execution.aborted", "compensation.queued", "verify.queued", "verify.started", "verify.checked", "verify.passed", "verify.failed", "verify.inconclusive", "verify.stable", "verify.recurred", "retry.scheduled", "escalation.required", "review.recorded", "knowledge.added", "knowledge.deleted",
 		"notification.sent", "notification.failed", "conversation.asked", "conversation.answered", "conversation.failed", "incident.event",
 	];
 	for (const eventName of eventNames) source.addEventListener(eventName, consume);
@@ -946,4 +946,69 @@ export async function getTopology(incidentID = 0): Promise<Topology> {
       return { from: text(edge.from), to: text(edge.to), type: text(edge.type) };
     }),
   };
+}
+
+// Skill is a reviewed investigation guide matched to incidents by alert name.
+export interface Skill {
+  name: string;
+  description: string;
+  alerts: string[];
+  tools: string[];
+  sha256: string;
+  body: string;
+  activations_30d: number;
+}
+
+export async function getSkills(): Promise<Skill[]> {
+  const body = object(await request<unknown>("/api/v1/skills"));
+  return list(body, "skills").map((value) => {
+    const skill = object(value);
+    return {
+      name: text(skill.name), description: text(skill.description), alerts: strings(skill.alerts), tools: strings(skill.tools),
+      sha256: text(skill.sha256), body: text(skill.body), activations_30d: number(skill.activations_30d),
+    };
+  });
+}
+
+// KnowledgeEntry is a handbook section (source repo) or a reviewed incident
+// (source incident). snippet is set in search results, body when one is read.
+export interface KnowledgeEntry {
+  id: number;
+  source: "repo" | "incident";
+  ref: string;
+  title: string;
+  created_by: string;
+  updated_at: string;
+  snippet: string;
+  body: string;
+}
+
+function toKnowledgeEntry(value: unknown): KnowledgeEntry {
+  const entry = object(value);
+  return {
+    id: number(entry.id), source: entry.source === "incident" ? "incident" : "repo", ref: text(entry.ref), title: text(entry.title),
+    created_by: text(entry.created_by), updated_at: text(entry.updated_at), snippet: text(entry.snippet), body: text(entry.body),
+  };
+}
+
+export async function searchKnowledge(query = "", source = ""): Promise<KnowledgeEntry[]> {
+  const params = new URLSearchParams();
+  if (query) params.set("q", query);
+  if (source) params.set("source", source);
+  const search = params.toString();
+  return list(await request<unknown>(`/api/v1/knowledge${search ? `?${search}` : ""}`), "entries").map(toKnowledgeEntry);
+}
+
+export async function getKnowledgeEntry(id: number): Promise<KnowledgeEntry> {
+  return toKnowledgeEntry(await request<unknown>(`/api/v1/knowledge/${id}`));
+}
+
+export async function deleteKnowledgeEntry(id: number): Promise<void> {
+  await request(`/api/v1/knowledge/${id}`, { method: "DELETE" });
+}
+
+// addIncidentKnowledge writes the incident's latest confirmed review as a
+// knowledge entry; adding it again rewrites the same entry.
+export async function addIncidentKnowledge(incidentID: number): Promise<KnowledgeEntry> {
+  return toKnowledgeEntry(await request<unknown>(`/api/v1/incidents/${incidentID}/knowledge`, { method: "POST" }));
 }

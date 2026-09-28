@@ -33,13 +33,27 @@ loki.source.docker "containers" {
   host       = "unix:///var/run/docker.sock"
   targets    = discovery.relabel.containers.output
   labels     = {}
-  forward_to = [loki.write.local.receiver]
+  forward_to = [loki.process.recent.receiver]
 }
 
 loki.source.journal "agent" {
   matches    = "_SYSTEMD_UNIT=oncall-agent.service"
   labels     = {service = "oncall-agent"}
+  forward_to = [loki.process.recent.receiver]
+}
+
+// On first start the sources read each container's whole log. Loki rejects
+// lines older than reject_old_samples_max_age (168h) with a 400 that fails the
+// whole batch, so drop them here; one hour of margin keeps an entry from aging
+// past the limit in flight. loki_write_dropped_entries_total then counts only
+// real losses (LogPipelineDropping).
+loki.process "recent" {
   forward_to = [loki.write.local.receiver]
+
+  stage.drop {
+    older_than          = "167h"
+    drop_counter_reason = "older_than_retention"
+  }
 }
 
 loki.write "local" {

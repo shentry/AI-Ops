@@ -25,6 +25,7 @@ import (
 	"oncall-agent/internal/grafana"
 	"oncall-agent/internal/incident"
 	"oncall-agent/internal/ingest"
+	"oncall-agent/internal/knowledge"
 	"oncall-agent/internal/llm"
 	"oncall-agent/internal/memory"
 	"oncall-agent/internal/metrics"
@@ -132,6 +133,18 @@ func run() error {
 		worker.Wait()
 	}()
 
+	// 排查技能与仓库手册编译进二进制：技能格式错误拒绝启动；手册同步到
+	// knowledge_entry（缺迁移 016 同样拒绝启动），与本次发布的内容一致。
+	skills, err := knowledge.LoadSkills()
+	if err != nil {
+		return fmt.Errorf("server: %w", err)
+	}
+	synced, err := knowledge.SyncRepo(ctx, db)
+	if err != nil {
+		return fmt.Errorf("server: sync knowledge (apply migration 016?): %w", err)
+	}
+	log.Printf("server: knowledge handbook %s", synced)
+
 	// 工具目录：只读工具与写动作。Prometheus 必须可用；Docker socket 缺席时
 	// 只跳过 Docker 工具和依赖它的动作，不影响其余证据段。
 	registry := tools.NewRegistry()
@@ -140,6 +153,9 @@ func run() error {
 		return fmt.Errorf("server: init prometheus client: %w", err)
 	}
 	if err := promClient.RegisterTools(registry); err != nil {
+		return err
+	}
+	if err := knowledge.RegisterTools(registry, db); err != nil {
 		return err
 	}
 	// Loki 是可选的历史日志：未配置时只剩 docker_logs 看当前容器实例。
@@ -361,7 +377,7 @@ func run() error {
 		}
 		reasoner := llm.NewReasoner(llmFactory, registry, cfg.Diagnose.Budget)
 		pipeline := diagnose.NewPipeline(db, evidenceBuilder, reasoner, policy, approvalSvc,
-			diagnose.NewNotifyReporter(notifier, notificationWebURL(cfg)), faultMemory, cfg.Memory.CmdHistoryInject)
+			diagnose.NewNotifyReporter(notifier, notificationWebURL(cfg)), faultMemory, cfg.Memory.CmdHistoryInject, skills)
 		diagnosis := diagnose.NewWorker(db, pipeline, log.Default())
 		if err := diagnosis.Start(ctx); err != nil {
 			return fmt.Errorf("server: start diagnose worker: %w", err)
@@ -432,6 +448,10 @@ func run() error {
 			server.BindHandler(route, observabilityAPI.Handle)
 		}
 		server.BindHandler("/api/v1/topology", api.NewTopologyAPI(graph, db, auth).Handle)
+		knowledgeAPI := api.NewKnowledgeAPI(skills, db, auth)
+		for _, route := range []string{"/api/v1/skills", "/api/v1/knowledge", "/api/v1/knowledge/:id", "/api/v1/incidents/:id/knowledge"} {
+			server.BindHandler(route, knowledgeAPI.Handle)
+		}
 	}
 	if feishuCallback != nil {
 		server.BindHandler("/integrations/feishu/events", feishuCallback.Handle)

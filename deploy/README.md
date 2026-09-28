@@ -1,6 +1,6 @@
 # sub2api 生产部署
 
-> 2026-09-26：无人值守修复与实际验收见 [验证记录](../docs/unattended-remediation-verification.md)。当前数据库需迁移到 015；自动规则缺少管理员、通知、业务探针或持续验证条件会被启动检查拒绝。
+> 2026-09-26：无人值守修复与实际验收见 [验证记录](../docs/unattended-remediation-verification.md)。当前数据库需迁移到 016（016 为知识库表，停服务后直接执行 `migrations/016_knowledge_entry.sql`）；自动规则缺少管理员、通知、业务探针或持续验证条件会被启动检查拒绝。
 
 对应 [自动处置方案](../docs/production-auto-remediation-plan.md) §9 与阶段 A/B/E。Agent 作为 sub2api 宿主机上的 systemd 进程运行；监控栈是独立 Compose 项目（[monitoring/](monitoring/)）。两者都不随 sub2api 发布或重启。
 
@@ -117,7 +117,7 @@ exporter 二进制来自上面的构建（`bin/sub2api-exporter`，Compose 以�
 - **Alloy**（`config.alloy`）：采集 `SUB2API_COMPOSE_PROJECT` 和本监控项目的容器日志，标签为 `service`（Compose 服务名）和 `container`；另外采集 journald 中 `oncall-agent.service` 的日志，标签为 `service=oncall-agent`。采集范围就是 `loki_query` 能读到的范围，其他容器不进入 Loki。Alloy 通过 Docker API 读日志，和 cAdvisor 一样持有 Docker socket，属于与 root 等价的权限；它不暴露端口。journald 需要持久化日志目录 `/var/log/journal`（Ubuntu 默认存在），`/etc/machine-id` 以只读方式挂载。
 - **看板**：`sub2api 服务`、`依赖与主机`、`oncall-agent 运行`、`监控栈` 四个，JSON 定义在仓库的 `internal/grafana/dashboards/`。平时直接在控制台的“监控”页查看：它原生渲染同一套定义，通过 Agent 查询 Prometheus，不依赖 Grafana 是否在线。
 - **Grafana**：数据源从 `grafana/provisioning` 加载，看板从 `internal/grafana/dashboards/` 加载，界面上不能修改，改动文件后约 30 秒生效。它用于 Explore 临时查询和日志面板。匿名访问和注册已关闭，通过 SSH 隧道访问：`ssh -L 3000:127.0.0.1:3000 <host>`。控制台里的看板随 Agent 二进制发布；监控栈这边用的是仓库里的文件，两边要用同一个版本的仓库部署。
-- 日志链路告警 `LogPipelineDropping`（Alloy 放弃发送或 Loki 拒收）和三个新抓取目标的 `MonitoringTargetDown` 都按 `layer=monitoring` 直接通知人工。超过保留期的旧日志被拒收属于预期，不计入告警：首次启动时 Alloy 会读取容器已有的日志。
+- 日志链路告警 `LogPipelineDropping`（Alloy 放弃发送或 Loki 拒收）和三个新抓取目标的 `MonitoringTargetDown` 都按 `layer=monitoring` 直接通知人工。首次启动时 Alloy 会读取容器已有的全部日志，超过保留期的行在 Alloy 内丢弃（`loki_process_dropped_lines_total`），不发给 Loki，也不计入告警。
 
 ### 告警送达与心跳
 
@@ -137,6 +137,7 @@ exporter 二进制来自上面的构建（`bin/sub2api-exporter`，Compose 以�
 4. 控制台“监控”页四个看板都有数据；Grafana 里 `sub2api 服务` 底部能看到日志。
 5. 停掉 Loki（`docker compose stop loki`）后触发一次诊断：`loki_query` 返回错误，诊断照常完成；恢复后 `LogPipelineDropping` 不应持续触发。
 6. 控制台“拓扑”页：sub2api、postgres、redis、host 为正常，upstream 为未知（它没有可声明的检查）；任一节点显示不存在时，先核对配置里的容器名。
+7. 启动日志有 `server: knowledge handbook N sections`；控制台“知识库”页的参考文档列出仓库手册，搜索“数据库密码错误”能命中 PostgreSQL 常见错误一段。
 
 从旧版本升级时，Agent 的 `config.yaml` 需删掉 `tools.logs` 和 `tools.mysql_select`（它们从未被读取，现已移除，严格配置会拒绝未知字段），并按需加上 `tools.loki` 和 `topology`。
 

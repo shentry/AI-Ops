@@ -216,7 +216,7 @@ MYSQL_DSN=... go run ./cmd/retire-approvals -apply
 
 ## 文档
 
-- [排查技能、知识库、拓扑与监控设计](docs/skills-knowledge-topology-observability-design.md)：Skills、Tool Search、知识库、拓扑、Loki/Grafana 的取舍、实施顺序与效果评估；第 1 步（监控）、第 2 步（拓扑）已实现
+- [排查技能、知识库、拓扑与监控设计](docs/skills-knowledge-topology-observability-design.md)：Skills、Tool Search、知识库、拓扑、Loki/Grafana 的取舍、实施顺序与效果评估；第 1–4 步（监控、拓扑、技能、知识库）已实现
 - [生产自动处置实施方案](docs/production-auto-remediation-plan.md)：多动作自动处置的设计、阶段与演练矩阵；实施状态见文首
 - [生产部署](deploy/README.md)：阶段 A 核对清单、systemd、监控栈、密钥、心跳与上线顺序
 - [核心问答与答辩指南](docs/project-qa.md)：面试、评审与技术答辩高频 24 问及源码解析
@@ -225,10 +225,6 @@ MYSQL_DSN=... go run ./cmd/retire-approvals -apply
 - [AWS 部署与 k6 压测报告（2026-09-17）](docs/load-test-2026-09-17.md)：受限资源下的接收/消费能力、积压、风险与复现步骤
 - [执行安全与恢复验证设计](docs/execution-trust-design.md)：原始设计与待逐项核验的验收标准，现状以源码为准
 - [执行安全升级说明](docs/execution-trust-upgrade.md)：停机、备份、旧审批退役、迁移与回退
-- [系统设计](docs/ai-opus-system-design.md)
-- [Web 控制台与飞书协同接入方案](docs/web-feishu-control-room-design.md)：实时流程、问题面板、Incident 对话、Web/飞书统一审批与回调设计；
-- [开发 SPEC](oncall-agent-开发SPEC.md)
-- 历史过程文档（14 天计划与每日实现记录）已归档在 `docs/archive/`，仅供追溯，不再随代码更新
 
 ## 安全边界
 

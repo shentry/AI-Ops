@@ -126,7 +126,7 @@ func (c *LokiClient) query(ctx context.Context, raw json.RawMessage) (string, er
 	if clamped {
 		since = until.Add(-c.maxWindow)
 	}
-	limit, err := optionalInt(args.Limit)
+	limit, err := IntArg(args.Limit)
 	if err != nil {
 		return "", fmt.Errorf("limit must be an integer: %w", err)
 	}
@@ -163,16 +163,6 @@ func (c *LokiClient) query(ctx context.Context, raw json.RawMessage) (string, er
 	}
 	header.WriteByte('\n')
 	return header.String() + aggregateLogLines(strings.Join(lines, "\n")), nil
-}
-
-// optionalInt 接受 JSON 数字或数字字符串：工具 schema 把参数都声明成字符串，
-// 模型两种写法都会出现。缺省、null 和空串返回 0。
-func optionalInt(raw json.RawMessage) (int, error) {
-	text := strings.Trim(strings.TrimSpace(string(raw)), `"`)
-	if text == "" || text == "null" {
-		return 0, nil
-	}
-	return strconv.Atoi(text)
 }
 
 type lokiEntry struct {

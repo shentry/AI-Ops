@@ -1,7 +1,14 @@
 package tools
 
 import (
+	"context"
 	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -46,5 +53,44 @@ func TestValidContainerName(t *testing.T) {
 func TestNewDockerClientRequiresSocket(t *testing.T) {
 	if _, err := NewDockerClient("/nonexistent/docker.sock"); err == nil {
 		t.Fatal("missing socket accepted")
+	}
+}
+
+// The schema declares tail a string; a number, a numeric string and an
+// oversized value are all read, and the cap still applies.
+func TestDockerLogsTailAcceptsNumberOrString(t *testing.T) {
+	// Unix socket paths are limited to ~104 bytes; t.TempDir embeds the test name.
+	dir, err := os.MkdirTemp("", "ds")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "d.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tails := make(chan string, 4)
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tails <- r.URL.Query().Get("tail")
+		fmt.Fprint(w, "2026-09-28T00:00:00Z line\n")
+	})}
+	go server.Serve(listener)
+	t.Cleanup(func() { server.Close() })
+	client, err := NewDockerClient(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := client.logs(200)
+	for args, want := range map[string]string{`{"name":"sub2api","tail":50}`: "50", `{"name":"sub2api","tail":"50"}`: "50", `{"name":"sub2api","tail":"5000"}`: "200", `{"name":"sub2api"}`: "200"} {
+		if _, err := logs(context.Background(), json.RawMessage(args)); err != nil {
+			t.Fatalf("%s: %v", args, err)
+		}
+		if got := <-tails; got != want {
+			t.Fatalf("%s: tail = %s, want %s", args, got, want)
+		}
+	}
+	if _, err := logs(context.Background(), json.RawMessage(`{"name":"sub2api","tail":"many"}`)); err == nil {
+		t.Fatal("non-numeric tail accepted")
 	}
 }

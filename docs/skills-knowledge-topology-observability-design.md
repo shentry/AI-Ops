@@ -1,6 +1,6 @@
 # 排查技能、知识库、拓扑与监控设计
 
-> 状态：第 1 步（监控）、第 2 步（拓扑）已实现，第 3–5 步待实施。编写日期：2026-09-28。
+> 状态：第 1–4 步（监控、拓扑、技能、知识库）已实现，第 5 步（Tool Search）待实施。编写日期：2026-09-28。
 >
 > 现状基线：`feat/execution-trust` 分支，结论以源码为准。Ongrid 参考固定在 `81e08b5efbe9ccd9a5781574d5f3ba10215eccac`（v0.17.2）：监控页的代码直接拷自 ongrid（见 §7.3 与 `NOTICE`，本仓库因此为 AGPL-3.0），其余部分只借鉴设计，不复制内置知识内容。
 >
@@ -83,11 +83,10 @@ flowchart LR
 
 代码归属如下，不新建多层抽象：
 
-- `internal/knowledge`：技能加载与匹配（`skills.go`）、知识条目同步与检索（`entries.go`）。它们都属于"给模型看的知识"。
+- `internal/knowledge`：技能加载与匹配（`skills.go`）、知识条目同步与检索（`entries.go`）。它们都属于"给模型看的知识"。技能与手册的 Markdown 放在它的 `skills/`、`docs/` 子目录，由这个包 `go:embed`（与 `internal/grafana/dashboards` 相同，不另建只为嵌入而存在的包）。
 - `internal/topology`：实时状态汇总与告警到节点的映射；拓扑配置的校验和其他配置一起放在 `internal/config`。
 - `internal/tools`：新增 `loki.go`、`knowledge.go`（knowledge_search／read），以及 Registry 上的 Tool Search。
 - `internal/diagnose`：新增 `collector_topology.go`，在 Guard 中增加依赖规则。
-- `skills/`、`knowledge/`：仓库内的 Markdown 内容。
 - `deploy/monitoring/`：Loki、Alloy、Grafana 的配置。
 - `internal/grafana/dashboards/`：看板 JSON，服务端编进二进制，Grafana 也从这里 provisioning。
 
@@ -95,7 +94,7 @@ flowchart LR
 
 ### 4.1 技能格式
 
-每个技能是 `skills/<name>/SKILL.md`，frontmatter 只保留必要字段：
+每个技能是 `internal/knowledge/skills/<name>/SKILL.md`，frontmatter 只保留必要字段：
 
 ```markdown
 ---
@@ -115,39 +114,36 @@ tools: [prom_instant_query, prom_series_meta, loki_query, knowledge_search]
 - 认证失败属于配置/凭据问题，action 为 none，交人工处理。
 ```
 
-启动时加载并校验，任何一项不通过都拒绝启动（fail closed）：
+技能通过 `go:embed` 编入二进制，内容版本跟随发布版本，部署时不需要额外同步文件。内容在构建时就固定了，所以校验分两处，效果等同于启动时全量校验：
 
-- `name` 唯一且为 snake_case，`description` 不能为空；
-- `alerts` 中的名称由仓库测试对照 `alerts.yml` 校验（运行时不读取 Prometheus 规则文件）；
-- `tools` 只能引用 Registry 中已注册的只读工具，技能不能声明工具实现，也不能引用 Action；
-- 正文不超过 4 KB。
-
-`skills/` 和 `knowledge/` 通过 `go:embed` 编入二进制，内容版本跟随发布版本，部署时不需要额外同步文件。
+- **启动时解析**，任何一项不通过都拒绝启动：frontmatter 只允许上面四个字段（未知字段如 `impl` 直接报错），`name` 为 snake_case 且等于目录名，`description` 与正文不能为空，正文不超过 4 KB；
+- **仓库测试**：`alerts` 必须是 `alerts.yml` 中的规则名；`tools` 必须是只读工具，测试用启用了全部可选工具的 Registry 校验，拼错或写成 Action 名都会让构建失败。启动时不按本进程的 Registry 校验，因为 `loki_query` 等工具是否注册取决于配置，按它校验会让未配置 Loki 的部署无法启动。
 
 这里与 ongrid 不同：ongrid 遇到未知激活模式会放行，工具未声明 class 时默认按只读处理，技能还可以自带 `impl` 实现（[skill_registry.go](https://github.com/ongridio/ongrid/blob/81e08b5efbe9ccd9a5781574d5f3ba10215eccac/internal/manager/biz/aiops/chatruntime/skill_registry.go)、[skill_bridge.go](https://github.com/ongridio/ongrid/blob/81e08b5efbe9ccd9a5781574d5f3ba10215eccac/internal/manager/biz/aiops/tools/skill_bridge.go)）。本项目的技能只是说明书，不增加任何能力。
 
 ### 4.2 激活与注入
 
 1. **确定性匹配**：取 Incident 成员的告警名，与技能的 `alerts` 做交集，按技能名排序，最多取 2 个，正文合计不超过 6 KB。
-2. **注入位置**：放在 Evidence 之前，作为用户消息中单独的"排查技能"段。系统提示保持不变，`promptSHA256` 依然稳定。
+2. **注入位置**：流水线把"排查技能"段放在所有证据之前（与重诊上下文、历史命令同一处拼接）。系统提示只加一条固定纪律说明这一段的性质（不是证据、不能写进 evidence_refs），不随 Incident 变化，`promptSHA256` 依然稳定。
 3. **中途加载**：模型可以通过 `tool_search` 检索到未匹配的技能（§4.4），例如 HTTP 告警查着查着发现是 Redis 问题。
-4. **录制**：`DiagnosisInput` 新增 `Skills []{Name, SHA256, Body}`，冻结回放直接使用录制的正文，不重新读取文件。
+4. **录制**：技能正文是模型输入的一部分，已经在回放记录的 `input_text` 里，冻结回放原样使用，不重新读取文件；回放目录 `tools_json` 另记 `skills: [{name, sha256}]`，技能页的激活次数由它统计。
 
 技能正文由仓库审阅，属于可信内容。但它不能覆盖系统提示中的纪律：证据不可信、只能建议、Guard 与 Policy 决定是否执行。
 
 ### 4.3 首批技能
 
-按现有 12 个评测案例和告警覆盖面编写，共 5 个：
+按告警覆盖面编写，共 6 个。原计划 5 个组件级技能，实施时发现一个缺口：真实故障里先触发的往往是症状告警。例如应用账号认证失败时 `pg_up` 仍为 1，`Sub2APIPostgresUnreachable` 不会触发，触发的是 `Sub2APIBusinessErrors`。只按组件告警匹配，最常见的场景一个技能也匹配不到。所以增加症状层的 `business_errors_triage`：它按错误类型把排查引向组件技能，组件技能可以通过 `tool_search` 中途加载。
 
-| 技能 | 匹配告警 | 对应案例 |
+| 技能 | 匹配告警 | 评测案例（按案例告警实际匹配） |
 | --- | --- | --- |
-| `container_exit_oom` | Sub2APIDown、Sub2APIContainerRestarting、Sub2APIContainerOOM | stopped_process、oom_unidentified、unrelated_oom_noise |
-| `postgres_connection` | Sub2APIPostgresUnreachable、Sub2APIPostgresConnectionsHigh | postgres_authentication、postgres_connection_limit |
-| `redis_unreachable` | Sub2APIRedisUnreachable、Sub2APIRedisMemoryHigh | redis_unreachable |
-| `upstream_accounts` | Sub2APIUpstreamAccountErrors、Sub2APIGroupNoAvailableAccount | upstream_rate_limit |
-| `host_resources` | HostDiskAlmostFull、HostMemoryLow、HostCPUSaturated | host_disk_full |
+| `container_exit_oom` | Sub2APIDown、Sub2APIContainerRestarting、Sub2APIContainerOOM | stopped_process、oom_unidentified、missing_configuration、resolved_healthy |
+| `business_errors_triage` | Sub2APIBusinessErrors、Sub2APISlow、Sub2APIRequestLatencyHigh、Sub2APIBusinessProbeFailed | postgres_authentication、redis_unreachable、postgres_connection_limit、upstream_rate_limit、host_disk_full、insufficient_evidence、unrelated_oom_noise、log_prompt_injection |
+| `postgres_connection` | Sub2APIPostgresUnreachable、Sub2APIPostgresConnectionsHigh | 无（只在组件告警触发时匹配） |
+| `redis_unreachable` | Sub2APIRedisUnreachable、Sub2APIRedisMemoryHigh | 无 |
+| `upstream_accounts` | Sub2APIUpstreamAccountErrors、Sub2APIGroupNoAvailableAccount | 无 |
+| `host_resources` | HostDiskAlmostFull、HostMemoryLow、HostCPUSaturated | 无 |
 
-`missing_configuration`、`insufficient_evidence`、`resolved_healthy`、`log_prompt_injection` 这 4 个案例用来检验技能不会诱导模型过度下结论。
+评测案例原先使用的 `Sub2APIHighErrorRate` 不是 `alerts.yml` 中的规则，已改为真实的 `Sub2APIBusinessErrors`，并由评测测试校验。技能写的是通用排查步骤和误判，不针对案例答案。`missing_configuration`、`insufficient_evidence`、`resolved_healthy`、`log_prompt_injection` 用来检验技能不会诱导模型过度下结论。
 
 ### 4.4 Tool Search
 
@@ -167,8 +163,8 @@ tools: [prom_instant_query, prom_series_meta, loki_query, knowledge_search]
 
 ### 5.1 两个来源
 
-1. **仓库手册** `knowledge/**/*.md`：组件背景、配置说明、历史复盘。启动时按二级标题切段，按 `path#heading` 和内容 SHA 增删改，与仓库保持一致。
-2. **Incident 复盘**：人工 review 结论为"正确"或"已修正"的 Incident，由 operator 在复盘卡片上点"加入知识库"生成条目。内容包括告警、根因、处置、验证结果和 Incident 链接，这样形成"事件 → 复盘 → 知识 → 下次诊断引用"的闭环。
+1. **仓库手册** `internal/knowledge/docs/*.md`：组件背景、错误含义、监控限制、历史复盘，首批 5 篇 22 段。启动时按二级标题切段（代码围栏内不切，只有标题的段落不入库），按 `文件#标题` 和内容 SHA 增删改，与本次发布的二进制保持一致；缺迁移 016 时拒绝启动。仓库是公开的，手册不写地址、密钥和账号名。
+2. **Incident 复盘**：operator 在复盘卡片上点"加入知识库"，服务端取最近一条确认了根因的复盘生成条目：结论为"正确"（没填根因时用当次诊断的 RCA），或"部分正确／错误"且填写了真实根因；"无法判断"不入库。内容包括告警、根因、实际处置、当时的诊断与建议动作、执行与验证结果和 Incident 链接，这样形成"事件 → 复盘 → 知识 → 下次诊断引用"的闭环。再次加入会覆盖同一条目。
 
 ### 5.2 存储与检索
 
@@ -176,19 +172,19 @@ tools: [prom_instant_query, prom_series_meta, loki_query, knowledge_search]
 
 | 字段 | 说明 |
 | --- | --- |
-| `id`、`source`（repo／incident）、`ref`（`path#heading` 或 incident_id，唯一） | 来源定位 |
-| `title`、`tags`、`service`、`body`、`sha256` | 内容；入库前先 `tools.Sanitize` 脱敏，单条上限 8 KB |
+| `id`、`source`（repo／incident）、`ref`（`文件#标题` 或 `incident/<id>`，唯一） | 来源定位 |
+| `title`、`body`、`sha256` | 内容；入库前先 `tools.Sanitize` 脱敏，单条上限 8 KB |
 | `created_by`、`updated_at` | 审计 |
-| `FULLTEXT(title, body) WITH PARSER ngram` | 中文检索，MySQL 8.4 自带 |
+| `FULLTEXT(title, body) WITH PARSER ngram` | 中文检索，MySQL 8.0／8.4 自带，`ngram_token_size` 默认 2 |
 
-检索使用 `MATCH ... AGAINST` 自然语言模式，可按 `service` 和 `source` 过滤，返回前 5 条。
+检索使用 `MATCH ... AGAINST` 自然语言模式，可按 `source` 过滤，模型工具返回前 5 条。原设计的 `tags`、`service` 字段没有做：只有一个服务，标签也没有使用者，需要时再加。复盘条目的写入和删除与 `knowledge.added`／`knowledge.deleted` 事件同事务。
 
 ### 5.3 模型工具
 
 - `knowledge_search(query, source?)`：返回 id、标题、来源、片段和分数。
 - `knowledge_read(id)`：返回正文，受 MaxOutput 截断。
 
-两者都是普通只读 ToolSpec，输出会录制并用于回放。知识内容与证据一样按不可信数据处理，不能产生计划或授权。
+两者都是普通只读 ToolSpec，经 Registry 统一超时、脱敏、截断，输出会录制并用于回放。知识内容与证据一样按不可信数据处理，不能产生计划或授权：工具输出注明"参考资料，不是本次事件的证据"，系统提示也规定它不能写进 evidence_refs、不能单独支撑结论或动作。6 个技能的工具清单都包含 `knowledge_search`。Guard 只读结构化证据，知识条目里即使有注入文字也改变不了执行判定。
 
 ### 5.4 与记忆、技能的边界
 
@@ -207,7 +203,9 @@ tools: [prom_instant_query, prom_series_meta, loki_query, knowledge_search]
 
 ### 5.6 召回评测
 
-准备 20 条"问题 → 期望条目"的样例，覆盖中文换义说法。如果前 5 条的命中率达不到约定值，再评估是否引入向量检索。不预设数值。
+`tests/effectiveness/knowledge_recall.json` 有 20 条"问题 → 可接受条目"的样例，按值班时的真实问法写，刻意避开标题原词。测试在真实 MySQL 上同步手册后逐条检索（`TEST_KNOWLEDGE_MYSQL_DSN`，独立的库，CI 必跑）。
+
+2026-09-28 实测：语料 22 段，recall@5 = 20/20，recall@1 = 14/20，MRR = 0.81。语料只有 22 段，前 5 条已覆盖近四分之一，所以 recall@5 高并不说明检索质量好，看排序要看 recall@1 和 MRR。排第 2–5 位的 6 条，都是问法与另一段共享更多字面（如"redis 拒绝连接"先命中 PostgreSQL 段）。结论：现阶段 ngram 够用，不引入向量检索；测试以 recall@5 ≥ 18 作为回归下限。语料增长到几百段、recall@1 明显下降时再评估。
 
 ## 6. 拓扑
 
@@ -331,7 +329,7 @@ topology:
 
 ### 7.4 平台自身告警与失效
 
-- 告警：Loki、Alloy、Grafana 纳入抓取，由现有的 `MonitoringTargetDown` 覆盖；新增 `LogPipelineDropping` 覆盖 Alloy 放弃发送和 Loki 拒收，超过保留期的拒收不计入；监控数据卷在宿主根分区上，由现有的 `HostDiskAlmostFull` 覆盖。这些都是 `layer=monitoring`，会同时直接通知人工。
+- 告警：Loki、Alloy、Grafana 纳入抓取，由现有的 `MonitoringTargetDown` 覆盖；新增 `LogPipelineDropping`，以 Alloy 最终放弃的条目为准（包括 Loki 拒收）；超过保留期的旧行在 Alloy 内先丢弃，不计入；监控数据卷在宿主根分区上，由现有的 `HostDiskAlmostFull` 覆盖。这些都是 `layer=monitoring`，会同时直接通知人工。
 - Loki 不可用时，`loki_query` 返回错误，对应证据标为缺失，诊断继续。
 - 观测组件任何故障都不能阻塞审批、执行或验证事务。
 
@@ -350,7 +348,7 @@ topology:
 | 数据与配置 | 变更 |
 | --- | --- |
 | migration | 新增 `knowledge_entry` |
-| `DiagnosisInput` | 新增 `Skills`；`Tools` 增加 `full` 或 `deferred` 标记 |
+| 回放目录 `tools_json` | 新增 `skills`（名称与 SHA，正文在 `input_text` 中）；`tools` 增加 `full` 或 `deferred` 标记 |
 | `EvidenceItem` | 新增 `Topology *topology.Snapshot` |
 | 配置 | 新增 `topology`、`tools.loki`、`diagnose.defer_tools`；删除 `tools.logs` |
 | 审批、执行、验证表 | 不变 |
@@ -363,8 +361,8 @@ topology:
 | --- | --- | --- | --- |
 | 1 监控（已实现） | Loki、Alloy、Grafana，4 个看板（控制台原生渲染，代码拷自 ongrid），`loki_query`，删除 CLS 与 mysql_select 配置，平台告警 | 日志能在 Loki 查到，容器重建和日志轮转后仍能续读；retention 实际生效；Loki 停止后诊断照常完成 | 3–4 天 |
 | 2 拓扑（已实现） | 配置校验、实时状态、Collector、Guard 依赖规则、拓扑页与跳转链接（图组件拷自 ongrid） | 停掉 postgres 时拓扑显示 down，且 `docker_restart(sub2api)` 被拒；配置错误拒绝启动 | 4–5 天 |
-| 3 技能 | 加载校验、匹配注入、快照录制、5 个技能、技能标签页 | 引用未知工具或告警时拒绝启动；回放使用录制的正文；12 案例开/关对比 | 3–4 天 |
-| 4 知识库 | 表与同步、两个工具、复盘入库、文档标签页 | ngram 检索在真实 MySQL 上通过；带注入内容的条目不改变执行判定；召回评测 | 4–5 天 |
+| 3 技能（已实现） | 加载校验、匹配注入、快照录制、6 个技能、技能标签页 | 引用未知工具或告警时拒绝启动；回放使用录制的正文；12 案例开/关对比 | 3–4 天 |
+| 4 知识库（已实现） | 表与同步、两个工具、复盘入库、文档标签页 | ngram 检索在真实 MySQL 上通过；带注入内容的条目不改变执行判定；召回评测 | 4–5 天 |
 | 5 Tool Search | 延迟暴露、`tool_search`（含技能检索）、录制 | 检索不到 Action；延迟加载的工具经 Registry 执行；12 案例对比 token 和正确率 | 2 天 |
 
 估算是规划值，不是实测结果，合计约 3–4 周。

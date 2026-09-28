@@ -85,3 +85,17 @@ const (
 	PendingRawEvents   = "pending_raw_events"
 	PendingAgentRuns   = "pending_agent_runs"
 )
+
+// 计数器启动即以 0 导出：否则序列在首次递增时才出现，increase()/rate()
+// 看不到这第一次 0→1，看板在重启后也显示无数据而不是 0。
+func init() {
+	for _, name := range []string{
+		WebhookReceived, RawEventProcessed, RawEventFailed, IncidentPromoted, IncidentResolved,
+		AgentRunEnqueued, AgentRunSucceeded, AgentRunFailed, MemoryHit, MemoryMiss,
+		ApprovalCreated, ApprovalApproved, ApprovalDenied, ApprovalExpired, ApprovalExecuted, ApprovalFailedExec,
+		VerifyPassed, VerifyFailed, VerifyInconclusive, EscalationSent, NotificationFailed,
+		DedupFull, MemoryExpired, MemoryDemoted,
+	} {
+		counters.Store(name, &atomic.Int64{})
+	}
+}

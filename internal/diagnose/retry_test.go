@@ -22,7 +22,7 @@ func TestPipelineInjectsRetryContext(t *testing.T) {
 	db.steps = append(db.steps, store.AgentRunStep{RunID: 10, Seq: 90, Kind: "verify", Name: "sub2api_http_health", OutputJSON: &verifyOutput})
 	var evidence string
 	reasoner := &capturingReasoner{inner: &fakeReasoner{result: &llm.DiagnoseResult{RCA: "新结论", Confidence: "medium"}}, out: &evidence}
-	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, reasoner, allowPolicy(), &fakeApprovals{}, &fakeReporter{}, nil, 0)
+	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, reasoner, allowPolicy(), &fakeApprovals{}, &fakeReporter{}, nil, 0, nil)
 	retryOf := uint64(10)
 	run := store.AgentRun{ID: 11, IncidentID: 7, Mode: "full", Status: "running", RetryOf: &retryOf}
 	if err := pipeline.Run(context.Background(), run); err != nil {

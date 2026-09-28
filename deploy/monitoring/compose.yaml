@@ -72,8 +72,11 @@ services:
       - --path.rootfs=/host
     networks: [monitoring]
 
+  # v0.54+ reads containers from Docker's containerd image store (the default
+  # since Docker 29); older versions report only the root cgroup there. Newer
+  # releases are published on ghcr.io only.
   cadvisor:
-    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    image: ghcr.io/google/cadvisor:v0.60.6
     restart: unless-stopped
     logging: *logging
     privileged: true

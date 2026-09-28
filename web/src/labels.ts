@@ -74,6 +74,8 @@ const eventTypeLabels: Record<string, string> = {
   "verify.stable": "恢复后观察期无复发",
   "verify.recurred": "恢复后复发",
   "review.recorded": "已记录复盘",
+  "knowledge.added": "已加入知识库",
+  "knowledge.deleted": "已移出知识库",
   "retry.scheduled": "已安排重新诊断",
   "notification.sent": "通知已发送",
   "notification.failed": "通知发送失败",
