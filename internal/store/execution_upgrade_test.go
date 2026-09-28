@@ -212,8 +212,8 @@ func TestExecutionUpgradeMigrations(t *testing.T) {
 		t.Fatal("empty database passed preflight")
 	}
 	files, err := filepath.Glob("../../migrations/*.sql")
-	if err != nil || len(files) != 15 {
-		t.Fatalf("expected migrations 001–015: %v %v", files, err)
+	if err != nil || len(files) != 16 {
+		t.Fatalf("expected migrations 001–016: %v %v", files, err)
 	}
 	var history []Approval
 	for i, path := range files {

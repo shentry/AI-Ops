@@ -720,7 +720,7 @@ export function subscribeIncident(incidentID: number, options: IncidentStreamOpt
 		"incident.created", "incident.promoted", "incident.resolved", "run.queued", "run.started", "run.succeeded", "run.failed", "run.stalled",
 		"collector.started", "collector.completed", "collector.failed", "llm.started", "llm.tool_called", "llm.completed", "llm.failed",
 		"guard.evaluated", "guard.overridden", "policy.evaluated", "policy.degraded", "approval.created", "approval.approved", "approval.denied", "approval.expired",
-		"execution.started", "execution.completed", "execution.failed", "execution.aborted", "compensation.queued", "verify.queued", "verify.started", "verify.checked", "verify.passed", "verify.failed", "verify.inconclusive", "verify.stable", "verify.recurred", "retry.scheduled", "escalation.required", "review.recorded",
+		"execution.started", "execution.completed", "execution.failed", "execution.aborted", "compensation.queued", "verify.queued", "verify.started", "verify.checked", "verify.passed", "verify.failed", "verify.inconclusive", "verify.stable", "verify.recurred", "retry.scheduled", "escalation.required", "review.recorded", "knowledge.added", "knowledge.deleted",
 		"notification.sent", "notification.failed", "conversation.asked", "conversation.answered", "conversation.failed", "incident.event",
 	];
 	for (const eventName of eventNames) source.addEventListener(eventName, consume);
