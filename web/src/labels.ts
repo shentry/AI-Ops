@@ -13,6 +13,8 @@ const statusLabels: Record<string, string> = {
   degraded: "降级",
   failed: "失败",
   error: "错误",
+  partial: "部分失败",
+  missing: "未配置",
   blocked: "阻塞",
   inconclusive: "不可判定",
   pending: "待处理",
@@ -20,6 +22,13 @@ const statusLabels: Record<string, string> = {
   denied: "已拒绝",
   expired: "已过期",
   executing: "执行中",
+  executed: "已执行",
+  aborted: "执行前拒绝",
+  stable: "恢复稳定",
+  recurred: "已复发",
+  not_started: "尚未开始",
+  not_applicable: "不适用",
+  unknown: "未知",
   recorded: "已记录",
   open: "未解决",
   resolved: "已恢复",
@@ -54,9 +63,17 @@ const eventTypeLabels: Record<string, string> = {
   "execution.started": "开始执行动作",
   "execution.completed": "动作执行完成",
   "execution.failed": "动作执行失败",
+  "execution.aborted": "执行前复验拒绝（未写入）",
+  "compensation.queued": "已排队预授权补偿",
+  "verify.queued": "恢复验证已排队",
+  "verify.started": "开始恢复验证",
+  "verify.checked": "完成一次健康观测",
   "verify.passed": "验证通过",
   "verify.failed": "验证失败",
   "verify.inconclusive": "验证不可判定",
+  "verify.stable": "恢复后观察期无复发",
+  "verify.recurred": "恢复后复发",
+  "review.recorded": "已记录复盘",
   "retry.scheduled": "已安排重新诊断",
   "notification.sent": "通知已发送",
   "notification.failed": "通知发送失败",
@@ -79,6 +96,9 @@ const problemCodeLabels: Record<string, string> = {
   policy_degraded: "Policy 降级为人工审批",
   approval_near_expiry: "审批即将过期",
   execution_failed: "动作执行失败",
+  execution_aborted: "执行前复验拒绝",
+  manual_check: "需要人工核查",
+  recurred: "恢复后复发",
   verify_failed: "验证失败",
   verify_inconclusive: "验证不可判定",
   notification_failed: "通知发送失败",
@@ -132,6 +152,47 @@ function lookup(table: Record<string, string>, value?: string | null, fallback =
 
 export function statusLabel(value?: string | null, fallback = "—"): string {
   return lookup(statusLabels, value, fallback);
+}
+
+const verificationStatusLabels: Record<string, string> = {
+  not_started: "尚未开始",
+  not_applicable: "不适用",
+  unknown: "未知",
+  pending: "等待恢复验证",
+  running: "恢复验证中",
+  passed: "恢复检查连续通过",
+  failed: "观察窗口内未恢复",
+  inconclusive: "恢复情况未知，需要人工核查",
+  stable: "恢复后观察期内未复发",
+  recurred: "恢复后复发",
+};
+
+const modeLabels: Record<string, string> = {
+  observe: "只观察（不执行）",
+  manual: "人工批准后执行",
+  auto: "规则自动执行",
+};
+
+// modeLabel names how a rule authorizes its action.
+export function modeLabel(value?: string | null): string {
+  return lookup(modeLabels, value, "未知");
+}
+
+const checkLabels: Record<string, string> = {
+  health: "服务健康",
+  container: "容器实例",
+  probe: "业务探针",
+  error_ratio: "真实流量错误率",
+  account: "账号调度状态",
+  group_available: "分组可用账号",
+};
+
+export function checkLabel(value: string): string {
+  return lookup(checkLabels, value, value);
+}
+
+export function verificationStatusLabel(value: string): string {
+  return lookup(verificationStatusLabels, value, "未知");
 }
 
 export function eventTypeLabel(value?: string | null): string {
@@ -202,4 +263,19 @@ export function timeLabel(value?: string | null, withSeconds = false): string {
     ...(withSeconds ? { second: "2-digit" } : {}),
     hour12: false,
   });
+}
+
+// relativeTime 给列表和时间线用的粗粒度相对时间；精确时刻放在 title 里。
+export function relativeTime(value?: string | null, now = Date.now()): string {
+  if (!value) return "—";
+  const at = Date.parse(value);
+  if (!Number.isFinite(at)) return value;
+  const seconds = Math.round((now - at) / 1000);
+  const future = seconds < 0;
+  const span = Math.abs(seconds);
+  if (span < 45) return future ? "即将" : "刚刚";
+  const suffix = future ? "后" : "前";
+  if (span < 3600) return `${Math.max(1, Math.round(span / 60))} 分钟${suffix}`;
+  if (span < 86400) return `${Math.round(span / 3600)} 小时${suffix}`;
+  return `${Math.round(span / 86400)} 天${suffix}`;
 }

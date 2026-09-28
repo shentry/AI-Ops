@@ -9,11 +9,9 @@ import (
 )
 
 type fakeMemoryStore struct {
-	entries  map[string]store.FaultMemory
-	history  []store.FaultCmdHistory
-	touched  int
-	demoted  []string
-	upserted []store.FaultMemory
+	entries map[string]store.FaultMemory
+	history []store.FaultCmdHistory
+	touched int
 }
 
 func newFakeMemoryStore() *fakeMemoryStore {
@@ -27,22 +25,8 @@ func (f *fakeMemoryStore) GetFaultMemory(_ context.Context, fp string) (store.Fa
 	return store.FaultMemory{}, store.ErrMemoryNotFound
 }
 
-func (f *fakeMemoryStore) UpsertFaultMemory(_ context.Context, entry store.FaultMemory) error {
-	f.entries[entry.Fingerprint] = entry
-	f.upserted = append(f.upserted, entry)
-	return nil
-}
-
 func (f *fakeMemoryStore) TouchFaultMemory(context.Context, string, time.Time) error {
 	f.touched++
-	return nil
-}
-
-func (f *fakeMemoryStore) DemoteFaultMemory(_ context.Context, fp string, _ time.Time) error {
-	f.demoted = append(f.demoted, fp)
-	entry := f.entries[fp]
-	entry.Confidence = "low"
-	f.entries[fp] = entry
 	return nil
 }
 
@@ -57,17 +41,6 @@ func (f *fakeMemoryStore) ListCmdHistory(_ context.Context, fp string, limit int
 		out = out[:limit]
 	}
 	return out, nil
-}
-
-func TestFaultFingerprintStable(t *testing.T) {
-	a := FaultFingerprint("payments", "HighCPU")
-	b := FaultFingerprint("payments", "HighCPU")
-	if a != b || len(a) != 12 {
-		t.Fatalf("fingerprint = %q vs %q", a, b)
-	}
-	if FaultFingerprint("payments", "Other") == a {
-		t.Fatal("different alert name produced same fingerprint")
-	}
 }
 
 func TestLookupGates(t *testing.T) {
@@ -103,37 +76,6 @@ func TestLookupGates(t *testing.T) {
 	}
 	if fake.touched != 1 {
 		t.Fatalf("touched after misses = %d, want 1", fake.touched)
-	}
-}
-
-func TestCommitOnlyHighConfidence(t *testing.T) {
-	fake := newFakeMemoryStore()
-	s := NewStore(fake, 3600, true)
-	entry := store.FaultMemory{Fingerprint: "fp1", PlanJSON: []byte(`{"action":"none"}`), Confidence: "high"}
-	if err := s.Commit(context.Background(), entry); err != nil {
-		t.Fatal(err)
-	}
-	// medium/low 直接拒绝（GC-16）。
-	entry.Confidence = "medium"
-	if err := s.Commit(context.Background(), entry); err == nil {
-		t.Fatal("medium confidence committed")
-	}
-	// 缺字段拒绝。
-	if err := s.Commit(context.Background(), store.FaultMemory{Confidence: "high"}); err == nil {
-		t.Fatal("empty fingerprint committed")
-	}
-}
-
-func TestDemoteBlocksFutureHits(t *testing.T) {
-	fake := newFakeMemoryStore()
-	fake.entries["fp1"] = store.FaultMemory{Fingerprint: "fp1", Confidence: "high", LastSuccess: time.Now()}
-	s := NewStore(fake, 3600, true)
-	ctx := context.Background()
-	if err := s.Demote(ctx, "fp1"); err != nil {
-		t.Fatal(err)
-	}
-	if _, hit, _ := s.Lookup(ctx, "fp1"); hit {
-		t.Fatal("demoted entry still hits")
 	}
 }
 

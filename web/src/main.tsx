@@ -1,42 +1,23 @@
-import { useEffect, useState } from "react";
+import "@fontsource/ibm-plex-sans/400.css";
+import "@fontsource/ibm-plex-sans/500.css";
+import "@fontsource/ibm-plex-sans/600.css";
+import "@fontsource/ibm-plex-mono/400.css";
+import "@fontsource/ibm-plex-mono/500.css";
+import "./index.css";
+
 import { createRoot } from "react-dom/client";
+import { BrowserRouter } from "react-router";
 
-import { getCurrentModel, ModelState } from "./api";
-import { IncidentPicker } from "./pages/IncidentPicker";
-import { IncidentRoom } from "./pages/IncidentRoom";
-import "./styles.css";
+import { App } from "./app/App";
+import { applyTheme, readTheme } from "./app/theme";
 
-const anonymousActorName = "匿名用户";
-
-function App() {
-  const [modelState, setModelState] = useState<ModelState | null>(null);
-  const incidentID = incidentIDFromPath(window.location.pathname);
-
-  useEffect(() => {
-    let active = true;
-    void getCurrentModel().then((state) => {
-      if (active) setModelState(state);
-    }).catch(() => {
-      // The control room remains usable when LLM/model management is unavailable.
-    });
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  if (incidentID === null) {
-    return <IncidentPicker actorName={anonymousActorName} modelState={modelState} onModelChanged={setModelState} />;
-  }
-  return <IncidentRoom incidentId={incidentID} actorName={anonymousActorName} modelState={modelState} onModelChanged={setModelState} />;
-}
-
-function incidentIDFromPath(pathname: string): number | null {
-  const match = pathname.match(/^\/incidents\/(\d+)(?:\/|$)/);
-  if (!match) return null;
-  const value = Number(match[1]);
-  return Number.isSafeInteger(value) && value > 0 ? value : null;
-}
+// CSP 禁止内联脚本，主题只能在这里、首帧渲染前应用；index.html 默认已是深色。
+applyTheme(readTheme());
 
 const root = document.getElementById("root");
 if (!root) throw new Error("Missing #root element");
-createRoot(root).render(<App />);
+createRoot(root).render(
+  <BrowserRouter>
+    <App />
+  </BrowserRouter>,
+);

@@ -77,7 +77,6 @@ func (c *PrometheusClient) RegisterTools(registry *Registry) error {
 		{
 			Name:        ToolPromInstantQuery,
 			Description: "Run a PromQL instant query. Returns the Prometheus result JSON.",
-			Level:       L1ReadOnly,
 			Timeout:     promToolTimeout,
 			MaxOutput:   defaultMaxOutput,
 			Params: []ParamSpec{
@@ -89,7 +88,6 @@ func (c *PrometheusClient) RegisterTools(registry *Registry) error {
 		{
 			Name:        ToolPromRangeQuery,
 			Description: "Run a PromQL range query. Range is capped and step adapts to max_points.",
-			Level:       L1ReadOnly,
 			Timeout:     promToolTimeout,
 			MaxOutput:   defaultMaxOutput,
 			Params: []ParamSpec{
@@ -102,7 +100,6 @@ func (c *PrometheusClient) RegisterTools(registry *Registry) error {
 		{
 			Name:        ToolPromSeriesMeta,
 			Description: "List series metadata. Use this before writing PromQL against unknown labels.",
-			Level:       L1ReadOnly,
 			Timeout:     promToolTimeout,
 			MaxOutput:   defaultMaxOutput,
 			Params: []ParamSpec{
@@ -244,6 +241,31 @@ func (c *PrometheusClient) rangeQuery(ctx context.Context, raw json.RawMessage) 
 		return "", err
 	}
 	return string(data), nil
+}
+
+// QueryRange runs a caller-bounded range query for the console's Monitor page
+// and returns Prometheus' result type and raw result. Unlike the model-facing
+// prom_range_query it does not cap the window: the HTTP handler owns those
+// limits for human users.
+func (c *PrometheusClient) QueryRange(ctx context.Context, expr string, start, end time.Time, step time.Duration) (string, json.RawMessage, error) {
+	query := url.Values{
+		"query": {expr},
+		"start": {strconv.FormatFloat(float64(start.UnixMilli())/1000, 'f', 3, 64)},
+		"end":   {strconv.FormatFloat(float64(end.UnixMilli())/1000, 'f', 3, 64)},
+		"step":  {strconv.FormatFloat(step.Seconds(), 'f', -1, 64)},
+	}
+	data, err := c.do(ctx, "/api/v1/query_range", query)
+	if err != nil {
+		return "", nil, err
+	}
+	var result struct {
+		ResultType string          `json:"resultType"`
+		Result     json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return "", nil, fmt.Errorf("decode range result: %w", err)
+	}
+	return result.ResultType, result.Result, nil
 }
 
 type seriesArgs struct {

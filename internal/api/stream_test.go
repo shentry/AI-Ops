@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"oncall-agent/internal/eventlog"
 	"oncall-agent/internal/store"
 )
 
@@ -28,7 +29,7 @@ func (f fakeEventStore) ListIncidentEvents(_ context.Context, _ uint64, after ui
 func TestStreamUnauthorizedAndLastEventID(t *testing.T) {
 	api := NewStreamAPI(fakeEventStore{rows: []store.IncidentEvent{{
 		ID: 5, IncidentID: 1, EventType: "run.started", Phase: "diagnose", Status: "running", Summary: "started",
-	}}}, (*Console)(nil), StreamConfig{MaxDuration: 20 * time.Millisecond, PollInterval: 5 * time.Millisecond})
+	}}}, testAuth(t), StreamConfig{MaxDuration: 20 * time.Millisecond, PollInterval: 5 * time.Millisecond})
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/incidents/1/stream", nil)
 	resp := httptest.NewRecorder()
 	api.ServeHTTP(resp, req)
@@ -38,8 +39,8 @@ func TestStreamUnauthorizedAndLastEventID(t *testing.T) {
 
 	live := NewStreamAPI(fakeEventStore{rows: []store.IncidentEvent{{
 		ID: 5, IncidentID: 1, EventType: "run.started", Phase: "diagnose", Status: "running", Summary: "started",
-	}}}, NewConsole(), StreamConfig{MaxDuration: 30 * time.Millisecond, PollInterval: 10 * time.Millisecond})
-	req = httptest.NewRequest(http.MethodGet, "/api/v1/incidents/1/stream", nil)
+	}}}, testAuth(t), StreamConfig{MaxDuration: 30 * time.Millisecond, PollInterval: 10 * time.Millisecond})
+	req = withBearer(httptest.NewRequest(http.MethodGet, "/api/v1/incidents/1/stream", nil), testViewerToken)
 	req.Header.Set("Last-Event-ID", "4")
 	resp = httptest.NewRecorder()
 	live.ServeHTTP(resp, req)
@@ -51,8 +52,8 @@ func TestStreamUnauthorizedAndLastEventID(t *testing.T) {
 		t.Fatalf("body = %q", body)
 	}
 
-	heart := NewStreamAPI(fakeEventStore{}, NewConsole(), StreamConfig{MaxDuration: 25 * time.Millisecond, PollInterval: 5 * time.Millisecond})
-	req = httptest.NewRequest(http.MethodGet, "/api/v1/incidents/1/stream", nil)
+	heart := NewStreamAPI(fakeEventStore{}, testAuth(t), StreamConfig{MaxDuration: 25 * time.Millisecond, PollInterval: 5 * time.Millisecond})
+	req = withBearer(httptest.NewRequest(http.MethodGet, "/api/v1/incidents/1/stream", nil), testViewerToken)
 	resp = httptest.NewRecorder()
 	heart.ServeHTTP(resp, req)
 	if !strings.Contains(resp.Body.String(), ": heartbeat") {
@@ -60,12 +61,34 @@ func TestStreamUnauthorizedAndLastEventID(t *testing.T) {
 	}
 }
 
+func TestStreamExecutionAndVerificationEvents(t *testing.T) {
+	types := []eventlog.EventType{eventlog.EventExecutionAborted, eventlog.EventVerifyQueued, eventlog.EventVerifyStarted, eventlog.EventVerifyChecked, eventlog.EventVerifyStable, eventlog.EventVerifyRecurred, eventlog.EventCompensationQueued, eventlog.EventReviewRecorded}
+	rows := make([]store.IncidentEvent, 0, len(types))
+	for index, eventType := range types {
+		rows = append(rows, store.IncidentEvent{ID: uint64(index + 1), IncidentID: 11, EventType: string(eventType)})
+	}
+	api := NewStreamAPI(fakeEventStore{rows: rows}, testAuth(t))
+	response := httptest.NewRecorder()
+	var cursor uint64
+	if err := api.writeEvents(response, response, context.Background(), 11, &cursor); err != nil {
+		t.Fatal(err)
+	}
+	for _, eventType := range types {
+		if !strings.Contains(response.Body.String(), "event: "+string(eventType)+"\n") {
+			t.Fatalf("event missing: %s", response.Body.String())
+		}
+	}
+	if cursor != uint64(len(types)) {
+		t.Fatalf("cursor = %d", cursor)
+	}
+}
+
 func TestStreamConnectionLimit(t *testing.T) {
-	api := NewStreamAPI(fakeEventStore{}, NewConsole(), StreamConfig{MaxConnections: 1, MaxDuration: time.Hour})
+	api := NewStreamAPI(fakeEventStore{}, testAuth(t), StreamConfig{MaxConnections: 1, MaxDuration: time.Hour})
 	if !api.tryAcquire() {
 		t.Fatal("first acquire")
 	}
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/incidents/1/stream", nil)
+	req := withBearer(httptest.NewRequest(http.MethodGet, "/api/v1/incidents/1/stream", nil), testViewerToken)
 	resp := httptest.NewRecorder()
 	api.ServeHTTP(resp, req)
 	if resp.Code != http.StatusServiceUnavailable {

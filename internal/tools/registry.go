@@ -1,6 +1,6 @@
-// Package tools 是 D06 的安全工具层：所有外部动作必须先注册成 ToolSpec，
-// 由 Registry 统一套超时和输出截断后才允许调用。LLM 只能拿到 ForLLM()
-// 导出的 L1 只读工具（GC-08/GC-12）。
+// Package tools 是唯一的工具目录：只读工具（ToolSpec）由 Registry 统一套超时、
+// 脱敏和输出截断，模型和采集器都经它调用；写操作是 Action，只由执行器按
+// 已批准的冻结快照调用，从不作为可调用工具交给模型。
 package tools
 
 import (
@@ -10,17 +10,6 @@ import (
 	"fmt"
 	"sort"
 	"time"
-)
-
-// SafetyLevel 是工具的安全分级（GC-10）：
-// L1 只读自动执行；L2 低风险满足护栏自动执行；L3 必须审批；L4 永远禁止。
-type SafetyLevel string
-
-const (
-	L1ReadOnly  SafetyLevel = "L1"
-	L2LowRisk   SafetyLevel = "L2"
-	L3Approval  SafetyLevel = "L3"
-	L4Forbidden SafetyLevel = "L4"
 )
 
 // Handler 是工具的实际执行体。args 是 LLM 或执行器给出的 JSON 参数，
@@ -35,11 +24,10 @@ type ParamSpec struct {
 	Required    bool
 }
 
-// ToolSpec 声明一个工具的完整契约：没有注册、没有等级的动作不存在。
+// ToolSpec 声明一个只读工具的完整契约：没有注册的工具不存在。
 type ToolSpec struct {
 	Name        string
 	Description string
-	Level       SafetyLevel
 	Timeout     time.Duration
 	MaxOutput   int // 输出按 rune 截断的上限；<=0 表示用默认
 	Params      []ParamSpec
@@ -53,10 +41,11 @@ const defaultMaxOutput = 4096
 // 不存在"默认放行"的路径。
 var ErrToolNotRegistered = errors.New("tools: tool is not registered")
 
-// Registry 是进程内唯一的工具目录。注册在启动时完成，运行时只读，
-// 所以没有并发写，不需要锁。
+// Registry 是进程内唯一的工具目录：只读工具与写动作。注册在启动时完成，
+// 运行时只读，所以没有并发写，不需要锁。
 type Registry struct {
-	tools map[string]ToolSpec
+	tools   map[string]ToolSpec
+	actions map[string]Action
 }
 
 // ExecutionMetadata records invocation facts that cannot be safely inferred
@@ -66,7 +55,7 @@ type ExecutionMetadata struct {
 }
 
 func NewRegistry() *Registry {
-	return &Registry{tools: make(map[string]ToolSpec)}
+	return &Registry{tools: make(map[string]ToolSpec), actions: make(map[string]Action)}
 }
 
 // Register 校验并登记一个工具。重复名字或契约不完整都在启动期暴露，
@@ -78,11 +67,6 @@ func (r *Registry) Register(spec ToolSpec) error {
 	if spec.Description == "" {
 		return fmt.Errorf("tools: tool %s description is required", spec.Name)
 	}
-	switch spec.Level {
-	case L1ReadOnly, L2LowRisk, L3Approval, L4Forbidden:
-	default:
-		return fmt.Errorf("tools: tool %s has invalid safety level %q", spec.Name, spec.Level)
-	}
 	if spec.Handler == nil {
 		return fmt.Errorf("tools: tool %s handler is required", spec.Name)
 	}
@@ -92,35 +76,28 @@ func (r *Registry) Register(spec ToolSpec) error {
 	if spec.MaxOutput <= 0 {
 		spec.MaxOutput = defaultMaxOutput
 	}
-	if _, exists := r.tools[spec.Name]; exists {
+	if _, exists := r.tools[spec.Name]; exists || r.actions[spec.Name] != nil {
 		return fmt.Errorf("tools: tool %s is already registered", spec.Name)
 	}
 	r.tools[spec.Name] = spec
 	return nil
 }
 
-// Get 按名取工具契约，供执行面（D10/D11）做权限判断。
-func (r *Registry) Get(name string) (ToolSpec, bool) {
-	spec, ok := r.tools[name]
-	return spec, ok
-}
-
-// ForLLM 只导出 L1 只读工具（GC-08）：LLM 看到的工具面就是它的全部权限面，
-// L2/L3/L4 的动作只能由确定性执行路径触发，LLM 编造名字也调不到。
+// ForLLM 导出全部只读工具：模型看到的工具面就是它的全部权限面。写动作
+// 不在这里，模型编造动作名也调不到；它只能在计划里建议已启用的动作。
 func (r *Registry) ForLLM() []ToolSpec {
 	exposed := make([]ToolSpec, 0, len(r.tools))
 	for _, spec := range r.tools {
-		if spec.Level == L1ReadOnly {
-			exposed = append(exposed, spec)
-		}
+		exposed = append(exposed, spec)
 	}
 	// 按名排序：每次导出顺序一致，prompt 里的工具清单稳定可 diff。
 	sort.Slice(exposed, func(i, j int) bool { return exposed[i].Name < exposed[j].Name })
 	return exposed
 }
 
-// Execute 是工具的统一入口：套超时、截输出。任何调用方（LLM 工具循环、
-// 审批执行器）都走这里，保证超时和截断纪律只有一份实现。
+// Execute 是只读工具的统一入口：套超时、脱敏、截输出。任何调用方（LLM 工具
+// 循环、证据采集、恢复验证）都走这里，保证这三条纪律只有一份实现：
+// 模型看到的工具输出和落库回放的内容是同一份脱敏后的文本。
 func (r *Registry) Execute(ctx context.Context, name string, args json.RawMessage) (string, error) {
 	output, _, err := r.ExecuteWithMetadata(ctx, name, args)
 	return output, err
@@ -141,8 +118,9 @@ func (r *Registry) ExecuteWithMetadata(ctx context.Context, name string, args js
 		}
 		return "", ExecutionMetadata{}, fmt.Errorf("tools: %s failed: %w", name, err)
 	}
-	truncated := Truncate(output, spec.MaxOutput)
-	return truncated, ExecutionMetadata{Truncated: truncated != output}, nil
+	clean := Sanitize(ToSafeText(output))
+	truncated := Truncate(clean, spec.MaxOutput)
+	return truncated, ExecutionMetadata{Truncated: truncated != clean}, nil
 }
 
 // Truncate 按 rune 截断，避免把 UTF-8 字符切成两半。

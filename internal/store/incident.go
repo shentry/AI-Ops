@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -9,9 +10,14 @@ import (
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+
+	incidentrule "oncall-agent/internal/incident"
 )
 
 // incident 归并事务与只读查询。
+// 归并判定本身（时间窗、severity 只升不降、promote 时机、关单条件）在
+// internal/incident，本文件只负责行锁、写库和事务边界。别名 incidentrule
+// 是因为本包里 incident 这个标识符被大量局部变量占着。
 // transactionIncidentTx 是 ApplyRawEvent 交给 ingest hook 的窄事务面：
 // hook 只能碰归并相关的写，碰不到审批和执行。
 
@@ -21,6 +27,10 @@ var ErrIncidentNotFound = errors.New("store: incident not found")
 
 // IncidentInput 是关联器（D04 Correlator）视角的一条 firing 告警：
 // 只带分组要用的字段，不带 annotations 这类大块内容。
+//
+// 字段必须与 incident.MergeInput 保持一一对应 —— AssignIncident 用
+// 直接类型转换把它交给领域层。改任一边的字段名、类型或顺序都要同步改另一边，
+// 否则要么编译不过，要么（同类型换位时）静默串字段。
 type IncidentInput struct {
 	GroupKey    string
 	Fingerprint string
@@ -47,8 +57,8 @@ type IncidentTx interface {
 	// D05：resolved 传播。全部成员 resolved 时把 incident 关单，返回是否本次关闭。
 	ResolveIncident(context.Context, uint64, time.Time) (bool, error)
 	// D05：促发分流。在促发同一事务里落 agent_run 队列行，保证跨表原子性。
-	// EnqueueAgentRun 落一行 agent_run 并回填自增 ID，调用方据此在同一事务
-	// 里追加 run.queued 事件。
+	// EnqueueAgentRun 在当前摄入事务内复用统一准入并发布 Run 事件；
+	// 调用方只提交 Incident 事件，不能再重复发布 run.queued。
 	EnqueueAgentRun(context.Context, *AgentRun) error
 	EventProblemWriter
 }
@@ -62,26 +72,14 @@ type transactionIncidentTx struct {
 // 挂成员 → 只升不降地刷新 severity / last_seen_at → 成员数攒够 minAlerts
 // 时把 candidate 升为 firing。
 func (t *transactionIncidentTx) AssignIncident(ctx context.Context, input IncidentInput, window time.Duration, minAlerts int) (IncidentAssignment, error) {
-	// 身份三要素和窗口参数是 D04 关联的硬前提，缺了宁可报错也不猜 ——
-	// 猜错一个 group_key 就会把不相干的告警并进同一个 incident。
-	if input.GroupKey == "" || input.Fingerprint == "" || input.Name == "" {
-		return IncidentAssignment{}, errors.New("store: incident identity is required")
-	}
-	if input.ObservedAt.IsZero() {
-		return IncidentAssignment{}, errors.New("store: incident observed time is required")
-	}
-	if window <= 0 {
-		return IncidentAssignment{}, errors.New("store: incident window must be positive")
-	}
-	if minAlerts < 1 {
-		return IncidentAssignment{}, errors.New("store: incident minimum alerts must be at least 1")
+	rule := incidentrule.MergeInput(input)
+	if err := rule.Validate(window, minAlerts); err != nil {
+		return IncidentAssignment{}, err
 	}
 
 	observedAt := input.ObservedAt.UTC()
-	// cutoff 之后仍有活动的 incident 才算"活着"。过了时间窗的不再吸收
-	// 新告警 —— 上次故障和这次复发是两个 incident，不能缝在一起。
-	cutoff := observedAt.Add(-window)
-	var incident Incident
+	cutoff := rule.Cutoff(window)
+	var row Incident
 	// FOR UPDATE 行锁：并发处理同一 group 时，后到的事务会等先到的提交，
 	// 不会两边都读到"没有"然后各建一个 incident。
 	// BINARY 是大小写敏感比较：表排序规则是 *_ci，不绕过它的话
@@ -92,74 +90,70 @@ func (t *transactionIncidentTx) AssignIncident(ctx context.Context, input Incide
 		// 窗口内可能同时活着好几个 incident，挑最近活跃的那个；
 		// id DESC 兜底，last_seen_at 相同时结果也是确定的。
 		Order("last_seen_at DESC, id DESC").
-		First(&incident)
+		First(&row)
 	created := false
 	if errors.Is(query.Error, gorm.ErrRecordNotFound) {
-		// 新建的是 candidate（候选）：单条告警不足以下结论，攒够
-		// minAlerts 才升 firing，避免一条孤立告警就制造一次故障。
-		incident = Incident{
+		initial := incidentrule.NewCandidate(rule)
+		row = Incident{
 			GroupKey:    input.GroupKey,
-			Status:      "candidate",
-			Severity:    uint8(input.Severity),
-			AlertsCount: 0,
-			Title:       fmt.Sprintf("%s: %s", input.GroupKey, input.Name),
+			Status:      initial.Status,
+			Severity:    uint8(initial.Severity),
+			AlertsCount: initial.AlertsCount,
+			Title:       rule.Title(),
 			StartedAt:   observedAt,
-			LastSeenAt:  observedAt,
+			LastSeenAt:  initial.LastSeenAt,
 		}
-		if err := t.db.WithContext(ctx).Create(&incident).Error; err != nil {
+		if err := t.db.WithContext(ctx).Create(&row).Error; err != nil {
 			return IncidentAssignment{}, fmt.Errorf("store: create incident: %w", err)
 		}
 		created = true
 	} else if query.Error != nil {
 		return IncidentAssignment{}, fmt.Errorf("store: find open incident: %w", query.Error)
 	}
-	// "进来时是不是 candidate"要在更新前存下，等会儿升级后就看不出来了。
-	wasCandidate := incident.Status == "candidate"
+	// 归并前的状态要在更新前存下，Promoted 靠它判定状态跃迁。
+	before := incidentrule.State{
+		Status:      row.Status,
+		Severity:    int(row.Severity),
+		AlertsCount: row.AlertsCount,
+		LastSeenAt:  row.LastSeenAt,
+	}
 
 	// 挂成员关系。ON CONFLICT DO NOTHING：同一指纹反复 firing 不能把
 	// alerts_count 刷高，只有真正的新成员（RowsAffected>0）才计数。
-	member := IncidentAlert{IncidentID: incident.ID, Fingerprint: input.Fingerprint, LinkedAt: observedAt}
+	member := IncidentAlert{IncidentID: row.ID, Fingerprint: input.Fingerprint, LinkedAt: observedAt}
 	insert := t.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&member)
 	if insert.Error != nil {
 		return IncidentAssignment{}, fmt.Errorf("store: link incident alert: %w", insert.Error)
 	}
-	if insert.RowsAffected > 0 {
-		incident.AlertsCount++
-	}
-	// severity 只升不降：incident 保留吸收过的最高级别，
-	// 否则后到的一条 info 会把 critical 的故障"降级"。
-	if input.Severity > int(incident.Severity) {
-		incident.Severity = uint8(input.Severity)
-	}
-	// 重放积压时告警可能乱序到达，last_seen_at 只前进不后退。
-	if observedAt.After(incident.LastSeenAt) {
-		incident.LastSeenAt = observedAt
-	}
 
+	// severity 只升不降、last_seen_at 只前进、candidate→firing 的时机
+	// 都由领域规则决定，这里只负责把结论写回去。
+	after := incidentrule.Merge(before, rule, insert.RowsAffected > 0, minAlerts)
+	// 列是 TINYINT UNSIGNED，转换只做一次：写库和返回值必须是同一个数，
+	// 否则调用方拿到的 severity 和落库的会在越界时不一致。
+	severity := uint8(after.Severity)
 	updates := map[string]any{
-		"severity":     incident.Severity,
-		"alerts_count": incident.AlertsCount,
-		"last_seen_at": incident.LastSeenAt,
+		"severity":     severity,
+		"alerts_count": after.AlertsCount,
+		"last_seen_at": after.LastSeenAt,
 	}
-	// candidate → firing 只在这里发生：成员数够 minAlerts 的那一刻升级。
-	if incident.Status == "candidate" && incident.AlertsCount >= minAlerts {
-		incident.Status = "firing"
-		updates["status"] = incident.Status
+	if after.Status != before.Status {
+		updates["status"] = after.Status
 	}
-	if err := t.db.WithContext(ctx).Model(&Incident{}).Where("id = ?", incident.ID).Updates(updates).Error; err != nil {
+	if err := t.db.WithContext(ctx).Model(&Incident{}).Where("id = ?", row.ID).Updates(updates).Error; err != nil {
 		return IncidentAssignment{}, fmt.Errorf("store: update incident: %w", err)
 	}
 	// 反向指针：last_alert 记住自己挂在哪个 incident 上，
 	// 之后 DedupFull 的心跳（TouchIncident）就顺着它找到续命对象。
-	if err := t.db.WithContext(ctx).Model(&LastAlert{}).Where("fingerprint = ?", input.Fingerprint).Update("incident_id", incident.ID).Error; err != nil {
+	if err := t.db.WithContext(ctx).Model(&LastAlert{}).Where("fingerprint = ?", input.Fingerprint).Update("incident_id", row.ID).Error; err != nil {
 		return IncidentAssignment{}, fmt.Errorf("store: link last alert to incident: %w", err)
 	}
 	return IncidentAssignment{
-		IncidentID: incident.ID,
-		Status:     incident.Status,
-		Severity:   int(incident.Severity),
+		IncidentID: row.ID,
+		Status:     after.Status,
+		Severity:   int(severity),
 		Created:    created,
-		Promoted:   wasCandidate && incident.Status == "firing",
+		Promoted:   incidentrule.Promoted(before, after),
 	}, nil
 }
 
@@ -171,28 +165,23 @@ func (t *transactionIncidentTx) TouchIncident(ctx context.Context, id uint64, ob
 	if id == 0 || observedAt.IsZero() {
 		return nil
 	}
-	var incident Incident
-	query := t.db.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).First(&incident, id)
+	var row Incident
+	query := t.db.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).First(&row, id)
 	if errors.Is(query.Error, gorm.ErrRecordNotFound) {
 		return nil
 	}
 	if query.Error != nil {
 		return fmt.Errorf("store: find incident for heartbeat: %w", query.Error)
 	}
-	// 只有 open 状态（candidate/firing）才值得续命，其余状态不动。
-	if incident.Status != "candidate" && incident.Status != "firing" {
+	current := incidentrule.State{Status: row.Status, Severity: int(row.Severity), LastSeenAt: row.LastSeenAt}
+	// 非 open 状态（acknowledged/resolved）不续命，changed=false 直接跳过写库。
+	next, changed := incidentrule.Heartbeat(current, observedAt, severity)
+	if !changed {
 		return nil
 	}
-	observedAt = observedAt.UTC()
-	if observedAt.After(incident.LastSeenAt) {
-		incident.LastSeenAt = observedAt
-	}
-	if severity > int(incident.Severity) {
-		incident.Severity = uint8(severity)
-	}
 	if err := t.db.WithContext(ctx).Model(&Incident{}).Where("id = ?", id).Updates(map[string]any{
-		"last_seen_at": incident.LastSeenAt,
-		"severity":     incident.Severity,
+		"last_seen_at": next.LastSeenAt,
+		"severity":     uint8(next.Severity),
 	}).Error; err != nil {
 		return fmt.Errorf("store: refresh incident heartbeat: %w", err)
 	}
@@ -207,8 +196,8 @@ func (t *transactionIncidentTx) ResolveIncident(ctx context.Context, id uint64, 
 	if id == 0 || observedAt.IsZero() {
 		return false, nil
 	}
-	var incident Incident
-	query := t.db.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).First(&incident, id)
+	var row Incident
+	query := t.db.WithContext(ctx).Clauses(clause.Locking{Strength: "UPDATE"}).First(&row, id)
 	if errors.Is(query.Error, gorm.ErrRecordNotFound) {
 		return false, nil
 	}
@@ -216,12 +205,11 @@ func (t *transactionIncidentTx) ResolveIncident(ctx context.Context, id uint64, 
 		return false, fmt.Errorf("store: find incident for resolve: %w", query.Error)
 	}
 	// 已关单（resolved）或被人工接管（acknowledged）的不重复处理：
-	// 重放 resolved 事件不能把 resolved_at 改来改去。
-	if incident.Status != "candidate" && incident.Status != "firing" {
+	// 重放 resolved 事件不能把 resolved_at 改来改去。提前返回避免多一次 count。
+	if !incidentrule.IsOpen(row.Status) {
 		return false, nil
 	}
 	// 成员状态以 last_alert 快照为准：它是每个 fingerprint 的当前态。
-	// 还有任何一个成员没 resolved，incident 就保持开放。
 	var firingMembers int64
 	count := t.db.WithContext(ctx).
 		Table("incident_alert").
@@ -231,7 +219,8 @@ func (t *transactionIncidentTx) ResolveIncident(ctx context.Context, id uint64, 
 	if count.Error != nil {
 		return false, fmt.Errorf("store: count unresolved incident members: %w", count.Error)
 	}
-	if firingMembers > 0 {
+	// resolve_on=ALL：还有任何一个成员没 resolved，incident 就保持开放。
+	if !incidentrule.CanResolve(row.Status, firingMembers) {
 		return false, nil
 	}
 	resolvedAt := observedAt.UTC()
@@ -244,25 +233,16 @@ func (t *transactionIncidentTx) ResolveIncident(ctx context.Context, id uint64, 
 	return true, nil
 }
 
-// EnqueueAgentRun 在促发事务里落一行 agent_run —— 这张表就是 D05 的诊断队列。
-// 身份字段缺失直接报错，让事务回滚，不落一条永远没人消费的脏队列行。
-// 成功后 run.ID 被回填，调用方可用它挂同事务的 run.queued 事件。
+// EnqueueAgentRun shares admission and event publication with every other trigger.
 func (t *transactionIncidentTx) EnqueueAgentRun(ctx context.Context, run *AgentRun) error {
 	if run == nil {
 		return errors.New("store: agent run is required")
 	}
-	if run.IncidentID == 0 {
-		return errors.New("store: agent run incident is required")
+	created, _, err := requestRun(ctx, t.db, RunRequest{IncidentID: run.IncidentID, Mode: run.Mode, Trigger: RunTriggerAlert, RequestedAt: run.StartedAt})
+	if err != nil {
+		return err
 	}
-	if run.Mode == "" || run.Status == "" {
-		return errors.New("store: agent run mode and status are required")
-	}
-	if run.StartedAt.IsZero() {
-		return errors.New("store: agent run start time is required")
-	}
-	if err := t.db.WithContext(ctx).Create(run).Error; err != nil {
-		return fmt.Errorf("store: enqueue agent run: %w", err)
-	}
+	*run = created
 	return nil
 }
 
@@ -351,4 +331,28 @@ func (db *DB) ListIncidentAlerts(ctx context.Context, incidentID uint64) ([]Aler
 		return nil, fmt.Errorf("store: list incident alerts: %w", err)
 	}
 	return alerts, nil
+}
+
+func ExecutionMembersFromAlerts(alerts []Alert) ([]incidentrule.ExecutionMember, error) {
+	members := make([]incidentrule.ExecutionMember, 0, len(alerts))
+	for _, alert := range alerts {
+		var labels map[string]string
+		if err := json.Unmarshal(alert.Labels, &labels); err != nil {
+			return nil, fmt.Errorf("store: invalid labels for alert %d", alert.ID)
+		}
+		members = append(members, incidentrule.ExecutionMember{Fingerprint: alert.Fingerprint, Name: alert.Name, Status: alert.Status, Service: labels["service"]})
+	}
+	return members, nil
+}
+
+func (db *DB) ListIncidentExecutionMembers(ctx context.Context, incidentID uint64) ([]incidentrule.ExecutionMember, error) {
+	return listIncidentExecutionMembers(ctx, db.DB, incidentID)
+}
+
+func listIncidentExecutionMembers(ctx context.Context, tx *gorm.DB, incidentID uint64) ([]incidentrule.ExecutionMember, error) {
+	alerts, err := (&DB{DB: tx}).ListIncidentAlerts(ctx, incidentID)
+	if err != nil {
+		return nil, err
+	}
+	return ExecutionMembersFromAlerts(alerts)
 }

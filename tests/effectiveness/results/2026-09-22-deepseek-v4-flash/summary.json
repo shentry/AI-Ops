@@ -1,0 +1,71 @@
+{
+  "model": "deepseek-v4-flash",
+  "scope": "synthetic_snapshot_diagnosis_only",
+  "cases": 12,
+  "repeats_per_case": 3,
+  "diagnoses": 36,
+  "completed_without_model_error": 36,
+  "automatic_checks_passed": 34,
+  "automatic_checks_failed": 2,
+  "mean_seconds": 6.431164027777777,
+  "median_seconds": 6.2995695000000005,
+  "p95_nearest_rank_seconds": 9.905100000000001,
+  "max_seconds": 10.659213,
+  "tokens_in": 105482,
+  "tokens_out": 31353,
+  "read_only_tool_calls": 51,
+  "incorrect_entity_attributions": 3,
+  "unsupported_restart_suggestions": 2,
+  "resolved_event_unsupported_self_recovery_claims": 3,
+  "semantic_accuracy": "not_reported_as_single_score; see individual reviews and qualifications",
+  "actual_repairs": 0,
+  "source_manifests": [
+    {
+      "started_at": "2026-09-22T14:59:01.342612+00:00",
+      "model": "deepseek-v4-flash",
+      "base_url": "https://api.delean.ai/v1",
+      "max_tokens": 8192,
+      "context_window_tokens": 1000000,
+      "thinking": false,
+      "mode": "light",
+      "repeats": 1,
+      "timeout_seconds_per_case": 120,
+      "git_head": "2323cdddb2f5fac004d4ba191552d36955d586c6",
+      "source_sha256": {
+        "tests/effectiveness/cases.json": "a9690592a2dd65789f84f87bc2001d9bc8869522b03276d2c5fde6171797670f",
+        "tests/effectiveness/effectiveness_test.go": "e9eb0bd68e4d7d78f856a92b8050584abd2584a2a194dcc5e21364595d8b0932",
+        "internal/llm/prompts.go": "cdff7cd1b50672e0433cde8843b54c70e3893057a3432390b76b38f8c0ec5405",
+        "internal/llm/reasoner.go": "653ee961f5cd7fe0a68d67ef57e36f0cf8648b52d62b456cde6228e679fe901e",
+        "internal/llm/factory.go": "00feac2ce21f342e6a80439b8c5c7f67c78b2be1919b9f7b2ab7f3088f6272c2",
+        "internal/diagnose/guard.go": "bba305e473166d77b73a989bc853d2b2e0eddafe8f255d4fdc6478cc045ef575"
+      },
+      "run_dir": "/Users/zxy/oncall agent/tmp/effectiveness/deepseek-v4-flash-4d5siy63",
+      "finished_at": "2026-09-22T15:00:24.499459+00:00",
+      "exit_code": 1
+    },
+    {
+      "started_at": "2026-09-22T15:01:04.617311+00:00",
+      "model": "deepseek-v4-flash",
+      "base_url": "https://api.delean.ai/v1",
+      "max_tokens": 8192,
+      "context_window_tokens": 1000000,
+      "thinking": false,
+      "mode": "light",
+      "repeats": 2,
+      "timeout_seconds_per_case": 120,
+      "git_head": "2323cdddb2f5fac004d4ba191552d36955d586c6",
+      "source_sha256": {
+        "tests/effectiveness/cases.json": "a9690592a2dd65789f84f87bc2001d9bc8869522b03276d2c5fde6171797670f",
+        "tests/effectiveness/effectiveness_test.go": "e9eb0bd68e4d7d78f856a92b8050584abd2584a2a194dcc5e21364595d8b0932",
+        "internal/llm/prompts.go": "cdff7cd1b50672e0433cde8843b54c70e3893057a3432390b76b38f8c0ec5405",
+        "internal/llm/reasoner.go": "653ee961f5cd7fe0a68d67ef57e36f0cf8648b52d62b456cde6228e679fe901e",
+        "internal/llm/factory.go": "00feac2ce21f342e6a80439b8c5c7f67c78b2be1919b9f7b2ab7f3088f6272c2",
+        "internal/diagnose/guard.go": "bba305e473166d77b73a989bc853d2b2e0eddafe8f255d4fdc6478cc045ef575"
+      },
+      "run_dir": "/Users/zxy/oncall agent/tmp/effectiveness/deepseek-v4-flash-repeat-vooq8zqg",
+      "previous_run": "/Users/zxy/oncall agent/tmp/effectiveness/deepseek-v4-flash-4d5siy63",
+      "finished_at": "2026-09-22T15:03:39.418615+00:00",
+      "exit_code": 1
+    }
+  ]
+}

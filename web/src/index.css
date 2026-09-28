@@ -1,0 +1,151 @@
+@import "tailwindcss";
+
+/* 主题由 <html> 上的 .dark 决定，默认深色；浅色是同一套语义 token 的另一组取值。 */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* 语义色板（OKLCH）。中性色统一向蓝灰（hue 262）偏一点，和强调色同源；
+   ok / warn / danger / info 只表达状态，不做装饰。 */
+:root {
+  color-scheme: light;
+  --canvas: oklch(0.975 0.004 262);
+  --sidebar: oklch(0.957 0.006 262);
+  --surface: oklch(0.995 0.002 262);
+  --surface-2: oklch(0.953 0.007 262);
+  --line: oklch(0.885 0.009 262);
+  --line-soft: oklch(0.925 0.007 262);
+  --fg: oklch(0.235 0.02 262);
+  --fg-muted: oklch(0.45 0.02 262);
+  --fg-faint: oklch(0.57 0.018 262);
+  --accent: oklch(0.53 0.19 262);
+  --accent-fg: oklch(0.985 0.005 262);
+  --ok: oklch(0.53 0.13 158);
+  --warn: oklch(0.6 0.14 70);
+  --danger: oklch(0.54 0.2 25);
+  --info: oklch(0.52 0.12 235);
+  --ring: oklch(0.53 0.19 262 / 0.45);
+  /* 图表分类色：固定顺序，按主题各取一组；已用 dataviz 校验脚本验证色弱区分与对比度。 */
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+  --series-6: #008300;
+}
+
+.dark {
+  color-scheme: dark;
+  --canvas: oklch(0.158 0.008 262);
+  --sidebar: oklch(0.176 0.009 262);
+  --surface: oklch(0.196 0.01 262);
+  --surface-2: oklch(0.232 0.012 262);
+  --line: oklch(0.285 0.013 262);
+  --line-soft: oklch(0.245 0.011 262);
+  --fg: oklch(0.955 0.005 262);
+  --fg-muted: oklch(0.745 0.013 262);
+  --fg-faint: oklch(0.585 0.014 262);
+  --accent: oklch(0.68 0.16 262);
+  --accent-fg: oklch(0.99 0.004 262);
+  --ok: oklch(0.74 0.15 158);
+  --warn: oklch(0.82 0.15 80);
+  --danger: oklch(0.7 0.18 25);
+  --info: oklch(0.76 0.11 230);
+  --ring: oklch(0.68 0.16 262 / 0.5);
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+  --series-5: #d55181;
+  --series-6: #008300;
+}
+
+/* React Flow 的缩放按钮跟随控制台主题。 */
+.react-flow {
+  --xy-controls-button-background-color: var(--surface);
+  --xy-controls-button-background-color-hover: var(--surface-2);
+  --xy-controls-button-color: var(--fg-muted);
+  --xy-controls-button-color-hover: var(--fg);
+  --xy-controls-button-border-color: var(--line);
+}
+
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-sidebar: var(--sidebar);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-line: var(--line);
+  --color-line-soft: var(--line-soft);
+  --color-fg: var(--fg);
+  --color-fg-muted: var(--fg-muted);
+  --color-fg-faint: var(--fg-faint);
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-fg);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-danger: var(--danger);
+  --color-info: var(--info);
+  --color-ring: var(--ring);
+}
+
+@theme {
+  --font-sans: "IBM Plex Sans", "PingFang SC", "Hiragino Sans GB", "HarmonyOS Sans SC", "Noto Sans CJK SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --animate-pulse-dot: pulse-dot 1.6s ease-in-out infinite;
+  --animate-fade-in: fade-in 160ms ease-out;
+
+  @keyframes pulse-dot {
+    0%, 100% { opacity: 0.35; }
+    50% { opacity: 1; }
+  }
+  @keyframes fade-in {
+    from { opacity: 0; transform: translateY(2px); }
+    to { opacity: 1; transform: none; }
+  }
+}
+
+@layer base {
+  html, body, #root { height: 100%; }
+  body {
+    @apply bg-canvas text-fg font-sans antialiased;
+    font-size: 14px;
+    line-height: 1.55;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+  }
+  ::selection { background: color-mix(in oklab, var(--accent) 32%, transparent); }
+  :focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+  * { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+  code, kbd, pre, samp { font-family: var(--font-mono); }
+  .tabular { font-variant-numeric: tabular-nums; }
+}
+
+@layer components {
+  .caps { @apply text-[11px] font-medium uppercase tracking-[0.08em] text-fg-faint; }
+
+  /* 模型生成的 Markdown：只做排版，不渲染原始 HTML 和图片。 */
+  .markdown { @apply text-[13.5px] leading-relaxed text-fg; overflow-wrap: anywhere; }
+  .markdown > * + * { margin-top: 0.65em; }
+  .markdown h1, .markdown h2, .markdown h3, .markdown h4 { @apply font-semibold text-fg; margin-top: 1.1em; }
+  .markdown h1 { font-size: 1.15em; }
+  .markdown h2 { font-size: 1.08em; }
+  .markdown h3, .markdown h4 { font-size: 1em; }
+  .markdown ul { @apply list-disc pl-5; }
+  .markdown ol { @apply list-decimal pl-5; }
+  .markdown li + li { margin-top: 0.25em; }
+  .markdown a { @apply text-accent underline underline-offset-2; }
+  .markdown strong { @apply font-semibold text-fg; }
+  .markdown blockquote { @apply border-l-2 border-line pl-3 text-fg-muted; }
+  .markdown :not(pre) > code { @apply rounded border border-line-soft bg-surface-2 px-1 py-px text-[12px]; }
+  .markdown pre { @apply overflow-x-auto rounded-md border border-line-soft bg-canvas p-3 text-[12px] leading-5; }
+  .markdown table { @apply w-full border-collapse text-[12.5px]; }
+  .markdown th, .markdown td { @apply border border-line px-2.5 py-1.5 text-left align-top; }
+  .markdown th { @apply bg-surface-2 font-medium; }
+  .markdown hr { @apply border-line; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

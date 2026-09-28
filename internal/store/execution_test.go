@@ -2,116 +2,58 @@ package store
 
 import (
 	"context"
-	"strings"
+	"fmt"
 	"testing"
 	"time"
 )
 
-// 执行闸门：限频计数与崩溃恢复。
-
-// CountRecentExecutions 是 L2 限频护栏的数据源：只数同 plan_hash、
-// 窗口内、且真的进入过执行的单子。pending/denied 不算 —— 那些没动过外部系统。
-func TestCountRecentExecutions(t *testing.T) {
+// An interrupted execution stays executing through TTL sweeps until the
+// executor reconciles it with the target; an unknown outcome is recorded as
+// failed with a manual check, blocks the rule and is never retried.
+func TestInterruptedExecutionAwaitsReconciliation(t *testing.T) {
 	db := openIntegrationDB(t)
+	t.Cleanup(func() { db.Close() })
 	ctx := context.Background()
-	planHash := "ratelimit-" + md5Hex(t.Name())
-	otherHash := planHash + "-other"
-	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
-	var ids []uint64
-	t.Cleanup(func() {
-		if len(ids) > 0 {
-			db.Where("id IN ?", ids).Delete(&Approval{})
-		}
-		db.Close()
-	})
-
-	create := func(hash, status string, createdAt time.Time) uint64 {
-		t.Helper()
-		created, err := db.CreateApproval(ctx, Approval{
-			IncidentID: 1, RunID: 2, ToolName: "docker_restart", ArgsJSON: []byte(`{"target_name":"sub2api"}`),
-			Reason: "r", PlanHash: hash, ExpiresAt: createdAt.Add(30 * time.Minute), CreatedAt: createdAt,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		ids = append(ids, created.ID)
-		if status != "pending" {
-			if err := db.Model(&Approval{}).Where("id = ?", created.ID).Update("status", status).Error; err != nil {
-				t.Fatal(err)
-			}
-		}
-		return created.ID
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	stuck, policy := executionFixture(t, db, now, "approved")
+	if _, claimed, err := db.ClaimApprovalExecution(ctx, stuck.ID, now, policy); err != nil || !claimed {
+		t.Fatalf("claim=%v %v", claimed, err)
 	}
-
-	create(planHash, "executed", now.Add(-10*time.Minute))
-	create(planHash, "failed", now.Add(-20*time.Minute))   // 失败的重复动作也要算
-	create(planHash, "executing", now.Add(-time.Minute))   // 正在执行的也占额度
-	create(planHash, "pending", now.Add(-5*time.Minute))   // 还没执行 → 不算
-	create(planHash, "denied", now.Add(-6*time.Minute))    // 被拒 → 不算
-	create(planHash, "executed", now.Add(-90*time.Minute)) // 窗口外 → 不算
-	create(otherHash, "executed", now.Add(-time.Minute))   // 别的动作 → 不算
-
-	count, err := db.CountRecentExecutions(ctx, planHash, now.Add(-time.Hour))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if count != 3 {
-		t.Fatalf("CountRecentExecutions() = %d, want 3", count)
-	}
-	// 空 plan_hash 是调用方 bug，不能静默返回 0。
-	if _, err := db.CountRecentExecutions(ctx, "  ", now); err == nil {
-		t.Fatal("empty plan hash accepted")
-	}
-}
-
-// 进程在 executing 状态崩掉的审批单必须在启动时被回收成 failed：
-// 动作可能已经触达外部系统，不能自动重放，只能要求人工核查。
-func TestRecoverExecutingApprovals(t *testing.T) {
-	db := openIntegrationDB(t)
-	ctx := context.Background()
-	now := time.Date(2026, 8, 20, 13, 0, 0, 0, time.UTC)
-	var ids []uint64
-	t.Cleanup(func() {
-		if len(ids) > 0 {
-			db.Where("id IN ?", ids).Delete(&Approval{})
-		}
-		db.Close()
-	})
-
-	stuck, err := db.CreateApproval(ctx, Approval{
-		IncidentID: 1, RunID: 2, ToolName: "docker_restart", ArgsJSON: []byte(`{}`),
-		Reason: "r", PlanHash: "recover-" + md5Hex(t.Name()), ExpiresAt: now.Add(time.Hour), CreatedAt: now,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ids = append(ids, stuck.ID)
-	if _, err := db.DecideApproval(ctx, stuck.ID, "approved", "ops", "test", "api", now); err != nil {
-		t.Fatal(err)
-	}
-	claimed, err := db.ClaimApprovalExecution(ctx, stuck.ID, now)
-	if err != nil || !claimed {
-		t.Fatalf("ClaimApprovalExecution() = %v, %v", claimed, err)
-	}
-	// executing 不会被 TTL sweep 带走 —— 只有 recover 能收拾它。
 	if _, err := db.ExpireApprovals(ctx, now.Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := db.GetApproval(ctx, stuck.ID); got.Status != "executing" {
-		t.Fatalf("status after sweep = %q, want executing", got.Status)
+	rows, err := db.ListExecutingApprovals(ctx)
+	if err != nil || !containsApproval(rows, stuck.ID) {
+		t.Fatalf("executing=%v err=%v", rows, err)
 	}
-	recovered, err := db.RecoverExecutingApprovals(ctx, now)
-	if err != nil || recovered < 1 {
-		t.Fatalf("RecoverExecutingApprovals() = %d, %v", recovered, err)
-	}
-	got, err := db.GetApproval(ctx, stuck.ID)
-	if err != nil {
+	t.Cleanup(func() {
+		db.Where("actor = ? AND reason = ?", "system:execution", fmt.Sprintf("approval %d outcome is unknown; reconcile before resuming", stuck.ID)).Delete(&ControlEvent{})
+	})
+	completion := ExecutionCompletion{ApprovalID: stuck.ID, Status: "failed", ManualCheck: true, ResultJSON: []byte(`{"outcome":"unknown","error":"target state could not be read"}`), FinishedAt: now.Add(time.Minute)}
+	if err := db.FinishExecution(ctx, completion); err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != "failed" {
-		t.Fatalf("status = %q, want failed", got.Status)
+	got, err := db.GetApproval(ctx, stuck.ID)
+	if err != nil || got.Status != "failed" || got.Verification != nil {
+		t.Fatalf("approval=%+v err=%v", got, err)
 	}
-	if got.ResultJSON == nil || !strings.Contains(string(*got.ResultJSON), "manual verification") {
-		t.Fatalf("result = %v, want the manual-check reason", got.ResultJSON)
+	for _, code := range []string{"execution_failed", "manual_check"} {
+		assertScopeRaceCount(t, db, &IncidentProblem{}, "incident_id = ? AND code = ? AND status = ?", []any{stuck.IncidentID, code, "open"}, 1)
 	}
+	if rows, err := db.ListExecutingApprovals(ctx); err != nil || containsApproval(rows, stuck.ID) {
+		t.Fatalf("reconciled execution still listed: %v", err)
+	}
+	state, err := db.RemediationState(ctx, RemediationQuery{Service: *stuck.Service, RuleID: *stuck.RuleID, IncidentID: stuck.IncidentID, Since: now.Add(-time.Hour)})
+	if err != nil || !state.Stopped || state.Executions != 1 || state.IncidentActions != 1 || state.Blocked == "" || state.BusyWith != 0 {
+		t.Fatalf("state after unknown outcome=%+v err=%v", state, err)
+	}
+}
+
+func containsApproval(rows []Approval, id uint64) bool {
+	for _, row := range rows {
+		if row.ID == id {
+			return true
+		}
+	}
+	return false
 }

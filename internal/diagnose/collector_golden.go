@@ -23,7 +23,7 @@ var goldenQueries = []struct {
 }
 
 // goldenMetricsCollector 查宿主机黄金指标。单条失败记进正文，
-// 不阻断其余指标；全部失败才算 collector 失败。
+// 不阻断其余指标；部分失败报 partial，全部失败报 error。
 type goldenMetricsCollector struct {
 	registry *tools.Registry
 }
@@ -48,8 +48,5 @@ func (c goldenMetricsCollector) Collect(ctx context.Context, target Target) Evid
 		}
 		fmt.Fprintf(&body, "  %s\n", out)
 	}
-	if failures == len(goldenQueries) {
-		return finishItem(c.Name(), "prometheus:query", "", fmt.Errorf("all %d golden queries failed", failures))
-	}
-	return finishItem(c.Name(), "prometheus:query", body.String(), nil)
+	return queriesItem(c.Name(), "prometheus:query", body.String(), failures, len(goldenQueries))
 }

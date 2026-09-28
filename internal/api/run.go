@@ -18,14 +18,14 @@ type RunStore interface {
 	ListIncidentRunSteps(context.Context, uint64, uint64, uint64, int) ([]store.AgentRunStep, error)
 }
 
-// RunAPI serves public Incident-scoped run and step history.
+// RunAPI serves Incident-scoped run and step history to viewers.
 type RunAPI struct {
-	db      RunStore
-	console *Console
+	db   RunStore
+	auth *Auth
 }
 
-func NewRunAPI(db RunStore, console *Console) *RunAPI {
-	return &RunAPI{db: db, console: console}
+func NewRunAPI(db RunStore, auth *Auth) *RunAPI {
+	return &RunAPI{db: db, auth: auth}
 }
 
 func (h *RunAPI) Handle(r *ghttp.Request) {
@@ -43,11 +43,10 @@ func (h *RunAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/"), "/")
 	parts := strings.Split(path, "/")
-	if _, ok := h.console.Actor(); !ok {
-		// Do not distinguish an invalid resource from a missing session on known
-		// data paths; the caller must authenticate before any store read.
-		if isRunPath(parts) {
-			writeError(w, http.StatusUnauthorized, "unauthorized")
+	// Do not distinguish an invalid resource from a missing session on known
+	// data paths; the caller must authenticate before any store read.
+	if isRunPath(parts) {
+		if _, ok := h.auth.Require(w, r, RoleViewer, true); !ok {
 			return
 		}
 	}

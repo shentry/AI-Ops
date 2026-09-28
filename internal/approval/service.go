@@ -1,106 +1,82 @@
 package approval
 
 import (
-	"bytes"
 	"context"
 	"fmt"
+	"strings"
 	"time"
-
-	"encoding/json"
 
 	"gorm.io/datatypes"
 
+	"oncall-agent/internal/incident"
 	"oncall-agent/internal/store"
 )
 
-// approvalStore 是 Service 对存储层的收窄接口。
 type approvalStore interface {
-	CreateApproval(ctx context.Context, approval store.Approval) (store.Approval, error)
-	CreateSystemApprovedApproval(ctx context.Context, approval store.Approval, decidedBy, decisionReason, decisionSource string, now time.Time) (store.Approval, error)
 	GetApproval(ctx context.Context, id uint64) (store.Approval, error)
-	DecideApproval(ctx context.Context, id uint64, status, decidedBy, decisionReason, decisionSource string, now time.Time) (store.Approval, error)
+	DecideApproval(ctx context.Context, id uint64, status, expectedPlanHash, decidedBy, decisionReason, decisionSource string, now time.Time) (store.Approval, error)
 	ListApprovals(ctx context.Context, status string) ([]store.Approval, error)
 }
 
-// Service 管理审批单生命周期。reason 脱敏后才进数据库 ——
-// 审批单与通知不能携带完整密钥、DSN 或敏感请求正文（GC-19）。
 type Service struct {
-	db         approvalStore
-	ttlMinutes int
+	db approvalStore
 }
 
-func NewService(db approvalStore, ttlMinutes int) *Service {
-	return &Service{db: db, ttlMinutes: ttlMinutes}
+func NewService(db approvalStore) *Service {
+	return &Service{db: db}
 }
 
-// Create 为一次 L3 决策创建 pending 审批单。reason 必须已被调用方脱敏。
-func (s *Service) Create(ctx context.Context, incidentID, runID uint64, decision Decision, reason string) (store.Approval, error) {
-	now := time.Now().UTC()
-	return s.db.CreateApproval(ctx, store.Approval{
-		IncidentID: incidentID,
-		RunID:      runID,
-		ToolName:   decision.ToolName,
-		ArgsJSON:   datatypes.JSON(decision.Args),
-		Reason:     reason,
-		PlanHash:   decision.PlanHash,
-		ExpiresAt:  now.Add(time.Duration(s.ttlMinutes) * time.Minute),
-		CreatedAt:  now,
-	})
+// Prepare validates an immutable draft without writing it. CompleteRun publishes
+// this draft atomically with the diagnosis, terminal run state and audit events.
+// An auto decision is approved by its rule; a manual one waits for a person.
+// The caller must sanitize reason before handing it to this service.
+func (s *Service) Prepare(incidentID, runID uint64, decision Decision, reason string) (store.Approval, error) {
+	if incidentID == 0 || runID == 0 || strings.TrimSpace(reason) == "" {
+		return store.Approval{}, fmt.Errorf("approval: incident, run and reason are required")
+	}
+	if decision.Kind != DecisionApproval && decision.Kind != DecisionAuto {
+		return store.Approval{}, fmt.Errorf("approval: decision %q cannot create an approval", decision.Kind)
+	}
+	snapshot, err := incident.ParseExecutionContext(decision.ExecutionContext)
+	if err != nil {
+		return store.Approval{}, err
+	}
+	hash, err := incident.PlanHash(decision.ToolName, decision.Args, decision.ExecutionContext)
+	if err != nil || hash != decision.PlanHash {
+		return store.Approval{}, fmt.Errorf("approval: plan hash does not match execution content")
+	}
+	if (decision.Kind == DecisionAuto) != (snapshot.Rule.Mode == incident.ModeAuto) {
+		return store.Approval{}, fmt.Errorf("approval: decision %q contradicts rule mode %q", decision.Kind, snapshot.Rule.Mode)
+	}
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	service, rule := snapshot.Service, snapshot.Rule.ID
+	draft := store.Approval{
+		IncidentID: incidentID, RunID: runID, Service: &service, RuleID: &rule, ToolName: decision.ToolName,
+		ArgsJSON:         datatypes.JSON(append([]byte(nil), decision.Args...)),
+		ExecutionContext: datatypes.JSON(append([]byte(nil), decision.ExecutionContext...)),
+		PlanHash:         hash, Reason: reason, Status: "pending", ExpiresAt: snapshot.ExpiresAt, CreatedAt: now,
+	}
+	if decision.Kind == DecisionAuto {
+		actor, source := "system:rule:"+rule, "rule"
+		draft.Status, draft.DecidedBy, draft.DecisionSource = "approved", &actor, &source
+		draft.DecidedAt, draft.DecisionReason = &now, &reason
+	}
+	return draft, nil
 }
 
-// Decide 审批或拒绝。幂等语义：已决/已过期 → ErrApprovalConflict；
-// 不存在 → ErrApprovalNotFound。返回数据库中的审批快照，供 Web/飞书复用。
-func (s *Service) Decide(ctx context.Context, id uint64, approve bool, decidedBy, decisionReason, decisionSource string) (store.Approval, error) {
+// Decide delegates hash/content/state/TTL validation to the store's row-locked transaction.
+func (s *Service) Decide(ctx context.Context, id uint64, approve bool, expectedPlanHash, decidedBy, decisionReason, decisionSource string) (store.Approval, error) {
 	status := "denied"
 	if approve {
 		status = "approved"
 	}
-	return s.db.DecideApproval(ctx, id, status, decidedBy, decisionReason, decisionSource, time.Now().UTC())
+	return s.db.DecideApproval(ctx, id, status, expectedPlanHash, decidedBy, decisionReason, decisionSource, time.Now().UTC())
 }
 
-// ValidateExecution 是执行前的最终闸（GC-13）：
-// 审批单必须 approved、未过期，且请求执行的 tool/args 与批准内容完全一致。
-// 篡改 plan_hash、target 或 args 在这里失配被拒。
-func (s *Service) ValidateExecution(ctx context.Context, id uint64, decision Decision) error {
-	approval, err := s.db.GetApproval(ctx, id)
-	if err != nil {
-		return err
-	}
-	if approval.Status != "approved" {
-		return fmt.Errorf("approval %d status is %q, not approved", id, approval.Status)
-	}
-	if time.Now().UTC().After(approval.ExpiresAt) {
-		return fmt.Errorf("approval %d expired at %s", id, approval.ExpiresAt)
-	}
-	if approval.ToolName != decision.ToolName ||
-		approval.PlanHash != decision.PlanHash ||
-		!bytes.Equal(normalizeJSON(json.RawMessage(approval.ArgsJSON)), normalizeJSON(decision.Args)) {
-		return fmt.Errorf("approval %d does not match the requested action", id)
-	}
-	return nil
-}
-
-// List 查询审批单。
 func (s *Service) List(ctx context.Context, status string) ([]store.Approval, error) {
 	return s.db.ListApprovals(ctx, status)
 }
 
 func (s *Service) Get(ctx context.Context, id uint64) (store.Approval, error) {
 	return s.db.GetApproval(ctx, id)
-}
-
-// CreateSystemApproved 为自动 L2 路径原子落"系统批准"的审批单：
-// 创建、approval.created 和 approval.approved 必须同一事务提交。
-func (s *Service) CreateSystemApproved(ctx context.Context, incidentID, runID uint64, decision Decision, reason string) (store.Approval, error) {
-	now := time.Now().UTC()
-	return s.db.CreateSystemApprovedApproval(ctx, store.Approval{
-		IncidentID: incidentID,
-		RunID:      runID,
-		ToolName:   decision.ToolName,
-		ArgsJSON:   datatypes.JSON(decision.Args),
-		Reason:     reason,
-		PlanHash:   decision.PlanHash,
-		ExpiresAt:  now.Add(time.Duration(s.ttlMinutes) * time.Minute),
-		CreatedAt:  now,
-	}, "system:auto_l2", reason, "system", now)
 }

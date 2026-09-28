@@ -199,10 +199,9 @@ func TestRegisterToolsRegistersThreeL1Tools(t *testing.T) {
 	if len(exposed) != 3 {
 		t.Fatalf("ForLLM() = %d tools, want 3", len(exposed))
 	}
-	for _, name := range []string{ToolPromInstantQuery, ToolPromRangeQuery, ToolPromSeriesMeta} {
-		spec, ok := registry.Get(name)
-		if !ok || spec.Level != L1ReadOnly {
-			t.Fatalf("Get(%s) = %+v, %v", name, spec, ok)
+	for i, name := range []string{ToolPromInstantQuery, ToolPromRangeQuery, ToolPromSeriesMeta} {
+		if exposed[i].Name != name {
+			t.Fatalf("ForLLM()[%d] = %s, want %s", i, exposed[i].Name, name)
 		}
 	}
 }
@@ -258,4 +257,25 @@ func prometheusTestURL(t *testing.T) string {
 		t.Fatalf("TEST_PROMETHEUS_URL invalid: %v", err)
 	}
 	return value
+}
+
+func TestQueryRangeForConsoleKeepsCallerWindow(t *testing.T) {
+	var got url.Values
+	_, client := fakePrometheus(t, func(w http.ResponseWriter, r *http.Request) {
+		got = r.URL.Query()
+		_, _ = w.Write([]byte(promSuccess(`{"resultType":"matrix","result":[{"metric":{"job":"a"},"values":[[1,"1"]]}]}`)))
+	})
+	start := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
+	end := start.Add(7 * 24 * time.Hour)
+	resultType, result, err := client.QueryRange(context.Background(), "up", start, end, 28*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 七天窗口原样下发：prom_range_query 的 15 分钟封顶只约束模型。
+	if got.Get("start") != "1789992000.000" || got.Get("end") != "1790596800.000" || got.Get("step") != "1680" {
+		t.Fatalf("params = %v", got)
+	}
+	if resultType != "matrix" || !strings.Contains(string(result), `"job":"a"`) {
+		t.Fatalf("result = %s %s", resultType, result)
+	}
 }

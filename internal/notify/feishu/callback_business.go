@@ -17,6 +17,7 @@ import (
 
 	"oncall-agent/internal/conversation"
 	"oncall-agent/internal/eventlog"
+	"oncall-agent/internal/incident"
 	"oncall-agent/internal/notify"
 	"oncall-agent/internal/store"
 )
@@ -65,11 +66,11 @@ type CallbackStore interface {
 
 // ApprovalDecider is intentionally the same contract implemented by
 // approval.Service. Both Web and Feishu therefore use the store CAS and retain
-// one audit trail. Get is required so the card's immutable plan_hash is checked
-// against a fresh database row before Decide.
+// one audit trail. Get improves callback feedback; Decide must validate the
+// card's immutable plan_hash again inside the decision transaction.
 type ApprovalDecider interface {
 	Get(context.Context, uint64) (store.Approval, error)
-	Decide(context.Context, uint64, bool, string, string, string) (store.Approval, error)
+	Decide(ctx context.Context, id uint64, approve bool, expectedPlanHash, decidedBy, decisionReason, decisionSource string) (store.Approval, error)
 }
 
 // ConversationAsker is the shared Web/Feishu conversation entrypoint. Its
@@ -196,11 +197,11 @@ func (b *CallbackBusiness) CardAction(ctx context.Context, event *callback.CardA
 	}
 	approve := action == "approve"
 	decidedBy := "feishu:" + operator
-	decided, err := b.approval.Decide(ctx, approvalID, approve, decidedBy, "", "feishu")
+	decided, err := b.approval.Decide(ctx, approvalID, approve, planHash, decidedBy, "", "feishu")
 	if err != nil {
 		if errors.Is(err, store.ErrApprovalConflict) {
 			finish("conflict")
-			return toast("success", "该审批已处理"), nil
+			return toast("error", "审批已变更、过期或已处理，请刷新卡片"), nil
 		}
 		b.abandonReceipt(ctx, eventID)
 		finish("failed")
@@ -401,6 +402,13 @@ func (b *CallbackBusiness) patchDecisionAsync(approvalRow store.Approval, messag
 		summary = "审批已批准"
 	}
 	incidentID, runID := approvalRow.IncidentID, approvalRow.RunID
+	payload := map[string]any{"approval_status": status, "action": approvalRow.ToolName, "reason": approvalRow.Reason}
+	snapshot, contextErr := incident.ParseExecutionContext(approvalRow.ExecutionContext)
+	hash, hashErr := incident.PlanHash(approvalRow.ToolName, approvalRow.ArgsJSON, approvalRow.ExecutionContext)
+	if contextErr == nil && hashErr == nil && hash == approvalRow.PlanHash {
+		payload["target"], payload["target_id"] = snapshot.Target.Kind+"/"+snapshot.Target.Name, snapshot.Target.ID
+		payload["rule_id"], payload["rule_mode"] = snapshot.Rule.ID, snapshot.Rule.Mode
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -409,7 +417,7 @@ func (b *CallbackBusiness) patchDecisionAsync(approvalRow store.Approval, messag
 			IncidentID: incidentID,
 			RunID:      &runID,
 			Summary:    summary,
-			Payload:    map[string]any{"approval_status": status},
+			Payload:    payload,
 		})
 		if err == nil {
 			err = b.client.Patch(ctx, messageID, string(content))

@@ -21,3 +21,7 @@ keep/
 .claude/
 SuperBizAgent-release-2026-01-09/
 .ace-tool/
+
+# Production monitoring secrets (see deploy/README.md).
+deploy/monitoring/secrets/
+deploy/monitoring/.env

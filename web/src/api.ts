@@ -1,5 +1,22 @@
 export type JsonObject = Record<string, unknown>;
 
+// Session is the identity the server proved for this browser. Roles nest:
+// viewer reads, operator also decides/asks/rediagnoses, admin also switches models.
+export type Role = "viewer" | "operator" | "admin";
+
+export interface Session {
+  id: string;
+  name: string;
+  role: Role;
+}
+
+export function canOperate(session: Session): boolean {
+  return session.role === "operator" || session.role === "admin";
+}
+
+// Dispatched whenever the server rejects the session so the app can sign out.
+export const unauthorizedEvent = "oncall:unauthorized";
+
 export interface Incident {
   id: number;
   group_key: string;
@@ -94,17 +111,33 @@ export interface ProblemDTO {
   resolved_at?: string | null;
 }
 
+// ApprovalDTO is the frozen snapshot a person approves. Snapshot fields are
+// empty when the snapshot does not validate against its plan hash.
 export interface ApprovalDTO {
   id: number;
   incident_id: number;
   run_id?: number | null;
+  parent_approval_id?: number | null;
   tool_name: string;
   plan_hash: string;
   reason: string;
-  target?: string | null;
-  risk?: string | null;
-  scope?: string | null;
-  dry_run?: boolean | null;
+  kind: string;
+  target: string;
+  target_id: string;
+  rule_id: string;
+  rule_version: string;
+  mode: string;
+  revision: string;
+  checks: string[];
+  compensation: string;
+  result: Receipt | null;
+  verification: {
+    status: string;
+    phase?: string;
+    last_checked_at?: string | null;
+    deadline_at?: string | null;
+    detail?: string;
+  };
   status: string;
   expires_at: string;
   created_at?: string;
@@ -160,6 +193,7 @@ export interface ControlRoom {
   flow_nodes: FlowNode[];
   open_problems: ProblemDTO[];
   pending_approval: ApprovalDTO | null;
+  latest_action: ApprovalDTO | null;
   recent_events: EventDTO[];
 }
 
@@ -346,24 +380,66 @@ function toProblem(value: unknown): ProblemDTO {
 }
 
 function toApproval(value: unknown): ApprovalDTO {
+  const source = object(value);
+  // Decision fields use the exact contract: never coerce unknown values into consent.
+  const field = (key: string): string => typeof source[key] === "string" ? source[key] : "";
+  const verification = object(source.verification);
   return {
-    id: number(read(value, "id")),
-    incident_id: number(read(value, "incident_id", "incidentId")),
-    run_id: optionalNumber(read(value, "run_id", "runId")),
-    tool_name: text(read(value, "tool_name", "toolName")),
-    plan_hash: text(read(value, "plan_hash", "planHash")),
-    reason: text(read(value, "reason")),
-    target: optionalText(read(value, "target")),
-    risk: optionalText(read(value, "risk")),
-    scope: optionalText(read(value, "scope")),
-    dry_run: read(value, "dry_run", "dryRun") === undefined ? undefined : boolean(read(value, "dry_run", "dryRun")),
-    status: text(read(value, "status"), "pending"),
-    expires_at: text(read(value, "expires_at", "expiresAt")),
+    id: number(source.id),
+    incident_id: number(source.incident_id),
+    run_id: optionalNumber(source.run_id),
+    parent_approval_id: optionalNumber(source.parent_approval_id),
+    tool_name: field("tool_name"),
+    plan_hash: field("plan_hash"),
+    reason: field("reason"),
+    kind: field("kind"),
+    target: field("target"),
+    target_id: field("target_id"),
+    rule_id: field("rule_id"),
+    rule_version: field("rule_version"),
+    mode: field("mode"),
+    revision: field("revision"),
+    checks: Array.isArray(source.checks) ? source.checks.filter((value): value is string => typeof value === "string") : [],
+    compensation: field("compensation"),
+    result: source.result && typeof source.result === "object" ? toReceipt(source.result) : null,
+    verification: {
+      status: text(verification.status, "unknown"),
+      phase: optionalText(verification.phase) ?? undefined,
+      last_checked_at: optionalText(verification.last_checked_at),
+      deadline_at: optionalText(verification.deadline_at),
+      detail: optionalText(verification.detail) ?? undefined,
+    },
+    status: field("status"),
+    expires_at: field("expires_at"),
     created_at: optionalText(read(value, "created_at", "createdAt")) ?? undefined,
     decided_by: optionalText(read(value, "decided_by", "decidedBy")),
     decided_at: optionalText(read(value, "decided_at", "decidedAt")),
     decision_reason: optionalText(read(value, "decision_reason", "decisionReason")),
     decision_source: optionalText(read(value, "decision_source", "decisionSource")),
+  };
+}
+
+// Receipt is the structured execution result: whether the write happened.
+export interface Receipt {
+  written: boolean;
+  outcome: string;
+  before: string;
+  after: string;
+  detail: string;
+  error: string;
+  manual_check: boolean;
+}
+
+function toReceipt(value: unknown): Receipt {
+  const source = object(value);
+  return {
+    written: source.written === true,
+    outcome: text(source.outcome),
+    before: text(source.before),
+    after: text(source.after),
+    detail: text(source.detail),
+    error: text(source.error),
+    manual_check: source.manual_check === true,
   };
 }
 
@@ -443,16 +519,21 @@ async function parseResponse(response: Response): Promise<unknown> {
   }
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const method = (init.method ?? "GET").toUpperCase();
   const headers = new Headers(init.headers);
   headers.set("Accept", "application/json");
+  // The server requires this header on cookie-authenticated writes (CSRF).
+  headers.set("X-Requested-With", "oncall-console");
   if (method !== "GET" && method !== "HEAD" && init.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
 
   const response = await fetch(path, { ...init, headers, credentials: "same-origin" });
   const body = await parseResponse(response);
+  if (response.status === 401 && path !== "/api/v1/session") {
+    window.dispatchEvent(new Event(unauthorizedEvent));
+  }
   if (!response.ok) {
     const message = text(read(body, "error", "message"), response.statusText || "Request failed");
     throw new ApiError(response.status, message, body);
@@ -468,6 +549,7 @@ export async function getControlRoom(incidentID: number): Promise<ControlRoom> {
   const currentRunValue = read(body, "current_run", "currentRun");
   const currentRun = currentRunValue && Object.keys(object(currentRunValue)).length ? toRun(currentRunValue) : null;
   const approvalValue = read(body, "pending_approval", "pendingApproval");
+  const latestActionValue = read(body, "latest_action");
   return {
     incident,
     members: list(body, "members").map(toMember),
@@ -475,6 +557,7 @@ export async function getControlRoom(incidentID: number): Promise<ControlRoom> {
     flow_nodes: list(body, "flow_nodes").map(toFlowNode),
     open_problems: list(body, "open_problems").map(toProblem),
     pending_approval: approvalValue && Object.keys(object(approvalValue)).length ? toApproval(approvalValue) : null,
+    latest_action: latestActionValue && Object.keys(object(latestActionValue)).length ? toApproval(latestActionValue) : null,
     recent_events: list(body, "recent_events").map(toEvent).filter((event) => event.id > 0),
   };
 }
@@ -490,14 +573,37 @@ export async function getCurrentModel(): Promise<ModelState> {
   return toModelState(await request<unknown>("/api/v1/control-room/model"));
 }
 
-export async function switchCurrentModel(token: string, model: string): Promise<ModelState> {
-  const managementToken = token.trim();
-  if (!managementToken) throw new ApiError(401, "请输入模型管理令牌");
+export async function switchCurrentModel(model: string): Promise<ModelState> {
   return toModelState(await request<unknown>("/api/v1/admin/model", {
     method: "PUT",
-    headers: { Authorization: `Bearer ${managementToken}` },
     body: JSON.stringify({ model }),
   }));
+}
+
+function toSession(value: unknown): Session {
+  const role = text(read(value, "role"));
+  return {
+    id: text(read(value, "id")),
+    name: text(read(value, "name")),
+    role: role === "admin" || role === "operator" ? role : "viewer",
+  };
+}
+
+export async function getSession(): Promise<Session> {
+  return toSession(await request<unknown>("/api/v1/session"));
+}
+
+// login exchanges a personal token for an HttpOnly session cookie. The token is
+// not stored by the browser.
+export async function login(token: string): Promise<Session> {
+  return toSession(await request<unknown>("/api/v1/session", {
+    method: "POST",
+    body: JSON.stringify({ token: token.trim() }),
+  }));
+}
+
+export async function logout(): Promise<void> {
+  await request<unknown>("/api/v1/session", { method: "DELETE" });
 }
 
 export async function getEvents(incidentID: number, after = 0, limit = 100): Promise<EventDTO[]> {
@@ -579,10 +685,10 @@ export async function requestEvidence(incidentID: number, requestText = "Collect
   });
 }
 
-export async function decideApproval(approvalID: number, approve: boolean, reason = ""): Promise<ApprovalDTO> {
+export async function decideApproval(approvalID: number, approve: boolean, planHash: string, reason: string): Promise<ApprovalDTO> {
   const body = await request<unknown>(`/api/v1/approvals/${approvalID}/${approve ? "approve" : "deny"}`, {
     method: "POST",
-    body: JSON.stringify({ reason }),
+    body: JSON.stringify({ plan_hash: planHash, reason }),
   });
   return toApproval(unwrap(body, "approval"));
 }
@@ -614,7 +720,7 @@ export function subscribeIncident(incidentID: number, options: IncidentStreamOpt
 		"incident.created", "incident.promoted", "incident.resolved", "run.queued", "run.started", "run.succeeded", "run.failed", "run.stalled",
 		"collector.started", "collector.completed", "collector.failed", "llm.started", "llm.tool_called", "llm.completed", "llm.failed",
 		"guard.evaluated", "guard.overridden", "policy.evaluated", "policy.degraded", "approval.created", "approval.approved", "approval.denied", "approval.expired",
-		"execution.started", "execution.completed", "execution.failed", "verify.passed", "verify.failed", "verify.inconclusive", "retry.scheduled", "escalation.required",
+		"execution.started", "execution.completed", "execution.failed", "execution.aborted", "compensation.queued", "verify.queued", "verify.started", "verify.checked", "verify.passed", "verify.failed", "verify.inconclusive", "verify.stable", "verify.recurred", "retry.scheduled", "escalation.required", "review.recorded",
 		"notification.sent", "notification.failed", "conversation.asked", "conversation.answered", "conversation.failed", "incident.event",
 	];
 	for (const eventName of eventNames) source.addEventListener(eventName, consume);
@@ -622,4 +728,222 @@ export function subscribeIncident(incidentID: number, options: IncidentStreamOpt
 		for (const eventName of eventNames) source.removeEventListener(eventName, consume);
 		source.close();
 	};
+}
+
+// Remediation is the automatic-handling state: the rules release in effect,
+// emergency stop, per-rule budget use and blocks, and the control audit.
+export interface RemediationRule {
+  id: string;
+  action: string;
+  mode: string;
+  alerts: string[];
+  max_executions: number;
+  window_minutes: number;
+  executions: number;
+  blocked: string;
+}
+
+export interface ControlEvent {
+  id: number;
+  kind: string;
+  rule_id: string;
+  actor: string;
+  reason: string;
+  created_at: string;
+}
+
+export interface Remediation {
+  service: string;
+  env: string;
+  rules_version: string;
+  emergency_stop: boolean;
+  stop_reason: string;
+  maintenance: string;
+  busy_with: number;
+  rules: RemediationRule[];
+  events: ControlEvent[];
+}
+
+function strings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+export async function getRemediation(): Promise<Remediation> {
+  const body = object(await request<unknown>("/api/v1/remediation"));
+  return {
+    service: text(body.service),
+    env: text(body.env),
+    rules_version: text(body.rules_version),
+    emergency_stop: body.emergency_stop === true,
+    stop_reason: text(body.stop_reason),
+    maintenance: text(body.maintenance),
+    busy_with: number(body.busy_with),
+    rules: list(body, "rules").map((value) => {
+      const rule = object(value);
+      return {
+        id: text(rule.id), action: text(rule.action), mode: text(rule.mode), alerts: strings(rule.alerts),
+        max_executions: number(rule.max_executions), window_minutes: number(rule.window_minutes),
+        executions: number(rule.executions), blocked: text(rule.blocked),
+      };
+    }),
+    events: list(body, "events").map((value) => {
+      const event = object(value);
+      return { id: number(event.id), kind: text(event.kind), rule_id: text(event.rule_id), actor: text(event.actor), reason: text(event.reason), created_at: text(event.created_at) };
+    }),
+  };
+}
+
+// controlRemediation records an admin decision: stop, resume or a rule reset.
+export async function controlRemediation(kind: "stop" | "resume" | "reset", reason: string, ruleID = ""): Promise<void> {
+  const path = kind === "reset" ? `/api/v1/remediation/rules/${encodeURIComponent(ruleID)}/reset` : `/api/v1/remediation/${kind}`;
+  await request(path, { method: "POST", body: JSON.stringify({ reason: reason.slice(0, 500) }) });
+}
+
+// Report figures are null when their denominator is zero: a small sample is
+// never shown as a rate.
+export interface Report {
+  since: string;
+  until: string;
+  incidents: number;
+  executions: { total: number; reviewed: number; wrong: number; coverage: number | null; error_rate: number | null };
+  unattended: { recovered: number; confirmed: number; rate: number | null; confirmed_rate: number | null; in_scope: number; in_scope_rate: number | null };
+  recovery_minutes: { median: number | null; max: number | null };
+  recurrence: { watched: number; recurred: number; rate: number | null };
+  manual: { incidents: number; share: number | null; minutes: number };
+  cost: { tokens_in: number; tokens_out: number; tokens_per_incident: number | null };
+  root_cause: { reviewed: number; correct: number; partial: number; wrong: number; unknown: number; accuracy: number | null };
+  review_queue: { incident_id: number; approval_id: number; reason: string }[];
+}
+
+export async function getReport(days = 30): Promise<Report> {
+  return request<Report>(`/api/v1/remediation/report?days=${Math.min(90, Math.max(1, days))}`);
+}
+
+export interface Review {
+  id: number;
+  incident_id: number;
+  run_id?: number | null;
+  approval_id?: number | null;
+  subject: string;
+  verdict: string;
+  root_cause: string;
+  actual_fix: string;
+  manual_minutes: number;
+  reviewer: string;
+  created_at: string;
+}
+
+function toReview(value: unknown): Review {
+  const source = object(value);
+  return {
+    id: number(source.id), incident_id: number(source.incident_id), run_id: optionalNumber(source.run_id), approval_id: optionalNumber(source.approval_id),
+    subject: text(source.subject), verdict: text(source.verdict), root_cause: text(source.root_cause), actual_fix: text(source.actual_fix),
+    manual_minutes: number(source.manual_minutes), reviewer: text(source.reviewer), created_at: text(source.created_at),
+  };
+}
+
+export async function getReviews(incidentID: number): Promise<Review[]> {
+  return list(await request<unknown>(`/api/v1/incidents/${incidentID}/reviews`), "reviews").map(toReview);
+}
+
+export interface ReviewInput {
+  subject: "diagnosis" | "action";
+  verdict: "correct" | "partial" | "wrong" | "unknown";
+  run_id?: number;
+  approval_id?: number;
+  root_cause: string;
+  actual_fix: string;
+  manual_minutes: number;
+}
+
+export async function addReview(incidentID: number, input: ReviewInput): Promise<Review> {
+  return toReview(await request<unknown>(`/api/v1/incidents/${incidentID}/reviews`, { method: "POST", body: JSON.stringify(input) }));
+}
+
+export interface Change {
+  id: number;
+  change_type: string;
+  release_id: string;
+  image_ref: string;
+  db_migration: string;
+  verified_at?: string | null;
+  occurred_at: string;
+  source: string;
+  actor: string;
+}
+
+export async function getChanges(): Promise<Change[]> {
+  return list(await request<unknown>("/api/v1/changes"), "changes").map((value) => {
+    const source = object(value);
+    return {
+      id: number(source.id), change_type: text(source.change_type), release_id: text(source.release_id), image_ref: text(source.image_ref),
+      db_migration: text(source.db_migration), verified_at: optionalText(source.verified_at), occurred_at: text(source.occurred_at),
+      source: text(source.source), actor: text(source.actor),
+    };
+  });
+}
+
+export async function verifyRelease(changeID: number): Promise<void> {
+  await request(`/api/v1/changes/${changeID}/verify`, { method: "POST" });
+}
+
+// listApprovals feeds the overview's decision queue; status is the server filter
+// (for example "pending"). Snapshot fields follow the same exact contract as the
+// control room, so an unverifiable snapshot is shown incomplete, never inferred.
+export async function listApprovals(status = "pending"): Promise<ApprovalDTO[]> {
+  const query = status ? `?status=${encodeURIComponent(status)}` : "";
+  return list(await request<unknown>(`/api/v1/approvals${query}`), "approvals").map(toApproval);
+}
+
+export type NodeState = "up" | "down" | "unknown" | "missing";
+
+export interface TopologyNode {
+  id: string;
+  kind: string;
+  container: string;
+  state: NodeState;
+  detail: string;
+  container_id: string;
+  restart_count: number;
+  oom_killed: boolean;
+  alerts: string[];
+}
+
+export interface TopologyEdge {
+  from: string;
+  to: string;
+  type: string;
+}
+
+// Topology is the declared graph with states observed at checked_at. highlight
+// lists the nodes the requested incident's alerts map to.
+export interface Topology {
+  checked_at: string;
+  nodes: TopologyNode[];
+  edges: TopologyEdge[];
+  alerts_error: string;
+  highlight: string[];
+}
+
+const nodeStates: NodeState[] = ["up", "down", "unknown", "missing"];
+
+export async function getTopology(incidentID = 0): Promise<Topology> {
+  const body = object(await request<unknown>(`/api/v1/topology${incidentID > 0 ? `?incident=${incidentID}` : ""}`));
+  return {
+    checked_at: text(body.checked_at),
+    alerts_error: text(body.alerts_error),
+    highlight: strings(body.highlight),
+    nodes: list(body, "nodes").map((value) => {
+      const node = object(value);
+      const state = nodeStates.find((item) => item === node.state) ?? "unknown";
+      return {
+        id: text(node.id), kind: text(node.kind), container: text(node.container), state, detail: text(node.detail),
+        container_id: text(node.container_id), restart_count: number(node.restart_count), oom_killed: node.oom_killed === true, alerts: strings(node.alerts),
+      };
+    }),
+    edges: list(body, "edges").map((value) => {
+      const edge = object(value);
+      return { from: text(edge.from), to: text(edge.to), type: text(edge.type) };
+    }),
+  };
 }

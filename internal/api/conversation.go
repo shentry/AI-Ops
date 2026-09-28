@@ -30,16 +30,16 @@ type IncidentActionService interface {
 	RequestEvidence(context.Context, uint64, Actor, string) error
 }
 
-// ConversationAPI serves public conversation history and asynchronous Incident
-// actions. A nil console keeps every route closed.
+// ConversationAPI serves conversation history to viewers and asynchronous
+// Incident actions to operators. Actions record the server-proven identity.
 type ConversationAPI struct {
 	service ConversationService
-	console *Console
+	auth    *Auth
 	actions IncidentActionService
 }
 
-func NewConversationAPI(service ConversationService, console *Console, actions IncidentActionService) *ConversationAPI {
-	return &ConversationAPI{service: service, console: console, actions: actions}
+func NewConversationAPI(service ConversationService, auth *Auth, actions IncidentActionService) *ConversationAPI {
+	return &ConversationAPI{service: service, auth: auth, actions: actions}
 }
 
 func (h *ConversationAPI) Handle(r *ghttp.Request) {
@@ -93,8 +93,7 @@ func (h *ConversationAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ConversationAPI) list(w http.ResponseWriter, r *http.Request, incidentID uint64) {
-	if _, ok := h.console.Actor(); !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
+	if _, ok := h.auth.Require(w, r, RoleViewer, true); !ok {
 		return
 	}
 	if h.service == nil {
@@ -129,9 +128,8 @@ func (h *ConversationAPI) list(w http.ResponseWriter, r *http.Request, incidentI
 }
 
 func (h *ConversationAPI) ask(w http.ResponseWriter, r *http.Request, incidentID uint64) {
-	actor, ok := h.console.Actor()
+	actor, ok := h.auth.Require(w, r, RoleOperator, false)
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 	if h.service == nil {
@@ -150,7 +148,7 @@ func (h *ConversationAPI) ask(w http.ResponseWriter, r *http.Request, incidentID
 		writeError(w, http.StatusBadRequest, "question must contain 1-4000 characters")
 		return
 	}
-	messageRow, err := h.service.Ask(r.Context(), incidentID, conversation.Actor{ID: actor.ID, Name: actor.Name, Source: "web"}, question, "web")
+	messageRow, err := h.service.Ask(r.Context(), incidentID, conversation.Actor{ID: actor.ID, Name: actor.Name, Source: actor.Source}, question, "web")
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrIncidentNotFound):
@@ -168,9 +166,8 @@ func (h *ConversationAPI) ask(w http.ResponseWriter, r *http.Request, incidentID
 }
 
 func (h *ConversationAPI) rediagnose(w http.ResponseWriter, r *http.Request, incidentID uint64) {
-	actor, ok := h.console.Actor()
+	actor, ok := h.auth.Require(w, r, RoleOperator, false)
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 	if h.actions == nil {
@@ -179,20 +176,15 @@ func (h *ConversationAPI) rediagnose(w http.ResponseWriter, r *http.Request, inc
 	}
 	run, err := h.actions.Rediagnose(r.Context(), incidentID, actor)
 	if err != nil {
-		if errors.Is(err, store.ErrIncidentNotFound) {
-			writeError(w, http.StatusNotFound, "incident not found")
-			return
-		}
-		writeError(w, http.StatusServiceUnavailable, "queue rediagnosis failed")
+		writeRunAdmissionError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"run": runDTO(run)})
 }
 
 func (h *ConversationAPI) requestEvidence(w http.ResponseWriter, r *http.Request, incidentID uint64) {
-	actor, ok := h.console.Actor()
+	actor, ok := h.auth.Require(w, r, RoleOperator, false)
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 	if h.actions == nil {

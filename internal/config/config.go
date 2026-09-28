@@ -4,13 +4,22 @@
 package config
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"oncall-agent/internal/incident"
 )
 
 var (
@@ -39,11 +48,150 @@ type Config struct {
 	Tools     ToolsConfig     `yaml:"tools"`
 	Notify    NotifyConfig    `yaml:"notify"`
 	Web       WebConfig       `yaml:"web"`
+	// Service is the one trusted description of the monitored service: its
+	// identity, targets, health, admin API and release entry.
+	Service ServiceConfig `yaml:"service"`
+	// Remediation holds the versioned action rules and their verification.
+	Remediation RemediationConfig `yaml:"remediation"`
+	// Topology declares what the service depends on. The service's own node
+	// comes from Service; only the other nodes and the edges are written here.
+	Topology TopologyConfig `yaml:"topology"`
+}
+
+// Topology node kinds and edge types. A depends_on edge propagates failure:
+// restarting a service whose dependency is down does not help. runs_on only
+// records placement.
+const (
+	TopologyDependsOn = "depends_on"
+	TopologyRunsOn    = "runs_on"
+)
+
+var topologyKinds = map[string]bool{"service": true, "container": true, "datastore": true, "upstream": true, "host": true}
+
+type TopologyConfig struct {
+	Nodes []TopologyNode `yaml:"nodes"`
+	Edges []TopologyEdge `yaml:"edges"`
+}
+
+// TopologyNode is observed through its container (docker inspect) and its
+// health expression: a PromQL instant query returning one sample, 1 for up and
+// 0 for down. A node with neither is shown but its state stays unknown.
+type TopologyNode struct {
+	ID        string `yaml:"id"`
+	Kind      string `yaml:"kind"`
+	Container string `yaml:"container"`
+	Health    string `yaml:"health"`
+}
+
+type TopologyEdge struct {
+	From string `yaml:"from"`
+	To   string `yaml:"to"`
+	Type string `yaml:"type"`
+}
+
+// ServiceConfig is the only place that names the monitored service. Evidence,
+// actions and verification all read targets from here.
+type ServiceConfig struct {
+	Name      string `yaml:"name"`
+	Env       string `yaml:"env"`
+	Container string `yaml:"container"`
+	// BaseURL is the service origin: health checks, admin API and probes.
+	BaseURL string `yaml:"base_url"`
+	// AdminAPIKey has full sub2api admin authority; callers are restricted to
+	// their own endpoint allowlists. Empty disables upstream evidence and actions.
+	AdminAPIKey   string        `yaml:"admin_api_key"`
+	PostgresDSN   string        `yaml:"postgres_dsn"`
+	RedisAddr     string        `yaml:"redis_addr"`
+	RedisPassword string        `yaml:"redis_password"`
+	Probe         ProbeConfig   `yaml:"probe"`
+	Release       ReleaseConfig `yaml:"release"`
+}
+
+// ProbeConfig is the optional business probe: a dedicated low-cost test key
+// and model. Each call reaches an upstream model and costs money.
+type ProbeConfig struct {
+	Path   string `yaml:"path"`
+	Model  string `yaml:"model"`
+	APIKey string `yaml:"api_key"`
+}
+
+// ReleaseConfig is the deployment entry used by deployment_rollback: a fixed
+// executable run with an argument array (the approved image reference is
+// appended), never a shell string. It must honor the same lock file as CI/CD.
+type ReleaseConfig struct {
+	Command        []string `yaml:"command"`
+	WorkDir        string   `yaml:"work_dir"`
+	LockFile       string   `yaml:"lock_file"`
+	TimeoutSeconds int      `yaml:"timeout_seconds"`
+}
+
+// RemediationConfig is the pre-authorization of automatic handling. It is a
+// version-managed configuration release; there is no second rule store.
+type RemediationConfig struct {
+	RulesVersion string              `yaml:"rules_version"`
+	Rules        []RuleConfig        `yaml:"rules"`
+	Maintenance  []MaintenanceWindow `yaml:"maintenance"`
+	Verification VerificationConfig  `yaml:"verification"`
+}
+
+// RuleConfig authorizes one action for a fault condition within bounds.
+// Mode observe records what would be done; manual needs a person to approve
+// the frozen snapshot; auto executes when every fact, scope and budget holds.
+type RuleConfig struct {
+	ID     string   `yaml:"id"`
+	Action string   `yaml:"action"`
+	Mode   string   `yaml:"mode"`
+	Alerts []string `yaml:"alerts"`
+	// MaxExecutions real executions per WindowMinutes.
+	MaxExecutions int `yaml:"max_executions"`
+	WindowMinutes int `yaml:"window_minutes"`
+	// MinAvailableAccounts is the floor of schedulable accounts left in each
+	// affected group after upstream_quarantine.
+	MinAvailableAccounts int `yaml:"min_available_accounts"`
+	// MaxErrorRatio and MinRequests define business recovery for actions
+	// verified on real traffic; too few requests is not a pass.
+	MaxErrorRatio float64 `yaml:"max_error_ratio"`
+	MinRequests   int     `yaml:"min_requests"`
+	// Compensate pre-authorizes the action's frozen undo when verification fails.
+	Compensate bool `yaml:"compensate"`
+	// VerifyWindowSeconds overrides the verification window for this rule.
+	// Traffic checks read a trailing five-minute window, so actions verified on
+	// real requests need a longer window than a health probe.
+	VerifyWindowSeconds int `yaml:"verify_window_seconds"`
+}
+
+type MaintenanceWindow struct {
+	Start  time.Time `yaml:"start"`
+	End    time.Time `yaml:"end"`
+	Reason string    `yaml:"reason"`
+}
+
+// Release binds permissions to the rules, service identity and verification.
+// Credentials are hashed with the configuration and are never returned or audited.
+func (r RemediationConfig) Release(service ServiceConfig) string {
+	content, _ := json.Marshal(struct {
+		Rules        []RuleConfig
+		Service      ServiceConfig
+		Verification VerificationConfig
+	}{r.Rules, service, r.Verification})
+	sum := sha256.Sum256(content)
+	return r.RulesVersion + "@" + hex.EncodeToString(sum[:])[:12]
+}
+
+// InMaintenance returns the reason of the window covering now, if any.
+func (r RemediationConfig) InMaintenance(now time.Time) (string, bool) {
+	for _, window := range r.Maintenance {
+		if !now.Before(window.Start) && now.Before(window.End) {
+			return window.Reason, true
+		}
+	}
+	return "", false
 }
 
 type ServerConfig struct {
-	Port      int    `yaml:"port"`
-	AuthToken string `yaml:"auth_token"`
+	ListenAddr string `yaml:"listen_addr"`
+	Port       int    `yaml:"port"`
+	AuthToken  string `yaml:"auth_token"`
 }
 
 type MySQLConfig struct {
@@ -58,8 +206,20 @@ type LLMConfig struct {
 // ModelProfile is one selectable model from the server-owned allowlist. The
 // endpoint and API key remain role configuration, never browser input.
 type ModelProfile struct {
-	ID       string         `yaml:"id"`
-	Thinking ThinkingConfig `yaml:"thinking"`
+	ID                  string         `yaml:"id"`
+	Thinking            ThinkingConfig `yaml:"thinking"`
+	ContextWindowTokens int            `yaml:"context_window_tokens"`
+}
+
+// DefaultContextWindowTokens is an application fallback for unspecified models,
+// not a claim about any provider's actual capacity. Set each profile explicitly.
+const DefaultContextWindowTokens = 131072
+
+func (p ModelProfile) ContextWindow() int {
+	if p.ContextWindowTokens == 0 {
+		return DefaultContextWindowTokens
+	}
+	return p.ContextWindowTokens
 }
 
 type LLMRoles struct {
@@ -101,23 +261,31 @@ type DiagnoseConfig struct {
 	Evidence      EvidenceConfig    `yaml:"evidence"`
 }
 
-// EvidenceConfig 是 D07 证据采集的数据源配置。地址类字段全部可空：
-// 空表示该数据源缺席，对应 collector 记录"缺失"而不是让诊断失败。
+// VerificationConfig 控制独立恢复验证的调度，不复用证据采集超时。
+// RequiredPasses 是判定恢复所需的连续健康观测次数；WatchSeconds 是恢复后
+// 识别复发的观察窗口。写入审批快照后对该次处置不可改。
+type VerificationConfig struct {
+	IntervalSeconds int `yaml:"interval_seconds"`
+	WindowSeconds   int `yaml:"window_seconds"`
+	TimeoutSeconds  int `yaml:"timeout_seconds"`
+	RequiredPasses  int `yaml:"required_passes"`
+	WatchSeconds    int `yaml:"watch_seconds"`
+}
+
+// EvidenceConfig 是证据采集自身的参数；采集目标来自 service。
 type EvidenceConfig struct {
-	Sub2APIBaseURL    string `yaml:"sub2api_base_url"`
-	Sub2APIMetricsJob string `yaml:"sub2api_metrics_job"`
-	PostgresDSN       string `yaml:"postgres_dsn"`
-	RedisAddr         string `yaml:"redis_addr"`
-	RedisPassword     string `yaml:"redis_password"`
-	DockerContainer   string `yaml:"docker_container"`
-	DockerSocket      string `yaml:"docker_socket"`
-	TimeoutSeconds    int    `yaml:"timeout_seconds"`
-	LogMaxLines       int    `yaml:"log_max_lines"`
+	DockerSocket   string `yaml:"docker_socket"`
+	TimeoutSeconds int    `yaml:"timeout_seconds"`
+	LogMaxLines    int    `yaml:"log_max_lines"`
 }
 
 type DiagnoseBudget struct {
 	FullSteps  int `yaml:"full_steps"`
 	LightSteps int `yaml:"light_steps"`
+}
+
+func DefaultDiagnoseBudget() DiagnoseBudget {
+	return DiagnoseBudget{FullSteps: 32, LightSteps: 16}
 }
 
 type MemoryConfig struct {
@@ -126,37 +294,14 @@ type MemoryConfig struct {
 	CmdHistoryInject   int  `yaml:"cmd_history_inject"`
 }
 
+// ApprovalConfig 只管人工审批单的有效期；是否需要审批由 remediation 规则决定。
 type ApprovalConfig struct {
 	TTLMinutes int `yaml:"ttl_minutes"`
-	// AutoExecuteL2 是 L2 自动路径全局开关：默认关，L2 一律降级为审批。
-	AutoExecuteL2 bool `yaml:"auto_execute_l2"`
-	// DryRun 为真时 L2 只演练不真实执行（执行层检查）。
-	DryRun bool `yaml:"dry_run"`
-	// VerifyDelaySeconds 是执行后 Verify 的复查延迟。
-	VerifyDelaySeconds int `yaml:"verify_delay_seconds"`
-	// L2RateWindowMinutes / L2MaxPerWindow 是 L2 自动路径的限频护栏：
-	// 同一 target+action（同 plan_hash）在窗口内最多执行 L2MaxPerWindow 次，
-	// 超限降级审批 —— 自动路径不许无限重复同一个动作。
-	L2RateWindowMinutes int `yaml:"l2_rate_window_minutes"`
-	L2MaxPerWindow      int `yaml:"l2_max_per_window"`
 }
 
 type ToolsConfig struct {
-	Prometheus PrometheusConfig  `yaml:"prometheus"`
-	Logs       LogsConfig        `yaml:"logs"`
-	MySQLRead  MySQLReadConfig   `yaml:"mysql_select"`
-	Docker     DockerToolsConfig `yaml:"docker"`
-}
-
-// DockerToolsConfig 是 Docker 变更动作的配置。
-// AllowedContainers 是 docker_restart 的目标白名单（GC-11/GC-12）：
-// 空列表 = 没有可重启目标，一切重启请求被拒。
-// 两个限频字段是工具层的兜底护栏：即使上游决策放行，同一容器也不能
-// 被高频重启（对应设计"同一 target/action 在时间窗口内限制执行次数"）。
-type DockerToolsConfig struct {
-	AllowedContainers         []string `yaml:"allowed_containers"`
-	RestartMinIntervalSeconds int      `yaml:"restart_min_interval_seconds"`
-	RestartMaxPerHour         int      `yaml:"restart_max_per_hour"`
+	Prometheus PrometheusConfig `yaml:"prometheus"`
+	Loki       LokiConfig       `yaml:"loki"`
 }
 
 type PrometheusConfig struct {
@@ -165,15 +310,12 @@ type PrometheusConfig struct {
 	MaxPoints    int    `yaml:"max_points"`
 }
 
-type LogsConfig struct {
-	Enabled  bool   `yaml:"enabled"`
-	Provider string `yaml:"provider"`
-	Region   string `yaml:"region"`
-	TopicID  string `yaml:"topic_id"`
-}
-
-type MySQLReadConfig struct {
-	DSN string `yaml:"dsn"`
+// LokiConfig is the optional historical log search. An empty base_url leaves
+// loki_query unregistered; diagnosis then relies on docker_logs alone.
+type LokiConfig struct {
+	BaseURL          string `yaml:"base_url"`
+	MaxLines         int    `yaml:"max_lines"`
+	MaxWindowMinutes int    `yaml:"max_window_minutes"`
 }
 
 type NotifyConfig struct {
@@ -198,13 +340,30 @@ type FeishuConfig struct {
 }
 
 // WebConfig controls the browser control-room surface. A non-empty base_url
-// (or a configured feishu_app provider) enables the public console; the console
-// has no login, so there is no session or cookie configuration.
+// (or a configured feishu_app provider) enables the console, which then
+// requires at least one configured operator: there is no anonymous console.
 type WebConfig struct {
 	BaseURL string `yaml:"base_url"`
 	// OperatorAllowlist is the Feishu open_id allowlist for approval cards. It
-	// governs the Feishu callback only; the public console is not gated by it.
+	// governs the Feishu callback only; console access is governed by Operators.
 	OperatorAllowlist []string `yaml:"operator_allowlist"`
+	// Operators are the people (or service identities) allowed to use the
+	// console and operator APIs. Only the SHA-256 of each personal token is stored.
+	Operators []OperatorConfig `yaml:"operators"`
+}
+
+// OperatorConfig is one server-side identity. Role is viewer, operator or admin;
+// token_sha256 is the lowercase hex SHA-256 of a high-entropy personal token.
+type OperatorConfig struct {
+	ID          string `yaml:"id"`
+	Name        string `yaml:"name"`
+	Role        string `yaml:"role"`
+	TokenSHA256 string `yaml:"token_sha256"`
+}
+
+// ConsoleEnabled reports whether the browser console is served.
+func (c Config) ConsoleEnabled() bool {
+	return strings.TrimSpace(c.Web.BaseURL) != "" || strings.EqualFold(strings.TrimSpace(c.Notify.IM.Provider), "feishu_app")
 }
 
 // Load 读 YAML、展开 ${ENV}、套上非敏感默认值，再校验必填项和数值边界。
@@ -219,15 +378,31 @@ func Load(path string) (Config, error) {
 	}
 
 	var document yaml.Node
-	if err := yaml.Unmarshal(contents, &document); err != nil {
+	parser := yaml.NewDecoder(bytes.NewReader(contents))
+	if err := parser.Decode(&document); err != nil {
 		return Config{}, fmt.Errorf("config: parse YAML: %w", err)
+	}
+	var extra yaml.Node
+	if err := parser.Decode(&extra); err != io.EOF {
+		if err != nil {
+			return Config{}, fmt.Errorf("config: parse YAML: %w", err)
+		}
+		return Config{}, fmt.Errorf("config: only one YAML document is allowed")
 	}
 	if err := expandEnvironment(&document); err != nil {
 		return Config{}, err
 	}
-
+	if err := rejectNullListenAddr(&document); err != nil {
+		return Config{}, err
+	}
+	encoded, err := yaml.Marshal(&document)
+	if err != nil {
+		return Config{}, fmt.Errorf("config: encode expanded YAML: %w", err)
+	}
 	cfg := defaultConfig()
-	if err := document.Decode(&cfg); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(encoded))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil {
 		return Config{}, fmt.Errorf("config: decode YAML: %w", err)
 	}
 	normalizeLLMModels(&cfg)
@@ -241,7 +416,7 @@ func Load(path string) (Config, error) {
 // DSN、token、webhook 保持空，缺密钥时不能默默跑起来。
 func defaultConfig() Config {
 	return Config{
-		Server: ServerConfig{Port: 8080},
+		Server: ServerConfig{ListenAddr: "127.0.0.1", Port: 8080},
 		LLM: LLMConfig{Roles: LLMRoles{
 			Reasoner: RoleConfig{MaxTokens: 2048},
 		}},
@@ -254,7 +429,7 @@ func defaultConfig() Config {
 			MinAlerts:     1,
 		},
 		Diagnose: DiagnoseConfig{
-			Budget: DiagnoseBudget{FullSteps: 8, LightSteps: 3},
+			Budget: DefaultDiagnoseBudget(),
 			SeverityRoute: map[string]string{
 				"critical": "full",
 				"high":     "full",
@@ -263,11 +438,9 @@ func defaultConfig() Config {
 				"low":      "skip",
 			},
 			Evidence: EvidenceConfig{
-				Sub2APIMetricsJob: "sub2api",
-				DockerContainer:   "sub2api",
-				DockerSocket:      "/var/run/docker.sock",
-				TimeoutSeconds:    5,
-				LogMaxLines:       200,
+				DockerSocket:   "/var/run/docker.sock",
+				TimeoutSeconds: 5,
+				LogMaxLines:    200,
 			},
 		},
 		Memory: MemoryConfig{
@@ -275,9 +448,10 @@ func defaultConfig() Config {
 			OnlyHighConfidence: true,
 			CmdHistoryInject:   5,
 		},
-		Approval: ApprovalConfig{
-			TTLMinutes: 30, DryRun: true, VerifyDelaySeconds: 30,
-			L2RateWindowMinutes: 60, L2MaxPerWindow: 1,
+		Approval: ApprovalConfig{TTLMinutes: 30},
+		Service:  ServiceConfig{Name: "sub2api", Env: "prod", Container: "sub2api", Release: ReleaseConfig{TimeoutSeconds: 300}},
+		Remediation: RemediationConfig{
+			Verification: VerificationConfig{IntervalSeconds: 10, WindowSeconds: 300, TimeoutSeconds: 5, RequiredPasses: 3, WatchSeconds: 1800},
 		},
 		Tools: ToolsConfig{
 			Prometheus: PrometheusConfig{
@@ -286,8 +460,7 @@ func defaultConfig() Config {
 				RangeMinutes: 15,
 				MaxPoints:    300,
 			},
-			Logs:   LogsConfig{Provider: "cls"},
-			Docker: DockerToolsConfig{RestartMinIntervalSeconds: 60, RestartMaxPerHour: 3},
+			Loki: LokiConfig{MaxLines: 200, MaxWindowMinutes: 360},
 		},
 	}
 }
@@ -343,12 +516,32 @@ func expandEnvironment(node *yaml.Node) error {
 	return nil
 }
 
+// YAML null 不会覆盖 string 默认值，必须在类型解码前拒绝显式空监听地址。
+func rejectNullListenAddr(node *yaml.Node) error {
+	if node.Kind == yaml.MappingNode {
+		for i := 0; i < len(node.Content); i += 2 {
+			if node.Content[i].Value == "listen_addr" && node.Content[i+1].ShortTag() == "!!null" {
+				return fmt.Errorf("config: server.listen_addr must be a valid IP address")
+			}
+		}
+	}
+	for _, child := range node.Content {
+		if err := rejectNullListenAddr(child); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // validate 是启动前的 fail-fast 关口。
 // 数值边界一律在这里挡住：0 或负数会在运行时变成"立即超时"、"审批立即过期"、
-// "跳过 Verify"这类静默失效行为 —— 那时候没人看得出是配置写错了。
+// "验证窗口失效"这类静默失效行为 —— 那时候没人看得出是配置写错了。
 func validate(cfg Config) error {
 	if strings.TrimSpace(cfg.MySQL.DSN) == "" {
 		return fmt.Errorf("config: mysql.dsn is required; set MYSQL_DSN or mysql.dsn")
+	}
+	if net.ParseIP(cfg.Server.ListenAddr) == nil {
+		return fmt.Errorf("config: server.listen_addr must be a valid IP address")
 	}
 	if cfg.Server.Port < 1 || cfg.Server.Port > 65535 {
 		return fmt.Errorf("config: server.port must be between 1 and 65535")
@@ -365,18 +558,19 @@ func validate(cfg Config) error {
 	if err := validatePositiveMinutes("approval.ttl_minutes", cfg.Approval.TTLMinutes); err != nil {
 		return err
 	}
-	// Verify 延迟允许 0（立即复查，单测和演示用），负数不允许 —— 负延迟会
-	// 静默跳过"给系统留出自愈时间"这一步。
-	if err := validateNonNegativeSeconds("approval.verify_delay_seconds", cfg.Approval.VerifyDelaySeconds); err != nil {
-		return err
-	}
-	if err := validatePositiveMinutes("approval.l2_rate_window_minutes", cfg.Approval.L2RateWindowMinutes); err != nil {
-		return err
-	}
-	if cfg.Approval.L2MaxPerWindow < 1 {
-		return fmt.Errorf("config: approval.l2_max_per_window must be at least 1")
-	}
 	if err := validatePositiveSeconds("diagnose.evidence.timeout_seconds", cfg.Diagnose.Evidence.TimeoutSeconds); err != nil {
+		return err
+	}
+	if err := validateVerification(cfg.Remediation.Verification); err != nil {
+		return err
+	}
+	if err := validateService(cfg.Service); err != nil {
+		return err
+	}
+	if err := validateRemediation(cfg.Remediation, cfg.Service); err != nil {
+		return err
+	}
+	if err := validateTopology(cfg.Topology, cfg.Service); err != nil {
 		return err
 	}
 	if cfg.Diagnose.Evidence.LogMaxLines < 1 {
@@ -400,11 +594,11 @@ func validate(cfg Config) error {
 	if cfg.Tools.Prometheus.MaxPoints < 1 {
 		return fmt.Errorf("config: tools.prometheus.max_points must be at least 1")
 	}
-	if err := validateNonNegativeSeconds("tools.docker.restart_min_interval_seconds", cfg.Tools.Docker.RestartMinIntervalSeconds); err != nil {
-		return err
+	if cfg.Tools.Loki.MaxLines < 1 {
+		return fmt.Errorf("config: tools.loki.max_lines must be at least 1")
 	}
-	if cfg.Tools.Docker.RestartMaxPerHour < 1 {
-		return fmt.Errorf("config: tools.docker.restart_max_per_hour must be at least 1")
+	if err := validatePositiveMinutes("tools.loki.max_window_minutes", cfg.Tools.Loki.MaxWindowMinutes); err != nil {
+		return err
 	}
 	if cfg.LLM.Roles.Reasoner.MaxTokens < 1 {
 		return fmt.Errorf("config: llm.roles.reasoner.max_tokens must be at least 1")
@@ -413,6 +607,9 @@ func validate(cfg Config) error {
 		return err
 	}
 	if err := validateModelProfiles(cfg.LLM); err != nil {
+		return err
+	}
+	if err := validateOperators(cfg); err != nil {
 		return err
 	}
 	provider := strings.ToLower(strings.TrimSpace(cfg.Notify.IM.Provider))
@@ -446,6 +643,265 @@ func validate(cfg Config) error {
 	default:
 		return fmt.Errorf("config: notify.im.provider %q is unsupported", cfg.Notify.IM.Provider)
 	}
+	if cfg.AutomaticRemediation() {
+		if err := cfg.validateUnattended(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// AutomaticRemediation reports whether this configuration authorizes unattended writes.
+func (c Config) AutomaticRemediation() bool {
+	for _, rule := range c.Remediation.Rules {
+		if rule.Mode == incident.ModeAuto {
+			return true
+		}
+	}
+	return false
+}
+
+func (c Config) validateUnattended() error {
+	admin := false
+	for _, operator := range c.Web.Operators {
+		admin = admin || operator.Role == "admin"
+	}
+	if !admin {
+		return fmt.Errorf("config: auto remediation requires an admin identity for stop and recovery")
+	}
+	if !strings.EqualFold(c.Notify.IM.Provider, "feishu_app") && strings.TrimSpace(c.Notify.IM.Webhook) == "" {
+		return fmt.Errorf("config: auto remediation requires a notification provider")
+	}
+	for _, rule := range c.Remediation.Rules {
+		if rule.Mode != incident.ModeAuto {
+			continue
+		}
+		v := c.Remediation.VerificationFor(rule)
+		if v.RequiredPasses < 3 || v.WatchSeconds <= v.IntervalSeconds*v.RequiredPasses {
+			return fmt.Errorf("config: auto rule %s requires at least three passes and a watch window", rule.ID)
+		}
+		if rule.Action == "docker_restart" && strings.TrimSpace(c.Service.Probe.APIKey) == "" {
+			return fmt.Errorf("config: auto restart requires a business probe; health alone cannot prove recovery")
+		}
+		if rule.Action == "deployment_rollback" || rule.Action == "upstream_quarantine" {
+			if rule.MinRequests < 1 || v.WindowSeconds <= 300 {
+				return fmt.Errorf("config: auto rule %s requires real traffic samples and a window longer than five minutes", rule.ID)
+			}
+		}
+	}
+	return nil
+}
+
+func validateVerification(v VerificationConfig) error {
+	const field = "remediation.verification"
+	for name, seconds := range map[string]int{"timeout_seconds": v.TimeoutSeconds, "interval_seconds": v.IntervalSeconds, "window_seconds": v.WindowSeconds} {
+		if err := validatePositiveSeconds(field+"."+name, seconds); err != nil {
+			return err
+		}
+	}
+	if v.TimeoutSeconds >= 30 {
+		return fmt.Errorf("config: %s.timeout_seconds must be less than 30 (verification claim limit)", field)
+	}
+	if v.TimeoutSeconds >= v.IntervalSeconds {
+		return fmt.Errorf("config: %s.timeout_seconds must be less than interval_seconds", field)
+	}
+	if v.IntervalSeconds >= v.WindowSeconds {
+		return fmt.Errorf("config: %s.interval_seconds must be less than window_seconds", field)
+	}
+	if err := incident.ValidatePassWindow(v.RequiredPasses, v.IntervalSeconds, v.WindowSeconds); err != nil {
+		return fmt.Errorf("config: %s.required_passes must be 1..100 and (required_passes-1)*interval_seconds must be less than window_seconds", field)
+	}
+	if err := validateNonNegativeSeconds(field+".watch_seconds", v.WatchSeconds); err != nil {
+		return err
+	}
+	if v.WatchSeconds > 0 && v.WatchSeconds <= v.IntervalSeconds {
+		return fmt.Errorf("config: %s.watch_seconds must be 0 or longer than interval_seconds", field)
+	}
+	return nil
+}
+
+var serviceNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,63}$`)
+
+func validateService(s ServiceConfig) error {
+	if !serviceNamePattern.MatchString(s.Name) || !serviceNamePattern.MatchString(s.Container) || !serviceNamePattern.MatchString(s.Env) {
+		return fmt.Errorf("config: service.name, service.env and service.container must be 1-64 lowercase letters, digits and ._-")
+	}
+	if strings.TrimSpace(s.BaseURL) != "" {
+		if _, err := incident.NormalizeHealthBaseURL(s.BaseURL); err != nil {
+			return fmt.Errorf("config: service.base_url must be an HTTP(S) origin without credentials, path or query")
+		}
+	}
+	if p := s.Probe; strings.TrimSpace(p.APIKey) != "" && (!strings.HasPrefix(p.Path, "/") || strings.TrimSpace(p.Model) == "") {
+		return fmt.Errorf("config: service.probe requires path (starting with /) and model when api_key is set")
+	}
+	if r := s.Release; len(r.Command) > 0 {
+		if !strings.HasPrefix(r.Command[0], "/") || !strings.HasPrefix(r.WorkDir, "/") || !strings.HasPrefix(r.LockFile, "/") {
+			return fmt.Errorf("config: service.release requires an absolute command, work_dir and lock_file")
+		}
+		if err := validatePositiveSeconds("service.release.timeout_seconds", r.TimeoutSeconds); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateTopology rejects a graph the Guard could misread: duplicate or unknown
+// nodes, dangling edges and depends_on cycles. The service node is implicit.
+func validateTopology(t TopologyConfig, service ServiceConfig) error {
+	nodes := map[string]bool{service.Name: true}
+	for index, node := range t.Nodes {
+		field := fmt.Sprintf("topology.nodes[%d]", index)
+		if !serviceNamePattern.MatchString(node.ID) || nodes[node.ID] {
+			return fmt.Errorf("config: %s.id must be unique, differ from service.name and be 1-64 lowercase letters, digits and ._-", field)
+		}
+		nodes[node.ID] = true
+		if !topologyKinds[node.Kind] {
+			return fmt.Errorf("config: %s.kind must be service, container, datastore, upstream or host", field)
+		}
+		if node.Container != "" && !serviceNamePattern.MatchString(node.Container) {
+			return fmt.Errorf("config: %s.container must be 1-64 lowercase letters, digits and ._-", field)
+		}
+	}
+	dependsOn := map[string][]string{}
+	edges := map[TopologyEdge]bool{}
+	for index, edge := range t.Edges {
+		field := fmt.Sprintf("topology.edges[%d]", index)
+		if !nodes[edge.From] || !nodes[edge.To] || edge.From == edge.To {
+			return fmt.Errorf("config: %s must connect two different declared nodes", field)
+		}
+		if edge.Type != TopologyDependsOn && edge.Type != TopologyRunsOn {
+			return fmt.Errorf("config: %s.type must be depends_on or runs_on", field)
+		}
+		if edges[edge] {
+			return fmt.Errorf("config: %s duplicates an earlier edge", field)
+		}
+		edges[edge] = true
+		if edge.Type == TopologyDependsOn {
+			dependsOn[edge.From] = append(dependsOn[edge.From], edge.To)
+		}
+	}
+	// Depth-first search: reaching a node still on the stack closes a cycle.
+	state := map[string]int{} // 1 visiting, 2 done
+	var visit func(string) bool
+	visit = func(id string) bool {
+		if state[id] == 1 {
+			return true
+		}
+		if state[id] == 2 {
+			return false
+		}
+		state[id] = 1
+		if slices.ContainsFunc(dependsOn[id], visit) {
+			return true
+		}
+		state[id] = 2
+		return false
+	}
+	for id := range nodes {
+		if visit(id) {
+			return fmt.Errorf("config: topology depends_on edges form a cycle through %s", id)
+		}
+	}
+	return nil
+}
+
+var (
+	ruleIDPattern  = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+	validRuleModes = map[string]bool{incident.ModeObserve: true, incident.ModeManual: true, incident.ModeAuto: true}
+)
+
+// VerificationFor returns the verification timing a rule freezes into snapshots.
+func (r RemediationConfig) VerificationFor(rule RuleConfig) VerificationConfig {
+	v := r.Verification
+	if rule.VerifyWindowSeconds > 0 {
+		v.WindowSeconds = rule.VerifyWindowSeconds
+	}
+	return v
+}
+
+// validateRemediation checks rule shape only; whether each action is available
+// (for example release needs service.release) is checked against the action
+// catalog at startup.
+func validateRemediation(r RemediationConfig, service ServiceConfig) error {
+	if len(r.Rules) > 0 && strings.TrimSpace(r.RulesVersion) == "" {
+		return fmt.Errorf("config: remediation.rules_version is required when rules are configured")
+	}
+	if len(r.Rules) > 0 && strings.TrimSpace(service.BaseURL) == "" {
+		return fmt.Errorf("config: service.base_url is required when remediation rules are configured")
+	}
+	ids := map[string]bool{}
+	for index, rule := range r.Rules {
+		field := fmt.Sprintf("remediation.rules[%d]", index)
+		if !ruleIDPattern.MatchString(rule.ID) || ids[rule.ID] {
+			return fmt.Errorf("config: %s.id must be unique, 1-64 lowercase letters, digits, _ or -", field)
+		}
+		ids[rule.ID] = true
+		if strings.TrimSpace(rule.Action) == "" || !validRuleModes[rule.Mode] {
+			return fmt.Errorf("config: %s needs an action and mode observe, manual or auto", field)
+		}
+		if len(rule.Alerts) == 0 {
+			return fmt.Errorf("config: %s.alerts must name the alerts this rule covers", field)
+		}
+		for _, alert := range rule.Alerts {
+			if strings.TrimSpace(alert) == "" {
+				return fmt.Errorf("config: %s.alerts must not contain empty names", field)
+			}
+		}
+		if rule.MaxExecutions < 1 {
+			return fmt.Errorf("config: %s.max_executions must be at least 1", field)
+		}
+		if err := validatePositiveMinutes(field+".window_minutes", rule.WindowMinutes); err != nil {
+			return err
+		}
+		if rule.MinAvailableAccounts < 0 || rule.MinRequests < 0 || rule.MaxErrorRatio < 0 || rule.MaxErrorRatio >= 1 {
+			return fmt.Errorf("config: %s bounds must be non-negative and max_error_ratio below 1", field)
+		}
+		if rule.VerifyWindowSeconds != 0 {
+			window := r.Verification
+			window.WindowSeconds = rule.VerifyWindowSeconds
+			if err := validateVerification(window); err != nil {
+				return fmt.Errorf("config: %s.verify_window_seconds: %w", field, err)
+			}
+		}
+	}
+	for index, window := range r.Maintenance {
+		if window.Start.IsZero() || !window.End.After(window.Start) {
+			return fmt.Errorf("config: remediation.maintenance[%d] needs start before end", index)
+		}
+	}
+	return nil
+}
+
+var (
+	operatorIDPattern  = regexp.MustCompile(`^[A-Za-z0-9._@-]{1,64}$`)
+	sha256HexPattern   = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	validOperatorRoles = map[string]bool{"viewer": true, "operator": true, "admin": true}
+)
+
+// validateOperators rejects an anonymous console and any identity that could be
+// confused with another or with the shared machine token.
+func validateOperators(cfg Config) error {
+	if cfg.ConsoleEnabled() && len(cfg.Web.Operators) == 0 {
+		return fmt.Errorf("config: web.operators is required when the console is enabled; the console has no anonymous access")
+	}
+	machine := sha256.Sum256([]byte(cfg.Server.AuthToken))
+	ids, hashes := map[string]bool{}, map[string]bool{}
+	for index, operator := range cfg.Web.Operators {
+		field := fmt.Sprintf("web.operators[%d]", index)
+		if !operatorIDPattern.MatchString(operator.ID) || ids[operator.ID] {
+			return fmt.Errorf("config: %s.id must be unique, 1-64 characters of letters, digits and ._@-", field)
+		}
+		if !validOperatorRoles[operator.Role] {
+			return fmt.Errorf("config: %s.role must be viewer, operator or admin", field)
+		}
+		if !sha256HexPattern.MatchString(operator.TokenSHA256) || hashes[operator.TokenSHA256] {
+			return fmt.Errorf("config: %s.token_sha256 must be a unique lowercase hex SHA-256", field)
+		}
+		if operator.TokenSHA256 == hex.EncodeToString(machine[:]) {
+			return fmt.Errorf("config: %s must not reuse server.auth_token; the machine token is not a human identity", field)
+		}
+		ids[operator.ID], hashes[operator.TokenSHA256] = true, true
+	}
 	return nil
 }
 
@@ -469,6 +925,9 @@ func validateModelProfiles(cfg LLMConfig) error {
 			return fmt.Errorf("config: llm.models contains duplicate id %q", id)
 		}
 		seen[id] = struct{}{}
+		if profile.ContextWindow() <= cfg.Roles.Reasoner.MaxTokens || profile.ContextWindow()-cfg.Roles.Reasoner.MaxTokens < 1024 {
+			return fmt.Errorf("config: llm.models[%d].context_window_tokens must reserve max_tokens plus at least 1024 input tokens", index)
+		}
 		if id == selected {
 			selectedAllowed = true
 		}

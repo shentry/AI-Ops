@@ -7,89 +7,71 @@ import (
 	"time"
 )
 
-// 审批单生命周期。
-
 func TestApprovalLifecycle(t *testing.T) {
 	db := openIntegrationDB(t)
+	t.Cleanup(func() { db.Close() })
 	ctx := context.Background()
-	now := time.Date(2026, 8, 19, 14, 0, 0, 0, time.UTC)
-	var ids []uint64
-	t.Cleanup(func() {
-		if len(ids) > 0 {
-			db.Where("id IN ?", ids).Delete(&Approval{})
-		}
-		db.Close()
-	})
-
-	created, err := db.CreateApproval(ctx, Approval{
-		IncidentID: 1, RunID: 2, ToolName: "resize_pool", ArgsJSON: []byte(`{"target_name":"sub2api"}`),
-		Reason: "L3", PlanHash: "hash-1", ExpiresAt: now.Add(30 * time.Minute), CreatedAt: now,
-	})
-	if err != nil {
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	created, _ := executionFixture(t, db, now, "pending")
+	if _, err := db.DecideApproval(ctx, created.ID, "approved", "wrong-hash", "ops", "test", "api", now); !errors.Is(err, ErrApprovalConflict) {
+		t.Fatalf("wrong hash=%v", err)
+	}
+	if _, err := db.DecideApproval(ctx, created.ID, "approved", created.PlanHash, "ops", "test", "api", now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	ids = append(ids, created.ID)
-	if created.Status != "pending" {
-		t.Fatalf("status = %q", created.Status)
+	if _, err := db.DecideApproval(ctx, created.ID, "denied", created.PlanHash, "ops", "test", "api", now.Add(2*time.Minute)); !errors.Is(err, ErrApprovalConflict) {
+		t.Fatalf("duplicate=%v", err)
 	}
-
-	// 批准成功；重复批准 409；过期窗口外不能决策。
-	if _, err := db.DecideApproval(ctx, created.ID, "approved", "ops", "test", "api", now.Add(time.Minute)); err != nil {
-		t.Fatal(err)
+	if _, err := db.DecideApproval(ctx, 1<<62, "approved", created.PlanHash, "ops", "test", "api", now); !errors.Is(err, ErrApprovalNotFound) {
+		t.Fatalf("missing=%v", err)
 	}
-	if _, err := db.DecideApproval(ctx, created.ID, "denied", "ops", "test", "api", now.Add(2*time.Minute)); !errors.Is(err, ErrApprovalConflict) {
-		t.Fatalf("re-decide error = %v, want conflict", err)
+	expired, _ := executionFixture(t, db, now.Add(-2*time.Hour), "pending")
+	if _, err := db.DecideApproval(ctx, expired.ID, "approved", expired.PlanHash, "ops", "test", "api", now); !errors.Is(err, ErrApprovalConflict) {
+		t.Fatalf("expired=%v", err)
 	}
-	if _, err := db.DecideApproval(ctx, 1<<62, "approved", "ops", "test", "api", now); !errors.Is(err, ErrApprovalNotFound) {
-		t.Fatalf("missing error = %v, want not found", err)
-	}
-
-	// 过期单不能被批准。
-	expired, err := db.CreateApproval(ctx, Approval{
-		IncidentID: 1, RunID: 2, ToolName: "x", ArgsJSON: []byte(`{}`),
-		Reason: "r", PlanHash: "h", ExpiresAt: now.Add(time.Minute), CreatedAt: now,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ids = append(ids, expired.ID)
-	if _, err := db.DecideApproval(ctx, expired.ID, "approved", "ops", "test", "api", now.Add(2*time.Minute)); !errors.Is(err, ErrApprovalConflict) {
-		t.Fatalf("expired approve error = %v, want conflict", err)
-	}
-
-	// 主动过期 sweep。
-	swept, err := db.ExpireApprovals(ctx, now.Add(2*time.Minute))
-	if err != nil || swept == 0 {
-		t.Fatalf("ExpireApprovals() = %d, %v", swept, err)
+	if swept, err := db.ExpireApprovals(ctx, now); err != nil || swept == 0 {
+		t.Fatalf("sweep=%d %v", swept, err)
 	}
 	got, err := db.GetApproval(ctx, expired.ID)
+	if err != nil || got.Status != "expired" {
+		t.Fatalf("expired=%+v %v", got, err)
+	}
+	got, err = db.GetApproval(ctx, created.ID)
+	if err != nil || got.Status != "approved" || got.DecidedBy == nil || *got.DecidedBy != "ops" {
+		t.Fatalf("approved=%+v %v", got, err)
+	}
+	rows, err := db.ListApprovals(ctx, "expired")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != "expired" {
-		t.Fatalf("status = %q, want expired", got.Status)
+	found := false
+	for _, row := range rows {
+		if row.ID == expired.ID {
+			found = true
+		}
+		if row.ID == created.ID {
+			t.Fatal("status filter included approved")
+		}
 	}
-	// 已批准的不会被 sweep。
-	got, _ = db.GetApproval(ctx, created.ID)
-	if got.Status != "approved" {
-		t.Fatalf("approved status = %q", got.Status)
+	if !found {
+		t.Fatal("expired approval missing")
 	}
+}
 
-	// 列表过滤。
-	approvals, err := db.ListApprovals(ctx, "expired")
-	if err != nil {
+func TestApprovalDecisionChecksActualSnapshotInsideTransaction(t *testing.T) {
+	db := openIntegrationDB(t)
+	t.Cleanup(func() { db.Close() })
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	approval, _ := executionFixture(t, db, now, "pending")
+	if err := db.Model(&Approval{}).Where("id = ?", approval.ID).Update("args_json", []byte(`{"target_kind":"container","target_name":"different"}`)).Error; err != nil {
 		t.Fatal(err)
 	}
-	foundExpired := false
-	for _, a := range approvals {
-		if a.ID == expired.ID {
-			foundExpired = true
-		}
-		if a.ID == created.ID {
-			t.Fatal("approved approval leaked into expired filter")
-		}
+	if _, err := db.DecideApproval(ctx, approval.ID, "approved", approval.PlanHash, "ops", "test", "web", now); !errors.Is(err, ErrApprovalConflict) {
+		t.Fatalf("modified content=%v", err)
 	}
-	if !foundExpired {
-		t.Fatal("expired approval missing from list")
+	got, err := db.GetApproval(ctx, approval.ID)
+	if err != nil || got.Status != "pending" || got.DecidedBy != nil {
+		t.Fatalf("rejected decision changed state: %+v %v", got, err)
 	}
 }

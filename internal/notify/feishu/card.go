@@ -7,10 +7,11 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
-	"oncall-agent/internal/diagnose"
 	"oncall-agent/internal/notify"
+	"oncall-agent/internal/tools"
 )
 
 // MaxCardBytes is Feishu's maximum serialized size for an interactive card.
@@ -69,8 +70,12 @@ func BuildCard(n notify.Notification) map[string]any {
 		keys  []string
 	}{
 		{label: "Action", keys: []string{"action", "plan_action"}},
-		{label: "Target", keys: []string{"target", "plan_target"}},
+		{label: "Target", keys: []string{"target"}},
+		{label: "Target ID", keys: []string{"target_id"}},
+		{label: "Rule", keys: []string{"rule_id"}},
+		{label: "Mode", keys: []string{"rule_mode"}},
 		{label: "Reason", keys: []string{"reason", "plan_reason"}},
+		{label: "Expires at", keys: []string{"expires_at"}},
 		{label: "RCA", keys: []string{"rca"}},
 		{label: "Confidence", keys: []string{"confidence"}},
 		{label: "Result", keys: []string{"result", "result_summary"}},
@@ -80,6 +85,12 @@ func BuildCard(n notify.Notification) map[string]any {
 		if value := payloadFirstText(n.Payload, field.keys...); value != "" {
 			lines = append(lines, "**"+field.label+":** "+truncate(value, maxCardTextRunes))
 		}
+	}
+
+	approvalID, hasApproval := notificationApprovalID(n)
+	decisionReady := approvalCardReady(n.Payload)
+	if hasApproval && !decisionReady {
+		lines = append(lines, "执行上下文不完整，无法批准；请在 Web 控制室查看并重新诊断。")
 	}
 
 	elements := make([]any, 0, len(lines)+2)
@@ -102,12 +113,13 @@ func BuildCard(n notify.Notification) map[string]any {
 			}},
 		})
 	}
-	if approvalID, ok := notificationApprovalID(n); ok {
-		planHash := payloadFirstText(n.Payload, "plan_hash")
-		buttons := []any{
-			ApprovalButton("approve", "批准", approvalID, planHash, webURL, "primary"),
-			ApprovalButton("deny", "拒绝", approvalID, planHash, webURL, "danger"),
+	planHash, _ := n.Payload["plan_hash"].(string)
+	if hasApproval && strings.TrimSpace(planHash) != "" {
+		buttons := make([]any, 0, 2)
+		if decisionReady {
+			buttons = append(buttons, ApprovalButton("approve", "批准", approvalID, planHash, "primary"))
 		}
+		buttons = append(buttons, ApprovalButton("deny", "拒绝", approvalID, planHash, "danger"))
 		elements = append(elements, map[string]any{
 			"tag":       "column_set",
 			"flex_mode": "none",
@@ -178,17 +190,12 @@ func MarshalCard(card any) ([]byte, error) {
 // ApprovalButton returns a Card 2.0 callback button. Its callback value is
 // deliberately limited to immutable references; executable arguments and
 // credentials never travel through the card.
-func ApprovalButton(action, label string, approvalID uint64, planHash, webURL, buttonType string) map[string]any {
+func ApprovalButton(action, label string, approvalID uint64, planHash, buttonType string) map[string]any {
 	value := map[string]any{
 		"action":      action,
 		"approval_id": approvalID,
 	}
-	if strings.TrimSpace(planHash) != "" {
-		value["plan_hash"] = truncate(planHash, 256)
-	}
-	if strings.TrimSpace(webURL) != "" {
-		value["web_url"] = truncate(webURL, maxCardTextRunes)
-	}
+	value["plan_hash"] = planHash
 	return map[string]any{
 		"tag":  "button",
 		"text": map[string]any{"tag": "plain_text", "content": truncate(label, maxCardTextRunes)},
@@ -198,6 +205,20 @@ func ApprovalButton(action, label string, approvalID uint64, planHash, webURL, b
 			"value": value,
 		}},
 	}
+}
+
+// A person may approve only a complete manual snapshot: its action, target
+// identity, rule, reason, hash and expiry are all shown. Display-only payloads
+// cannot recreate a legacy snapshot.
+func approvalCardReady(payload map[string]any) bool {
+	text := func(key string) string {
+		value, _ := payload[key].(string)
+		return strings.TrimSpace(value)
+	}
+	kind, name, found := strings.Cut(text("target"), "/")
+	expiresAt, err := time.Parse(time.RFC3339, text("expires_at"))
+	return text("action") != "" && found && kind != "" && name != "" && text("target_id") != "" && text("rule_id") != "" && text("rule_mode") == "manual" &&
+		text("plan_hash") != "" && text("reason") != "" && err == nil && !expiresAt.IsZero()
 }
 
 func notificationApprovalID(n notify.Notification) (uint64, bool) {
@@ -287,7 +308,7 @@ func payloadText(payload map[string]any, key string) string {
 }
 
 func cardText(value string, maxRunes int) string {
-	return truncate(strings.TrimSpace(diagnose.Sanitize(diagnose.ToSafeText(value))), maxRunes)
+	return truncate(strings.TrimSpace(tools.Sanitize(tools.ToSafeText(value))), maxRunes)
 }
 
 func safeCardURL(raw string, incidentID uint64) string {

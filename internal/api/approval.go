@@ -2,10 +2,7 @@ package api
 
 import (
 	"context"
-	"crypto/subtle"
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strings"
 
@@ -17,23 +14,21 @@ import (
 
 // approvalService 是审批 API 对审批层的收窄接口。
 type approvalService interface {
-	Decide(ctx context.Context, id uint64, approve bool, decidedBy, decisionReason, decisionSource string) (store.Approval, error)
+	Decide(ctx context.Context, id uint64, approve bool, expectedPlanHash, decidedBy, decisionReason, decisionSource string) (store.Approval, error)
 	List(ctx context.Context, status string) ([]store.Approval, error)
 	Get(ctx context.Context, id uint64) (store.Approval, error)
 }
 
-// ApprovalAPI exposes approval decisions and list/query operations. Automation
-// authenticates with the Bearer token; the browser reaches the same handlers
-// through the public console, which requires no login and records a fixed
-// anonymous operator on every decision.
+// ApprovalAPI exposes approval decisions and list/query operations. Reads accept
+// any identity including automation; a decision needs an operator whose identity
+// the server proved (session or personal token), and records that identity.
 type ApprovalAPI struct {
-	svc       approvalService
-	authToken string
-	console   *Console
+	svc  approvalService
+	auth *Auth
 }
 
-func NewApprovalAPI(svc approvalService, authToken string, console *Console) *ApprovalAPI {
-	return &ApprovalAPI{svc: svc, authToken: authToken, console: console}
+func NewApprovalAPI(svc approvalService, auth *Auth) *ApprovalAPI {
+	return &ApprovalAPI{svc: svc, auth: auth}
 }
 
 func (h *ApprovalAPI) Handle(r *ghttp.Request) {
@@ -45,12 +40,12 @@ func (h *ApprovalAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "approval service unavailable")
 		return
 	}
-	web, ok := h.authenticate(r)
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
 	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/approvals"), "/")
+	if r.Method == http.MethodGet {
+		if _, ok := h.auth.Require(w, r, RoleViewer, true); !ok {
+			return
+		}
+	}
 	if rest == "" {
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -99,44 +94,28 @@ func (h *ApprovalAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	actor, ok := h.auth.Require(w, r, RoleOperator, false)
+	if !ok {
+		return
+	}
 	id, err := parseIncidentID(parts[0])
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid approval id")
 		return
 	}
-	operator := strings.TrimSpace(r.Header.Get("X-Operator"))
-	source := "api"
-	if web {
-		actor, _ := h.console.Actor()
-		operator = actor.ID
-		source = "web"
-	} else if operator == "" {
-		writeError(w, http.StatusBadRequest, "X-Operator header is required")
+	var input struct {
+		PlanHash string  `json:"plan_hash"`
+		Reason   *string `json:"reason"`
+	}
+	if err := decodeBoundedJSON(r, &input, 64<<10); err != nil || strings.TrimSpace(input.PlanHash) == "" || input.Reason == nil {
+		writeError(w, http.StatusBadRequest, "plan_hash and reason are required")
 		return
 	}
-	reason, err := decodeDecisionReason(r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid decision reason")
-		return
-	}
-	h.decide(w, r, id, parts[1] == "approve", operator, reason, source, web)
+	h.decide(w, r, id, parts[1] == "approve", strings.TrimSpace(input.PlanHash), actor.ID, *input.Reason, actor.Source)
 }
 
-// authenticate reports whether the caller is allowed and whether the request
-// arrived through the browser console rather than Bearer automation. The two
-// channels differ only in the operator recorded on a decision.
-func (h *ApprovalAPI) authenticate(r *http.Request) (web bool, ok bool) {
-	if r != nil && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+h.authToken)) == 1 {
-		return false, true
-	}
-	if _, enabled := h.console.Actor(); !enabled {
-		return false, false
-	}
-	return true, true
-}
-
-func (h *ApprovalAPI) decide(w http.ResponseWriter, r *http.Request, id uint64, approve bool, operator, reason, source string, web bool) {
-	approval, err := h.svc.Decide(r.Context(), id, approve, operator, reason, source)
+func (h *ApprovalAPI) decide(w http.ResponseWriter, r *http.Request, id uint64, approve bool, planHash, operator, reason, source string) {
+	approval, err := h.svc.Decide(r.Context(), id, approve, planHash, operator, reason, source)
 	switch {
 	case err == nil:
 		writeJSON(w, http.StatusOK, approvalDTO(approval))
@@ -144,28 +123,8 @@ func (h *ApprovalAPI) decide(w http.ResponseWriter, r *http.Request, id uint64, 
 	case errors.Is(err, store.ErrApprovalNotFound):
 		writeError(w, http.StatusNotFound, "approval not found")
 	case errors.Is(err, store.ErrApprovalConflict):
-		writeError(w, http.StatusConflict, "approval already decided or expired")
+		writeError(w, http.StatusConflict, "approval changed, already decided or expired")
 	default:
 		writeError(w, http.StatusServiceUnavailable, "decide approval failed")
 	}
-}
-
-func decodeDecisionReason(r *http.Request) (string, error) {
-	if r.Body == nil {
-		return "", nil
-	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
-	if err != nil {
-		return "", err
-	}
-	if len(strings.TrimSpace(string(body))) == 0 {
-		return "", nil
-	}
-	var input struct {
-		Reason string `json:"reason"`
-	}
-	if err := json.Unmarshal(body, &input); err != nil {
-		return "", err
-	}
-	return input.Reason, nil
 }

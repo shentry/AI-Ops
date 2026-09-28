@@ -78,6 +78,7 @@ const (
 	VerifyFailed       = "verify_failed"
 	VerifyInconclusive = "verify_inconclusive"
 	EscalationSent     = "escalation_sent"
+	NotificationFailed = "notification_failed"
 	DedupFull          = "dedup_full"
 	MemoryExpired      = "memory_expired"
 	MemoryDemoted      = "memory_demoted"

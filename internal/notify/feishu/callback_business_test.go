@@ -2,12 +2,14 @@ package feishu
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 
+	"oncall-agent/internal/notify"
 	"oncall-agent/internal/store"
 )
 
@@ -53,17 +55,31 @@ func (f *fakeCallbackStore) AppendIncidentEvent(_ context.Context, event store.I
 }
 
 type fakeApproval struct {
-	row       store.Approval
-	decided   int
-	decideErr error
+	row            store.Approval
+	decided        int
+	decideErr      error
+	expectedHash   string
+	operator       string
+	source         string
+	mutateAfterGet bool
 }
 
 func (f *fakeApproval) Get(context.Context, uint64) (store.Approval, error) {
-	return f.row, nil
+	row := f.row
+	if f.mutateAfterGet {
+		f.row.PlanHash = "changed-after-read"
+	}
+	return row, nil
 }
 
-func (f *fakeApproval) Decide(context.Context, uint64, bool, string, string, string) (store.Approval, error) {
+func (f *fakeApproval) Decide(_ context.Context, _ uint64, _ bool, expectedHash, operator, _ string, source string) (store.Approval, error) {
 	f.decided++
+	f.expectedHash = expectedHash
+	f.operator = operator
+	f.source = source
+	if expectedHash == "" || expectedHash != f.row.PlanHash {
+		return store.Approval{}, store.ErrApprovalConflict
+	}
 	if f.decideErr != nil {
 		return store.Approval{}, f.decideErr
 	}
@@ -86,21 +102,87 @@ func cardEvent(eventID, openID, action string, approvalID uint64, planHash strin
 }
 
 func TestCardActionApproveUsesSharedDecide(t *testing.T) {
-	approval := &fakeApproval{row: store.Approval{ID: 7, Status: "pending", PlanHash: "abc"}}
+	approval := &fakeApproval{row: completeCardApproval(t)}
 	business := NewCallbackBusiness(BusinessDependencies{
 		Store:             &fakeCallbackStore{},
 		Approval:          approval,
 		OperatorAllowlist: []string{"ou_ops"},
 	})
-	resp, err := business.CardAction(context.Background(), cardEvent("evt-1", "ou_ops", "approve", 7, "abc"))
+	resp, err := business.CardAction(context.Background(), cardEvent("evt-1", "ou_ops", "approve", 7, approval.row.PlanHash))
 	if err != nil {
 		t.Fatalf("CardAction: %v", err)
 	}
-	if approval.decided != 1 {
-		t.Fatalf("Decide calls = %d", approval.decided)
+	if approval.decided != 1 || approval.expectedHash != approval.row.PlanHash || approval.operator != "feishu:ou_ops" || approval.source != "feishu" {
+		t.Fatalf("Decide = %+v", approval)
 	}
 	if resp == nil || resp.Toast == nil || resp.Toast.Content != "审批已批准" {
 		t.Fatalf("toast = %+v", resp)
+	}
+}
+
+func TestCardActionRejectsStaleOrMissingHash(t *testing.T) {
+	for _, hash := range []string{"", "stale"} {
+		approval := &fakeApproval{row: completeCardApproval(t)}
+		business := NewCallbackBusiness(BusinessDependencies{Store: &fakeCallbackStore{}, Approval: approval, OperatorAllowlist: []string{"ou_ops"}})
+		resp, err := business.CardAction(context.Background(), cardEvent("stale-"+hash, "ou_ops", "approve", 7, hash))
+		if err != nil || approval.decided != 0 || resp == nil || resp.Toast.Type != "error" {
+			t.Fatalf("stale hash: response=%+v err=%v calls=%d", resp, err, approval.decided)
+		}
+	}
+}
+
+func TestCardActionServiceConflictNeverReportsApproval(t *testing.T) {
+	for _, name := range []string{"changed_after_get", "legacy", "expired", "already_decided"} {
+		t.Run(name, func(t *testing.T) {
+			approval := &fakeApproval{row: completeCardApproval(t), decideErr: store.ErrApprovalConflict}
+			if name == "changed_after_get" {
+				approval.decideErr = nil
+				approval.mutateAfterGet = true
+			}
+			if name == "legacy" {
+				approval.row.ExecutionContext = nil
+			}
+			hash := approval.row.PlanHash
+			business := NewCallbackBusiness(BusinessDependencies{Store: &fakeCallbackStore{}, Approval: approval, OperatorAllowlist: []string{"ou_ops"}})
+			resp, err := business.CardAction(context.Background(), cardEvent("conflict-"+name, "ou_ops", "approve", 7, hash))
+			if err != nil || approval.decided != 1 || approval.expectedHash != hash || resp == nil || resp.Toast.Type != "error" {
+				t.Fatalf("conflict: response=%+v err=%v approval=%+v", resp, err, approval)
+			}
+		})
+	}
+}
+
+type cardPatchClient struct{ patched chan string }
+
+func (c cardPatchClient) Reply(context.Context, string, string) (notify.Delivery, error) {
+	return notify.Delivery{}, nil
+}
+func (c cardPatchClient) Patch(_ context.Context, _ string, content string) error {
+	c.patched <- content
+	return nil
+}
+
+func TestDecisionPatchRetainsApprovedSnapshotWithoutButtons(t *testing.T) {
+	approval := &fakeApproval{row: completeCardApproval(t)}
+	client := cardPatchClient{patched: make(chan string, 1)}
+	business := NewCallbackBusiness(BusinessDependencies{Store: &fakeCallbackStore{}, Approval: approval, Client: client, OperatorAllowlist: []string{"ou_ops"}})
+	if _, err := business.CardAction(context.Background(), cardEvent("patch", "ou_ops", "approve", 7, approval.row.PlanHash)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case content := <-client.patched:
+		for _, expected := range []string{"container/sub2api", "**Target ID:** c0ffee", "**Rule:** restart", "**Mode:** manual"} {
+			if !strings.Contains(content, expected) {
+				t.Fatalf("patch missing %s: %s", expected, content)
+			}
+		}
+		for _, forbidden := range []string{`"type":"callback"`, "private-target.invalid", "target_kind", "execution_context"} {
+			if strings.Contains(content, forbidden) {
+				t.Fatalf("patch leaked %s: %s", forbidden, content)
+			}
+		}
+	case <-time.After(time.Second):
+		t.Fatal("decision card was not patched")
 	}
 }
 

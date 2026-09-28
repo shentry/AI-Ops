@@ -34,24 +34,24 @@ func redisClient(addr, password string) *redis.Client {
 // redisCollector 采集 Sub2API 的 Redis 依赖证据：PING 延迟、内存占用、
 // 连接数。只用 PING/INFO 只读命令（命令白名单），addr 未配置时记 missing。
 type redisCollector struct {
-	cfg config.EvidenceConfig
+	addr, password string
+	timeout        time.Duration
 }
 
-func NewRedisCollector(cfg config.EvidenceConfig) Collector {
-	return &redisCollector{cfg: cfg}
+func NewRedisCollector(service config.ServiceConfig, evidence config.EvidenceConfig) Collector {
+	return &redisCollector{addr: service.RedisAddr, password: service.RedisPassword, timeout: time.Duration(evidence.TimeoutSeconds) * time.Second}
 }
 
 func (*redisCollector) Name() string { return "redis" }
 
 func (c *redisCollector) Collect(ctx context.Context, _ Target) EvidenceItem {
-	addr := strings.TrimSpace(c.cfg.RedisAddr)
+	addr := strings.TrimSpace(c.addr)
 	if addr == "" {
 		return missingItem(c.Name(), "redis:PING/INFO", "redis addr is not configured")
 	}
-	timeout := time.Duration(c.cfg.TimeoutSeconds) * time.Second
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
-	client := redisClient(addr, c.cfg.RedisPassword)
+	client := redisClient(addr, c.password)
 
 	started := time.Now()
 	if err := client.Ping(ctx).Err(); err != nil {

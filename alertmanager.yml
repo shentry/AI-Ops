@@ -9,8 +9,13 @@ route:
   group_wait: 5s
   group_interval: 30s
   repeat_interval: 4h
+  routes:
+    # The dev stack has no external heartbeat receiver.
+    - matchers: [alertname="Watchdog"]
+      receiver: discard
 
 receivers:
+  - name: discard
   - name: oncall-agent
     webhook_configs:
       - url: "http://host.docker.internal:18080/webhook/alertmanager"

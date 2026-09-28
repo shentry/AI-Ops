@@ -30,17 +30,17 @@ type StreamConfig struct {
 	MaxConnections int
 }
 
-// StreamAPI serves an Incident's public durable event stream.
+// StreamAPI serves an Incident's durable event stream to viewers.
 type StreamAPI struct {
 	db      EventStore
-	console *Console
+	auth    *Auth
 	poll    time.Duration
 	maxAge  time.Duration
 	maxConn int32
 	active  atomic.Int32
 }
 
-func NewStreamAPI(db EventStore, console *Console, configs ...StreamConfig) *StreamAPI {
+func NewStreamAPI(db EventStore, auth *Auth, configs ...StreamConfig) *StreamAPI {
 	cfg := StreamConfig{PollInterval: time.Second, MaxDuration: 10 * time.Minute, MaxConnections: 100}
 	if len(configs) > 0 {
 		if configs[0].PollInterval > 0 {
@@ -53,7 +53,7 @@ func NewStreamAPI(db EventStore, console *Console, configs ...StreamConfig) *Str
 			cfg.MaxConnections = configs[0].MaxConnections
 		}
 	}
-	return &StreamAPI{db: db, console: console, poll: cfg.PollInterval, maxAge: cfg.MaxDuration, maxConn: int32(cfg.MaxConnections)}
+	return &StreamAPI{db: db, auth: auth, poll: cfg.PollInterval, maxAge: cfg.MaxDuration, maxConn: int32(cfg.MaxConnections)}
 }
 
 func (h *StreamAPI) Handle(r *ghttp.Request) {
@@ -89,8 +89,7 @@ func (h *StreamAPI) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid incident id")
 		return
 	}
-	if _, ok := h.console.Actor(); !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
+	if _, ok := h.auth.Require(w, r, RoleViewer, true); !ok {
 		return
 	}
 	if !h.tryAcquire() {

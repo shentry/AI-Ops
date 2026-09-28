@@ -1,8 +1,18 @@
 # AI-Opus 上下文压缩机制设计
 
-> 文档状态：设计提案，尚未实现。
+> 文档状态：原始设计提案；2026-09-22 已落地最小子集，见下方“当前实现”。后续原始提案中的背景、参数和伪代码不是当前配置契约。
 > 适用范围：`internal/config`、`internal/llm`、`internal/diagnose`。
 > 目标：先让思考模型可正确调用，再对单次诊断内的工作记忆做分层压缩；不改变 Guard、Policy、审批和 Verify。
+
+## 当前实现（2026-09-22）
+
+- 上下文额度改为模型级 `llm.models[].context_window_tokens`，DeepSeek 示例为 1000000；未指定使用应用缺省 131072，不代表网关容量已确认。移除旧 `diagnose.budget.context_tokens`；模型客户端与窗口同锁快照，扣除角色 `max_tokens` 和 512 协议余量。
+- `token_estimator.go` 分别估算 ASCII 和非 ASCII 文本，初始增加 20% 余量，并用每轮实际 `prompt_tokens / 发送输入的基础估算` 向上校准，额外保留 10% 余量。校准只在本次诊断及其契约重试内共享；不是 tokenizer，也不使用累计 Token 判定窗口。
+- 超过输入额度 80% 才压缩旧工具结果，最近一个完整工具批次和原始 Evidence 不压缩。`tool_digest.go` 对 Prometheus 数值序列保留标签、首尾、极值及计数，对重复日志做可还原的连续行计数。未知格式、错误文本及无法可靠压缩的数据保留原样；压缩后仍放不下则明确失败。
+- 所有消息角色、tool call ID、assistant reasoning/协议元数据保留；发送副本与原始 ReAct 历史分离。这里只保持已有审计能力，不表示数据库存有完整原文，现有 step 摘要仍有截断预算。
+- full/light 默认 32/16 图步数只作兜底，诊断总超时 3 分钟。旧配置显式设置的 8/3 不自动替换。成功诊断步骤中记录压缩次数及估算变化，模型实际 usage 单独累计。
+- 未实现原提案中的 Evidence Pack、跨段 MemorySnapshot、额外 summarizer、精准 tokenizer 或累计费用硬预算；只读 Questioner 未接入上下文压缩。Thinking 适配已有独立实现，本次不改写其协议。
+- 专项测试覆盖压缩后继续取证、配对/字段保留、最近批次保护、错误与非有限数值保留、超预算拒绝及真实模型读取压缩历史。真实模型测试由 `TEST_LLM_*` 门控，使用合成证据，不能替代真实故障效果评测。
 
 ## 1. 背景
 
@@ -105,7 +115,7 @@ V1 不处理以下问题：
 - Markdown 围栏逃逸处理继续生效；
 - LLM 仍只能调用 `Registry.ForLLM()` 导出的 L1 工具；
 - Plan 仍必须经过 Guard、Policy、审批和 Verify；
-- Policy 的 `KnownTargets` 继续读取数据库中的告警标签，不依赖压缩文本；
+- Policy 的 `PolicyInput.Members` 从数据库告警事实投影（`ExecutionMembersFromAlerts`），不依赖压缩文本；
 - thinking 内容不得改写 RCA、Plan、target 或安全等级。
 
 ### 3.4 思考协议优先于压缩

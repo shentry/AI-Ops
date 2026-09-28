@@ -3,10 +3,14 @@ package store
 import (
 	"errors"
 	"fmt"
+	"log"
 	"strings"
+	"time"
 
+	mysqlDriver "github.com/go-sql-driver/mysql"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 // 连接边界与跨域小工具。整包只有这里 import gorm 的 driver ——
@@ -15,6 +19,7 @@ import (
 // DB 持有进程级 GORM 连接。D01 复用这一条；后续包不要自己再开连接池。
 type DB struct {
 	*gorm.DB
+	executionLease *executionLease
 }
 
 // Open 只建连。表结构走 migrations/001_init.sql，绝不 AutoMigrate。
@@ -23,10 +28,40 @@ func Open(dsn string) (*DB, error) {
 		return nil, errors.New("store: mysql DSN is required")
 	}
 
-	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	parsed, err := mysqlDriver.ParseDSN(dsn)
+	if err != nil {
+		return nil, errors.New("store: invalid MySQL DSN")
+	}
+	if parsed.Timeout == 0 {
+		parsed.Timeout = 5 * time.Second
+	}
+	if parsed.ReadTimeout == 0 {
+		parsed.ReadTimeout = 5 * time.Second
+	}
+	if parsed.WriteTimeout == 0 {
+		parsed.WriteTimeout = 5 * time.Second
+	}
+	dsn = parsed.FormatDSN()
+
+	// Workers poll queues with First(); an empty queue is ErrRecordNotFound,
+	// which GORM's default logger prints on every poll.
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{Logger: logger.New(log.Default(), logger.Config{
+		SlowThreshold:             200 * time.Millisecond,
+		LogLevel:                  logger.Warn,
+		IgnoreRecordNotFoundError: true,
+	})})
 	if err != nil {
 		return nil, fmt.Errorf("store: open MySQL: %w", err)
 	}
+	pool, err := db.DB()
+	if err != nil {
+		return nil, err
+	}
+	// The ingress has its own smaller concurrency budget, leaving room for
+	// approvals, verification, durable notifications and the pinned ownership connection.
+	pool.SetMaxOpenConns(24)
+	pool.SetMaxIdleConns(8)
+	pool.SetConnMaxLifetime(5 * time.Minute)
 	return &DB{DB: db}, nil
 }
 

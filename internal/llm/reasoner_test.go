@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -104,7 +105,7 @@ const validPlanJSON = `{
   "confidence": "high",
   "evidence_refs": ["docker", "alert_snapshot"],
   "plan": {
-    "action": "restart_container",
+    "action": "docker_restart",
     "target": {"kind": "container", "name": "sub2api"},
     "reason": "进程退出且无配置错误迹象",
     "confidence": "high",
@@ -121,11 +122,40 @@ func testReasoner(t *testing.T, baseURL string, registry *tools.Registry) *Reaso
 	return NewReasoner(factory, registry, config.DiagnoseBudget{FullSteps: 8, LightSteps: 3})
 }
 
-func stubLLMRegistry(t *testing.T) *tools.Registry {
+var stubActionDefinition = tools.ActionDefinition{Name: "docker_restart", Version: 1, TargetKind: "container", Description: "restart a container",
+	Params: []tools.ParamSpec{{Name: "reason", Description: "why"}}, Timeout: time.Second}
+
+// stubAction is a registered write the model may name; tests never execute it.
+type stubAction struct{ def tools.ActionDefinition }
+
+func (a stubAction) Definition() tools.ActionDefinition { return a.def }
+func (a stubAction) Prepare(context.Context, tools.PrepareRequest) (tools.Prepared, error) {
+	return tools.Prepared{}, errors.New("stub")
+}
+func (a stubAction) Execute(context.Context, tools.Operation) (tools.Receipt, error) {
+	return tools.Receipt{}, errors.New("stub")
+}
+func (a stubAction) Reconcile(context.Context, tools.Operation) (tools.Reconciliation, error) {
+	return tools.Reconciliation{Outcome: tools.OutcomeUnknown}, errors.New("stub")
+}
+
+// actionRegistry holds the plannable action the fixtures' plans name.
+func actionRegistry(t *testing.T) *tools.Registry {
 	t.Helper()
 	registry := tools.NewRegistry()
+	for _, def := range []tools.ActionDefinition{stubActionDefinition, {Name: "upstream_restore", Version: 1, TargetKind: "account", Description: "undo", Compensation: true, Timeout: time.Second}} {
+		if err := registry.RegisterAction(stubAction{def: def}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return registry
+}
+
+func stubLLMRegistry(t *testing.T) *tools.Registry {
+	t.Helper()
+	registry := actionRegistry(t)
 	if err := registry.Register(tools.ToolSpec{
-		Name: tools.ToolPromSeriesMeta, Description: "stub series meta", Level: tools.L1ReadOnly,
+		Name: tools.ToolPromSeriesMeta, Description: "stub series meta",
 		Timeout: 5 * time.Second, MaxOutput: 512,
 		Params: []tools.ParamSpec{{Name: "match", Description: "selector", Required: true}},
 		Handler: func(_ context.Context, raw json.RawMessage) (string, error) {
@@ -160,14 +190,14 @@ func TestReasonerDiagnoseStructuredOutput(t *testing.T) {
 		return chatResponse(validPlanJSON, 120, 45)
 	})
 	reasoner := testReasoner(t, fake.server.URL, stubLLMRegistry(t))
-	result, err := reasoner.Diagnose(context.Background(), "evidence text", "full")
+	result, err := reasoner.Diagnose(context.Background(), "evidence text", "full", nil)
 	if err != nil {
 		t.Fatalf("Diagnose() error = %v", err)
 	}
 	if result.RCA == "" || result.Confidence != "high" || len(result.EvidenceRefs) != 2 {
 		t.Fatalf("result = %+v", result)
 	}
-	if result.Plan.Action != "restart_container" || result.Plan.Target.Name != "sub2api" || result.Plan.Risk != "low" {
+	if result.Plan.Action != "docker_restart" || result.Plan.Target.Name != "sub2api" || result.Plan.Risk != "low" {
 		t.Fatalf("plan = %+v", result.Plan)
 	}
 	if result.TokensIn != 120 || result.TokensOut != 45 {
@@ -180,7 +210,7 @@ func TestReasonerStripsMarkdownFence(t *testing.T) {
 		return chatResponse("```json\n"+validPlanJSON+"\n```", 10, 5)
 	})
 	reasoner := testReasoner(t, fake.server.URL, stubLLMRegistry(t))
-	result, err := reasoner.Diagnose(context.Background(), "evidence", "light")
+	result, err := reasoner.Diagnose(context.Background(), "evidence", "light", nil)
 	if err != nil {
 		t.Fatalf("Diagnose() error = %v", err)
 	}
@@ -197,9 +227,9 @@ func TestReasonerToolCallWithinBudget(t *testing.T) {
 		}
 		return chatResponse(validPlanJSON, 30, 12)
 	})
-	registry := tools.NewRegistry()
+	registry := actionRegistry(t)
 	if err := registry.Register(tools.ToolSpec{
-		Name: tools.ToolPromSeriesMeta, Description: "stub", Level: tools.L1ReadOnly,
+		Name: tools.ToolPromSeriesMeta, Description: "stub",
 		Timeout: 5 * time.Second, MaxOutput: 512,
 		Params: []tools.ParamSpec{{Name: "match", Description: "selector", Required: true}},
 		Handler: func(_ context.Context, raw json.RawMessage) (string, error) {
@@ -210,7 +240,7 @@ func TestReasonerToolCallWithinBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	reasoner := testReasoner(t, fake.server.URL, registry)
-	result, err := reasoner.Diagnose(context.Background(), "evidence", "light")
+	result, err := reasoner.Diagnose(context.Background(), "evidence", "light", nil)
 	if err != nil {
 		t.Fatalf("Diagnose() error = %v", err)
 	}
@@ -243,7 +273,7 @@ func TestReasonerEchoesThinkingOnToolFollowUp(t *testing.T) {
 		},
 	}})
 	reasoner := NewReasoner(factory, stubLLMRegistry(t), config.DiagnoseBudget{FullSteps: 8, LightSteps: 3})
-	if _, err := reasoner.Diagnose(context.Background(), "evidence", "light"); err != nil {
+	if _, err := reasoner.Diagnose(context.Background(), "evidence", "light", nil); err != nil {
 		t.Fatalf("Diagnose() error = %v", err)
 	}
 	if got := fake.requests.Load(); got != 2 {
@@ -280,7 +310,7 @@ func TestReasonerRejectsInvalidJSONAfterOneRetry(t *testing.T) {
 		return chatResponse("这不是 JSON", 10, 5)
 	})
 	reasoner := testReasoner(t, fake.server.URL, stubLLMRegistry(t))
-	_, err := reasoner.Diagnose(context.Background(), "evidence", "full")
+	_, err := reasoner.Diagnose(context.Background(), "evidence", "full", nil)
 	if err == nil {
 		t.Fatal("Diagnose() error = nil, want contract failure")
 	}
@@ -298,7 +328,7 @@ func TestReasonerRetriesOnceThenParses(t *testing.T) {
 		return chatResponse(validPlanJSON, 20, 8)
 	})
 	reasoner := testReasoner(t, fake.server.URL, stubLLMRegistry(t))
-	result, err := reasoner.Diagnose(context.Background(), "evidence", "full")
+	result, err := reasoner.Diagnose(context.Background(), "evidence", "full", nil)
 	if err != nil {
 		t.Fatalf("Diagnose() error = %v", err)
 	}
@@ -308,7 +338,7 @@ func TestReasonerRetriesOnceThenParses(t *testing.T) {
 }
 func TestReasonerRejectsEmptyEvidence(t *testing.T) {
 	reasoner := testReasoner(t, "http://127.0.0.1:1", stubLLMRegistry(t))
-	if _, err := reasoner.Diagnose(context.Background(), "  ", "full"); err == nil {
+	if _, err := reasoner.Diagnose(context.Background(), "  ", "full", nil); err == nil {
 		t.Fatal("Diagnose(empty evidence) error = nil")
 	}
 }
@@ -321,33 +351,52 @@ func TestReasonerModelTimeout(t *testing.T) {
 	reasoner := testReasoner(t, fake.server.URL, stubLLMRegistry(t))
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	if _, err := reasoner.Diagnose(ctx, "evidence", "full"); err == nil {
+	if _, err := reasoner.Diagnose(ctx, "evidence", "full", nil); err == nil {
 		t.Fatal("Diagnose() error = nil, want timeout")
 	}
 }
 
-func TestReasonerLLMCannotReachL2Tools(t *testing.T) {
-	// 注册一个 L2 工具：它绝不能出现在 Reasoner 的工具面里。
+// Writes are actions: the model may name an enabled one in its plan, but no
+// action is ever a callable tool.
+func TestReasonerNeverExposesActionsAsTools(t *testing.T) {
 	registry := stubLLMRegistry(t)
-	if err := registry.Register(tools.ToolSpec{
-		Name: "docker_restart", Description: "restart", Level: tools.L2LowRisk,
-		Timeout: time.Second, Handler: func(context.Context, json.RawMessage) (string, error) { return "", nil },
-	}); err != nil {
-		t.Fatal(err)
-	}
 	reasoner := testReasoner(t, "http://127.0.0.1:1", registry)
-	agentTools, err := reasoner.agentTools(&stepRecorder{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	agentTools := reasoner.agentTools(registry.ForLLM(), &stepRecorder{})
 	for _, at := range agentTools {
 		info, _ := at.Info(context.Background())
 		if info.Name == "docker_restart" {
-			t.Fatal("L2 tool leaked into LLM tool surface")
+			t.Fatal("action leaked into the LLM tool surface")
 		}
 	}
 	if len(agentTools) != 1 {
-		t.Fatalf("agent tools = %d, want 1 (L1 only)", len(agentTools))
+		t.Fatalf("agent tools = %d, want 1 read-only tool", len(agentTools))
+	}
+	if !strings.Contains(reasoner.prompt, "docker_restart") || !strings.Contains(reasoner.prompt, "reason") || strings.Contains(reasoner.prompt, "upstream_restore") {
+		t.Fatalf("prompt must list plannable actions and their params only:\n%s", reasoner.prompt)
+	}
+}
+
+func TestParseContractAcceptsOnlyDeclaredActionParams(t *testing.T) {
+	actions := map[string]tools.ActionDefinition{"docker_restart": stubActionDefinition}
+	for name, test := range map[string]struct {
+		plan string
+		ok   bool
+	}{
+		"none":             {`{"action":"none"}`, true},
+		"declared param":   {`{"action":"docker_restart","params":{"reason":"oom"}}`, true},
+		"null params":      {`{"action":"docker_restart","params":null}`, true},
+		"unknown action":   {`{"action":"upstream_restore"}`, false},
+		"undeclared param": {`{"action":"docker_restart","params":{"image":"x"}}`, false},
+		"params not obj":   {`{"action":"docker_restart","params":["reason"]}`, false},
+	} {
+		raw := `{"rca":"x","confidence":"high","evidence_refs":["docker"],"plan":` + test.plan + `}`
+		contract, err := parseContract(raw, actions)
+		if (err == nil) != test.ok {
+			t.Fatalf("%s: err=%v", name, err)
+		}
+		if err == nil && len(contract.EvidenceRefs) != 1 {
+			t.Fatalf("%s: evidence refs lost: %+v", name, contract)
+		}
 	}
 }
 
@@ -361,7 +410,7 @@ func TestReasonerUsageAccumulatesAcrossRoundsAndRetry(t *testing.T) {
 		return chatResponse(validPlanJSON, 20, 8)
 	})
 	reasoner := testReasoner(t, fake.server.URL, stubLLMRegistry(t))
-	result, err := reasoner.Diagnose(context.Background(), "evidence", "full")
+	result, err := reasoner.Diagnose(context.Background(), "evidence", "full", nil)
 	if err != nil {
 		t.Fatalf("Diagnose() error = %v", err)
 	}
@@ -381,7 +430,7 @@ func TestReasonerRateLimited(t *testing.T) {
 	}))
 	t.Cleanup(fake.server.Close)
 	reasoner := testReasoner(t, fake.server.URL, stubLLMRegistry(t))
-	_, err := reasoner.Diagnose(context.Background(), "evidence", "full")
+	_, err := reasoner.Diagnose(context.Background(), "evidence", "full", nil)
 	if err == nil {
 		t.Fatal("Diagnose() error = nil, want rate limit failure")
 	}
@@ -396,7 +445,7 @@ func TestReasonerRejectsEmptyModelOutput(t *testing.T) {
 		return chatResponse("", 10, 5)
 	})
 	reasoner := testReasoner(t, fake.server.URL, stubLLMRegistry(t))
-	if _, err := reasoner.Diagnose(context.Background(), "evidence", "full"); err == nil {
+	if _, err := reasoner.Diagnose(context.Background(), "evidence", "full", nil); err == nil {
 		t.Fatal("Diagnose() error = nil, want empty output failure")
 	}
 	if got := fake.requests.Load(); got != 1 {
@@ -413,9 +462,9 @@ func TestReasonerToolErrorRecordedInSteps(t *testing.T) {
 		}
 		return chatResponse(validPlanJSON, 30, 12)
 	})
-	registry := tools.NewRegistry()
+	registry := actionRegistry(t)
 	if err := registry.Register(tools.ToolSpec{
-		Name: tools.ToolPromSeriesMeta, Description: "stub", Level: tools.L1ReadOnly,
+		Name: tools.ToolPromSeriesMeta, Description: "stub",
 		Timeout: 5 * time.Second, MaxOutput: 512,
 		Params: []tools.ParamSpec{{Name: "match", Description: "selector", Required: true}},
 		Handler: func(context.Context, json.RawMessage) (string, error) {
@@ -425,7 +474,7 @@ func TestReasonerToolErrorRecordedInSteps(t *testing.T) {
 		t.Fatal(err)
 	}
 	reasoner := testReasoner(t, fake.server.URL, registry)
-	result, err := reasoner.Diagnose(context.Background(), "evidence", "light")
+	result, err := reasoner.Diagnose(context.Background(), "evidence", "light", nil)
 	if err != nil {
 		t.Fatalf("Diagnose() error = %v", err)
 	}
@@ -445,9 +494,9 @@ func TestReasonerNormalizesEmptyToolArgumentPlaceholder(t *testing.T) {
 		}
 		return chatResponse(validPlanJSON, 30, 12)
 	})
-	registry := tools.NewRegistry()
+	registry := actionRegistry(t)
 	if err := registry.Register(tools.ToolSpec{
-		Name: tools.ToolPromSeriesMeta, Description: "stub", Level: tools.L1ReadOnly,
+		Name: tools.ToolPromSeriesMeta, Description: "stub",
 		Timeout: 5 * time.Second, MaxOutput: 512,
 		Params: []tools.ParamSpec{{Name: "match", Description: "selector", Required: true}},
 		Handler: func(_ context.Context, raw json.RawMessage) (string, error) {
@@ -467,7 +516,7 @@ func TestReasonerNormalizesEmptyToolArgumentPlaceholder(t *testing.T) {
 		t.Fatal(err)
 	}
 	reasoner := testReasoner(t, fake.server.URL, registry)
-	result, err := reasoner.Diagnose(context.Background(), "evidence", "light")
+	result, err := reasoner.Diagnose(context.Background(), "evidence", "light", nil)
 	if err != nil {
 		t.Fatalf("Diagnose() error = %v", err)
 	}
@@ -476,5 +525,123 @@ func TestReasonerNormalizesEmptyToolArgumentPlaceholder(t *testing.T) {
 	}
 	if len(result.Steps) != 1 || result.Steps[0].Err != "" {
 		t.Fatalf("steps = %+v", result.Steps)
+	}
+}
+
+// A model that keeps requesting evidence must still get a final answer turn
+// inside the existing graph budget (model + tools + model).
+func TestReasonerReservesFinalAnswerWithinBudget(t *testing.T) {
+	for _, steps := range []int{1, 2, 3, 8} {
+		t.Run(fmt.Sprint(steps), func(t *testing.T) {
+			fake := newFakeOpenAIServer(t, func(call int, body map[string]any) map[string]any {
+				if body["tool_choice"] == "none" {
+					return chatResponse(validPlanJSON, 10, 5)
+				}
+				return toolCallResponse(fmt.Sprint(call), tools.ToolPromSeriesMeta, `{"match":"up"}`)
+			})
+			r := testReasoner(t, fake.server.URL, stubLLMRegistry(t))
+			r.budget.LightSteps = steps
+			result, err := r.Diagnose(context.Background(), "evidence", "light", nil)
+			if err != nil {
+				t.Fatalf("Diagnose() = %v", err)
+			}
+			wantCalls := (steps + 1) / 2
+			if got := int(fake.requests.Load()); got != wantCalls || len(result.Steps) != wantCalls-1 {
+				t.Fatalf("calls=%d tools=%d, want %d/%d", got, len(result.Steps), wantCalls, wantCalls-1)
+			}
+		})
+	}
+}
+
+func TestReasonerRejectsFreeTextAction(t *testing.T) {
+	fake := newFakeOpenAIServer(t, func(call int, body map[string]any) map[string]any {
+		return chatResponse(strings.Replace(validPlanJSON, `"docker_restart"`, `"提高内存或扩容"`, 1), 10, 5)
+	})
+	r := testReasoner(t, fake.server.URL, stubLLMRegistry(t))
+	if _, err := r.Diagnose(context.Background(), "evidence", "light", nil); err == nil {
+		t.Fatal("free-text action accepted")
+	}
+	if fake.requests.Load() != 2 {
+		t.Fatal("invalid action must use the existing single contract retry")
+	}
+}
+
+func TestReasonerFinalTurnRejectsMoreTools(t *testing.T) {
+	fake := newFakeOpenAIServer(t, func(call int, body map[string]any) map[string]any {
+		return toolCallResponse(fmt.Sprint(call), tools.ToolPromSeriesMeta, `{"match":"up"}`)
+	})
+	r := testReasoner(t, fake.server.URL, stubLLMRegistry(t))
+	result, err := r.Diagnose(context.Background(), "evidence", "light", nil)
+	if err == nil || !strings.Contains(err.Error(), "evidence budget ended") {
+		t.Fatalf("error=%v, want tool budget rejection", err)
+	}
+	if result == nil || len(result.Steps) != 1 || result.Plan.Action != "" || result.TokensIn != 20 || fake.requests.Load() != 2 {
+		t.Fatalf("partial=%+v requests=%d", result, fake.requests.Load())
+	}
+}
+
+func TestReasonerBatchToolsPreservesEveryStep(t *testing.T) {
+	const batchSize = 8
+	fake := newFakeOpenAIServer(t, func(call int, body map[string]any) map[string]any {
+		if call > 1 {
+			if body["tool_choice"] != "none" {
+				t.Error("batch must count as one tool round")
+			}
+			return chatResponse(validPlanJSON, 10, 5)
+		}
+		response := toolCallResponse("unused", tools.ToolPromSeriesMeta, `{"match":"up"}`)
+		calls := make([]map[string]any, 0, batchSize)
+		for i := 0; i < batchSize; i++ {
+			calls = append(calls, map[string]any{"id": fmt.Sprint(i), "type": "function", "function": map[string]any{
+				"name": tools.ToolPromSeriesMeta, "arguments": fmt.Sprintf(`{"match":"metric_%d"}`, i),
+			}})
+		}
+		response["choices"].([]map[string]any)[0]["message"].(map[string]any)["tool_calls"] = calls
+		return response
+	})
+	r := testReasoner(t, fake.server.URL, stubLLMRegistry(t))
+	result, err := r.Diagnose(context.Background(), "evidence", "light", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string]bool)
+	for _, step := range result.Steps {
+		seen[step.Input] = true
+	}
+	if len(result.Steps) != batchSize || len(seen) != batchSize {
+		t.Fatalf("recorded %d steps (%d distinct), want %d", len(result.Steps), len(seen), batchSize)
+	}
+}
+
+// The replay record must be written before the model sees anything, and name
+// exactly the model, prompt and tool surface used. A failed record stops the call.
+func TestReasonerRecordsInputBeforeFirstModelCall(t *testing.T) {
+	fake := newFakeOpenAIServer(t, func(int, map[string]any) map[string]any {
+		return chatResponse(validPlanJSON, 10, 5)
+	})
+	reasoner := testReasoner(t, fake.server.URL, stubLLMRegistry(t))
+	var recorded DiagnosisInput
+	result, err := reasoner.Diagnose(context.Background(), "evidence text", "light", func(input DiagnosisInput) error {
+		if fake.requests.Load() != 0 {
+			t.Error("input recorded after the model was called")
+		}
+		recorded = input
+		return nil
+	})
+	if err != nil || result == nil {
+		t.Fatalf("Diagnose() = %v", err)
+	}
+	if recorded.Model != "fake-model" || recorded.PromptSHA256 != reasoner.promptSHA256 || len(recorded.PromptSHA256) != 64 || recorded.Evidence != "evidence text" {
+		t.Fatalf("recorded = %+v", recorded)
+	}
+	if len(recorded.Tools) != 1 || recorded.Tools[0].Name != tools.ToolPromSeriesMeta || len(recorded.Tools[0].Params) != 1 {
+		t.Fatalf("recorded tools = %+v", recorded.Tools)
+	}
+
+	_, err = reasoner.Diagnose(context.Background(), "evidence text", "light", func(DiagnosisInput) error {
+		return fmt.Errorf("snapshot store unavailable")
+	})
+	if err == nil || !strings.Contains(err.Error(), "record diagnosis input") || fake.requests.Load() != 1 {
+		t.Fatalf("err=%v requests=%d, want no model call after a failed record", err, fake.requests.Load())
 	}
 }

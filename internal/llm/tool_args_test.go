@@ -55,7 +55,7 @@ func TestExecuteLLMToolRejectsConflictingRepeatedArguments(t *testing.T) {
 	registry := tools.NewRegistry()
 	called := false
 	if err := registry.Register(tools.ToolSpec{
-		Name: "docker_inspect", Description: "test", Level: tools.L1ReadOnly,
+		Name: "docker_inspect", Description: "test",
 		Timeout: time.Second,
 		Handler: func(context.Context, json.RawMessage) (string, error) {
 			called = true
@@ -77,7 +77,7 @@ func TestQuestionRegistryToolNormalizesEmptyGatewayPlaceholder(t *testing.T) {
 	registry := tools.NewRegistry()
 	called := false
 	if err := registry.Register(tools.ToolSpec{
-		Name: "prom_series_meta", Description: "test", Level: tools.L1ReadOnly,
+		Name: "prom_series_meta", Description: "test",
 		Timeout: time.Second,
 		Handler: func(_ context.Context, raw json.RawMessage) (string, error) {
 			called = true

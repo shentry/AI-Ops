@@ -3,10 +3,13 @@ package store
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
@@ -19,6 +22,49 @@ import (
 // ErrInvalidRawEvent 是"报文不是合法 JSON"的哨兵错误。HTTP 层用 errors.Is
 // 区分输入问题和存储故障：前者回 400 怪调用方，后者回 503 怪自己。
 var ErrInvalidRawEvent = errors.New("store: raw event payload must be valid JSON")
+
+// Pending admission is part of the durable write, including across server processes.
+const maxPendingRawEvents = 1000
+
+var ErrRawEventQueueFull = errors.New("store: raw event queue is full")
+
+// ErrInvalidAlertInput identifies permanent input failures; database errors remain retryable.
+var ErrInvalidAlertInput = errors.New("store: invalid alert input")
+
+// ValidateAlertInput checks the actual alert/last_alert column limits before any writes.
+func ValidateAlertInput(input AlertInput) error {
+	for _, field := range []struct {
+		name  string
+		value string
+		limit int
+	}{
+		{"fingerprint", input.Fingerprint, 64},
+		{"alert_hash", input.AlertHash, 32},
+		{"source", input.Source, 64},
+		{"name", input.Name, 255},
+	} {
+		if strings.TrimSpace(field.value) == "" || utf8.RuneCountInString(field.value) > field.limit {
+			return fmt.Errorf("%w: %s must contain 1..%d characters", ErrInvalidAlertInput, field.name, field.limit)
+		}
+	}
+	if len(input.GeneratorURL) > 65535 {
+		return fmt.Errorf("%w: generatorURL exceeds TEXT capacity", ErrInvalidAlertInput)
+	}
+	if input.Status != "firing" && input.Status != "resolved" {
+		return fmt.Errorf("%w: unsupported status", ErrInvalidAlertInput)
+	}
+	if input.Severity < 0 || input.Severity > 127 {
+		return fmt.Errorf("%w: severity exceeds TINYINT range", ErrInvalidAlertInput)
+	}
+	for _, timestamp := range []time.Time{input.StartsAt, input.ReceivedAt} {
+		// DATETIME(3) rounds fractions, so the upper half millisecond would overflow.
+		utc := timestamp.UTC()
+		if utc.Year() < 1000 || utc.Year() > 9999 || !utc.Before(time.Date(9999, 12, 31, 23, 59, 59, 999500000, time.UTC)) {
+			return fmt.Errorf("%w: timestamp outside DATETIME(3) range", ErrInvalidAlertInput)
+		}
+	}
+	return nil
+}
 
 // DedupResult 是新到告警与同指纹 last_alert 比对后的三种结论，
 // 下游（worker 的 hook）按它决定建 incident 还是只续心跳。
@@ -66,16 +112,27 @@ type AlertApplyResult struct {
 // "必须和 alert 落库同生共死"的逻辑 —— D04 的 incident 关联正是。
 type RawEventApplyHook func(context.Context, IncidentTx, AlertApplyResult) error
 
-// CreateRawEvent 是 webhook handler 的直接落库点，只做最基本的把关：
-// 必须是合法 JSON 才能进队列 —— 坏报文在这里就拦下（handler 回 400），
-// 根本不占用 worker 的重试环。payload 拷贝一份再存，和调用方的切片脱钩，
-// 避免 buffer 复用把已入库内容改掉。落库即 pending，等 worker 来消费。
+// CreateRawEvent validates JSON and admits a pending event only if capacity remains.
+// Locking the indexed pending range at REPEATABLE READ prevents concurrent admissions
+// from exceeding the cap, even when the queue is empty. Lock/deadlock errors are
+// returned to the webhook as retryable failures; 202 requires a committed insert.
 func (db *DB) CreateRawEvent(ctx context.Context, source string, payload []byte, createdAt time.Time) (RawEvent, error) {
 	if len(bytes.TrimSpace(payload)) == 0 || !json.Valid(payload) {
 		return RawEvent{}, ErrInvalidRawEvent
 	}
 	event := RawEvent{Source: source, Payload: datatypes.JSON(append([]byte(nil), payload...)), Status: "pending", CreatedAt: createdAt}
-	if err := db.WithContext(ctx).Create(&event).Error; err != nil {
+	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var pending []uint64
+		if err := tx.Model(&RawEvent{}).Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("status = ?", "pending").Limit(maxPendingRawEvents).Pluck("id", &pending).Error; err != nil {
+			return err
+		}
+		if len(pending) >= maxPendingRawEvents {
+			return ErrRawEventQueueFull
+		}
+		return tx.Create(&event).Error
+	}, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
+	if err != nil {
 		return RawEvent{}, fmt.Errorf("store: create raw event: %w", err)
 	}
 	return event, nil
@@ -112,6 +169,11 @@ func (db *DB) MarkRawEventFailed(ctx context.Context, id uint64, message string,
 // 它和 MarkRawEventFailed 正是 worker 那套二分法的落库侧：
 // 报文没救走 failed，库出问题走这里的回滚重试。
 func (db *DB) ApplyRawEvent(ctx context.Context, rawEventID uint64, inputs []AlertInput, processedAt time.Time, hook RawEventApplyHook) ([]AlertApplyResult, error) {
+	for _, input := range inputs {
+		if err := ValidateAlertInput(input); err != nil {
+			return nil, err
+		}
+	}
 	results := make([]AlertApplyResult, 0, len(inputs))
 	err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var event RawEvent
@@ -150,10 +212,6 @@ func (db *DB) ApplyRawEvent(ctx context.Context, rawEventID uint64, inputs []Ale
 // 三种结果分别对应 DedupNew / DedupFull / DedupPartial。必须在事务里跑：
 // last_alert 的"读-比-写"不是原子的，靠 FOR UPDATE 串行化。
 func applyAlert(tx *gorm.DB, input AlertInput) (AlertApplyResult, error) {
-	// 身份字段缺失直接报错，不落一条永远查不回来的脏数据。
-	if input.Fingerprint == "" || input.AlertHash == "" || input.Name == "" {
-		return AlertApplyResult{}, errors.New("store: alert identity is required")
-	}
 	labels, err := json.Marshal(input.Labels)
 	if err != nil {
 		return AlertApplyResult{}, fmt.Errorf("store: encode alert labels: %w", err)
@@ -196,6 +254,13 @@ func applyAlert(tx *gorm.DB, input AlertInput) (AlertApplyResult, error) {
 		}
 		last.LastSeen = input.ReceivedAt
 		return AlertApplyResult{Input: input, Dedup: DedupFull, Last: last}, nil
+	}
+	// A changed current alert also changes the scope of its existing Incident.
+	// Lock it even when the correlator will choose a different group afterward.
+	if last.IncidentID != nil {
+		if _, err := lockIncident(tx.Statement.Context, tx, *last.IncidentID); err != nil {
+			return AlertApplyResult{}, fmt.Errorf("lock incident before alert change: %w", err)
+		}
 	}
 	// 同指纹不同内容：追加一条新版本 alert，last_alert 改指到它。
 	// firing_count 用 SQL 原子自增（gorm.Expr）而不是读-改-写，并发下不丢计数。

@@ -1,0 +1,30 @@
+oncall-agent
+Licensed under the GNU Affero General Public License v3.0 (see LICENSE).
+
+This project contains code copied from ongrid
+(https://github.com/ongridio/ongrid), Copyright the ongrid authors,
+licensed under the GNU Affero General Public License v3.0. The copies are
+taken from commit 81e08b5efbe9ccd9a5781574d5f3ba10215eccac (v0.17.2) and were
+modified on 2026-09-28; each file's header names its source path and states
+what was changed.
+
+Copied files:
+
+  internal/api/observability.go              <- internal/manager/server/prometheus/http.go (queryRange)
+  web/src/components/PromQLPanel.tsx         <- web/src/components/PromQLPanel.tsx
+  web/src/components/TimeRangePicker.tsx     <- web/src/components/ui/TimeRangePicker.tsx
+  web/src/components/monitor/PanelGrid.tsx   <- web/src/components/monitor/PanelGrid.tsx
+  web/src/components/topology/Graph.tsx      <- web/src/components/topology/Graph.tsx
+  web/src/components/topology/route.ts       <- web/src/components/topology/route.ts (unmodified)
+  web/src/lib/grafana.ts                     <- web/src/api/grafana.ts
+  web/src/lib/grafanaVars.ts                 <- web/src/lib/grafanaVars.ts (unmodified)
+  web/src/lib/prom.ts                        <- web/src/api/prom.ts
+  web/src/lib/telemetryContext.ts            <- web/src/lib/telemetryContext.ts (time helpers only)
+  web/src/lib/usePoll.ts                     <- web/src/lib/usePoll.ts (unmodified)
+  web/src/pages/Monitor.tsx                  <- web/src/pages/Monitor.tsx
+  web/src/pages/Topology.tsx                 <- web/src/pages/Topology.tsx (graph view and node drawer)
+
+The layout of internal/grafana (dashboards embedded in the server binary)
+follows ongrid's internal/manager/biz/grafana; that file was written for this
+project. No ongrid brand assets are included; they are not covered by the
+AGPL-3.0 grant.

@@ -1,8 +1,14 @@
 package feishu
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
+
+	"gorm.io/datatypes"
+	"oncall-agent/internal/incident"
+	"oncall-agent/internal/store"
 
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 
@@ -70,7 +76,7 @@ func TestApprovalButtonValueParsesInCallback(t *testing.T) {
 		ApprovalID: &approvalID,
 		Title:      "诊断报告",
 		Summary:    "连接池耗尽",
-		Payload:    map[string]any{"plan_hash": "abc"},
+		Payload:    completeCardPayload(t),
 	})
 	value := firstCallbackValue(t, card)
 	action, gotID, gotHash, err := cardActionValue(&callback.CardActionTriggerEvent{
@@ -82,8 +88,88 @@ func TestApprovalButtonValueParsesInCallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cardActionValue() error = %v, value = %v", err, value)
 	}
-	if action != "approve" || gotID != approvalID || gotHash != "abc" {
+	if action != "approve" || gotID != approvalID || gotHash != completeCardPayload(t)["plan_hash"] {
 		t.Fatalf("parsed = (%q, %d, %q)", action, gotID, gotHash)
+	}
+}
+
+func completeCardApproval(t *testing.T) store.Approval {
+	t.Helper()
+	expires := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	snapshot, _ := json.Marshal(incident.ExecutionContext{Version: incident.ExecutionContextVersion, Kind: incident.KindPrimary, Service: "sub2api",
+		Rule:          incident.RuleRef{ID: "restart", Version: "r1@000000000000", Mode: incident.ModeManual, Alerts: []string{"Sub2APIDown"}},
+		ActionVersion: 2, Target: incident.Object{Kind: "container", Name: "sub2api", ID: "c0ffee"}, Revision: "started_at=x", PreState: json.RawMessage(`{}`),
+		Members: []string{"private-member"}, FaultAlert: "Sub2APIDown", ExpiresAt: expires,
+		Verification: incident.VerificationSpec{Checks: []incident.Check{{Kind: incident.CheckHealth, Params: json.RawMessage(`{"base_url":"http://private-target.invalid:8080"}`)}},
+			IntervalSeconds: 10, WindowSeconds: 120, TimeoutSeconds: 5, RequiredPasses: 1}})
+	row := store.Approval{ID: 7, IncidentID: 11, RunID: 9, ToolName: "docker_restart", Status: "pending", Reason: "manual approval required", ExpiresAt: expires, ArgsJSON: datatypes.JSON(`{"target_kind":"container","target_name":"sub2api"}`), ExecutionContext: snapshot}
+	var err error
+	row.PlanHash, err = incident.PlanHash(row.ToolName, row.ArgsJSON, row.ExecutionContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return row
+}
+
+func completeCardPayload(t *testing.T) map[string]any {
+	row := completeCardApproval(t)
+	return map[string]any{"plan_hash": row.PlanHash, "action": row.ToolName, "target": "container/sub2api", "target_id": "c0ffee", "rule_id": "restart", "rule_mode": "manual", "reason": row.Reason, "expires_at": row.ExpiresAt.Format(time.RFC3339), "web_url": "https://console.example.invalid/incidents/11"}
+}
+
+func TestApprovalCardSnapshotAndImmutableReferences(t *testing.T) {
+	payload := completeCardPayload(t)
+	payload["risk"] = "invented-model-risk"
+	payload["execution_context"] = completeCardApproval(t).ExecutionContext
+	payload["args_json"] = completeCardApproval(t).ArgsJSON
+	payload["verification"] = map[string]any{"base_url": "http://private-target.invalid:8080"}
+	id := uint64(7)
+	card := BuildCard(notify.Notification{Kind: notify.NotificationApprovalRequired, IncidentID: 11, ApprovalID: &id, Payload: payload})
+	encoded, err := MarshalCard(card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(encoded)
+	for _, expected := range []string{"container/sub2api", "**Target ID:** c0ffee", "**Rule:** restart", "**Mode:** manual"} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("missing %q: %s", expected, body)
+		}
+	}
+	for _, forbidden := range []string{"invented-model-risk", "private-target.invalid", "private-member", "args_json", "target_kind", "execution_context"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("leaked %q: %s", forbidden, body)
+		}
+	}
+	value := firstCallbackValue(t, card)
+	if len(value) != 3 || value["action"] != "approve" || value["approval_id"] != id || value["plan_hash"] != payload["plan_hash"] {
+		t.Fatalf("callback must contain only immutable references: %#v", value)
+	}
+}
+
+// Only a complete manual snapshot can be approved from a card; an automatic
+// rule's snapshot needs no person.
+func TestApprovalCardIncompleteSnapshotHasNoApprove(t *testing.T) {
+	for _, key := range []string{"plan_hash", "action", "target", "target_id", "rule_id", "rule_mode", "reason", "expires_at"} {
+		t.Run(key, func(t *testing.T) {
+			payload := completeCardPayload(t)
+			delete(payload, key)
+			id := uint64(7)
+			encoded, err := RenderCard(notify.Notification{Kind: notify.NotificationApprovalRequired, IncidentID: 11, ApprovalID: &id, Payload: payload})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(encoded), `"action":"approve"`) {
+				t.Fatalf("incomplete %s still approves: %s", key, encoded)
+			}
+		})
+	}
+	for _, mode := range []any{"auto", "observe", true, nil} {
+		payload := completeCardPayload(t)
+		payload["rule_mode"] = mode
+		id := uint64(7)
+		encoded, _ := json.Marshal(BuildCard(notify.Notification{ApprovalID: &id, Payload: payload}))
+		if strings.Contains(string(encoded), `"action":"approve"`) {
+			t.Fatalf("mode %v accepted: %s", mode, encoded)
+		}
 	}
 }
 

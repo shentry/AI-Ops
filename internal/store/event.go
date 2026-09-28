@@ -45,12 +45,22 @@ func appendIncidentEvent(ctx context.Context, q *gorm.DB, event IncidentEvent) (
 	if err := q.WithContext(ctx).Create(&event).Error; err != nil {
 		return IncidentEvent{}, fmt.Errorf("store: append incident event: %w", err)
 	}
+	if requiresHumanAttention(event) {
+		if err := q.WithContext(ctx).Create(&NotificationTask{EventID: event.ID, NextAttemptAt: event.CreatedAt}).Error; err != nil {
+			return IncidentEvent{}, fmt.Errorf("store: queue human notification: %w", err)
+		}
+	}
 	return event, nil
 }
 
-// AppendIncidentEvent 写入非事务路径的 Incident 事件。
-func (db *DB) AppendIncidentEvent(ctx context.Context, event IncidentEvent) (IncidentEvent, error) {
-	return appendIncidentEvent(ctx, db.DB, event)
+// AppendIncidentEvent commits the event and any required delivery task together.
+func (db *DB) AppendIncidentEvent(ctx context.Context, event IncidentEvent) (saved IncidentEvent, err error) {
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var saveErr error
+		saved, saveErr = appendIncidentEvent(ctx, tx, event)
+		return saveErr
+	})
+	return saved, err
 }
 
 // AppendIncidentEvent 在 ApplyRawEvent 事务内追加事实事件。

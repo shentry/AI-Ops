@@ -1,0 +1,49 @@
+// Ships logs to Loki. Only these sources are collected, so this file is also the
+// boundary of what the agent's loki_query can read:
+//   - containers of the sub2api Compose project and of this monitoring project,
+//     labelled service=<Compose service> and container=<container name>;
+//   - the oncall-agent systemd journal, labelled service=oncall-agent.
+
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    regex         = sys.env("SUB2API_COMPOSE_PROJECT") + "|sub2api-monitoring"
+    action        = "keep"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+}
+
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers.output
+  labels     = {}
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.source.journal "agent" {
+  matches    = "_SYSTEMD_UNIT=oncall-agent.service"
+  labels     = {service = "oncall-agent"}
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

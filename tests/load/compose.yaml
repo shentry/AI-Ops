@@ -1,0 +1,115 @@
+# Isolated, resource-limited deployment; no Docker socket or monitored-service mounts.
+name: oncall-benchmark
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  mysql:
+    image: mysql@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b
+    container_name: oncall-bench-mysql
+    labels:
+      oncall.scope: aws-k6-20260917
+    cpus: "0.80"
+    mem_limit: 768m
+    memswap_limit: 768m
+    pids_limit: 128
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?required}
+      MYSQL_DATABASE: oncall_benchmark
+      MYSQL_USER: oncall
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?required}
+    command:
+      - --max-connections=100
+      - --innodb-buffer-pool-size=268435456
+      - --innodb-flush-log-at-trx-commit=1
+      - --sync-binlog=1
+      - --binlog-expire-logs-seconds=86400
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "MYSQL_PWD=$$MYSQL_ROOT_PASSWORD mysqladmin ping -uroot -h 127.0.0.1 --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+      start_period: 30s
+
+  server:
+    image: alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+    container_name: oncall-bench-server
+    labels:
+      oncall.scope: aws-k6-20260917
+    cpus: "0.60"
+    mem_limit: 384m
+    memswap_limit: 384m
+    pids_limit: 64
+    restart: unless-stopped
+    logging: *logging
+    read_only: true
+    user: "1000:1000"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    working_dir: /app
+    entrypoint: ["/app/oncall-server"]
+    environment:
+      CONFIG_FILE: /app/config.bench.yaml
+      AUTH_TOKEN: ${AUTH_TOKEN:?required}
+      BENCH_VIEWER_TOKEN_SHA256: ${BENCH_VIEWER_TOKEN_SHA256:?required}
+      MYSQL_DSN: oncall:${MYSQL_PASSWORD:?required}@tcp(mysql:3306)/oncall_benchmark?parseTime=true&charset=utf8mb4&loc=UTC&timeout=3s&readTimeout=5s&writeTimeout=5s
+      GOMAXPROCS: "1"
+      GOMEMLIMIT: 320MiB
+    ports:
+      - "127.0.0.1:18081:18080"
+    volumes:
+      - ./oncall-server:/app/oncall-server:ro
+      - ./config.bench.yaml:/app/config.bench.yaml:ro
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:18080/metrics"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  k6:
+    profiles: ["load"]
+    image: alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+    labels:
+      oncall.scope: aws-k6-20260917
+    cpus: "0.25"
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 64
+    logging: *logging
+    read_only: true
+    user: "1000:1000"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    entrypoint: ["/usr/local/bin/k6"]
+    environment:
+      AUTH_TOKEN: ${AUTH_TOKEN:?required}
+      BASE_URL: http://server:18080
+      BENCHMARK_ACK: oncall-isolated-only
+      K6_NO_USAGE_REPORT: "true"
+      GOMAXPROCS: "1"
+      GOMEMLIMIT: 192MiB
+    volumes:
+      - /home/ubuntu/bin/k6:/usr/local/bin/k6:ro
+      - ./alertmanager.k6.js:/scripts/alertmanager.k6.js:ro
+      - ./results:/results
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+
+volumes:
+  mysql-data:
+    labels:
+      oncall.scope: aws-k6-20260917

@@ -1,0 +1,184 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 同一分支的新提交取消上一次未跑完的 run，避免排队浪费。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go
+    runs-on: ubuntu-latest
+
+    # store 集成测试使用独立真 MySQL；CI 必须设置 TEST_MYSQL_DSN，
+    # 不允许因缺少连接配置跳过队列 CAS、事务回滚与恢复测试。
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root-pass
+          MYSQL_DATABASE: oncall
+          MYSQL_USER: oncall
+          MYSQL_PASSWORD: oncall-pass
+        ports:
+          - 3306:3306
+        # 没有 health check 的话后续步骤会在 MySQL 还没起来时就连，
+        # 表现为随机失败的 CI。
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot-pass"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # Go embed 必须包含本次前端产物，不能仅凭 .gitkeep 编译空控制台。
+      - name: Build embedded frontend
+        working-directory: web
+        run: npm ci && npm run build
+
+      # 仅限这个可丢弃的 CI MySQL。故障注入测试用条件触发器 + SIGNAL；
+      # 测试进程仍使用应用账号，不把 root 或此全局设置带到生产。
+      - name: Configure MySQL fault-injection privileges
+        run: |
+          docker exec "${{ job.services.mysql.id }}" mysql -uroot -proot-pass -e \
+            "SET GLOBAL log_bin_trust_function_creators = 1; GRANT TRIGGER ON oncall.* TO 'oncall'@'%';"
+
+      # 迁移手工执行、无版本表。CI 每次从空库
+      # 按序全量跑一遍 —— 顺带验证这些 SQL 在干净库上确实能跑通。
+      # 用 mysql:8.0 镜像里的客户端而不是 runner 预装的：service 已经拉过
+      # 这个镜像，不额外花时间，也不赌 runner 镜像里有没有 mysql-client。
+      - name: Apply all migrations
+        run: |
+          for f in migrations/*.sql; do
+            echo "applying $f"
+            docker run --rm -i --network host mysql:8.0 \
+              mysql -h 127.0.0.1 -P 3306 -uoncall -poncall-pass oncall < "$f"
+          done
+
+      # API 的 Web/飞书并发裁决使用另一数据库，避免与 store 全局 FIFO 队列测试互相干扰。
+      - name: Prepare isolated approval API database (all migrations)
+        run: |
+          docker exec "${{ job.services.mysql.id }}" mysql -uroot -proot-pass -e \
+            'CREATE DATABASE oncall_api; GRANT ALL PRIVILEGES ON `oncall\_api`.* TO "oncall"@"%";'
+          for f in migrations/*.sql; do
+            echo "applying $f to oncall_api"
+            docker exec -i "${{ job.services.mysql.id }}" \
+              mysql -uoncall -poncall-pass oncall_api < "$f"
+          done
+
+      # diagnosis/verifier 使用独立 FIFO 队列库，不能与 store 或 API 集成测试共库。
+      - name: Prepare isolated diagnosis database (all migrations)
+        run: |
+          docker exec "${{ job.services.mysql.id }}" mysql -uroot -proot-pass -e \
+            'CREATE DATABASE oncall_diagnose; GRANT ALL PRIVILEGES ON `oncall\_diagnose`.* TO "oncall"@"%";'
+          for f in migrations/*.sql; do
+            echo "applying $f to oncall_diagnose"
+            docker exec -i "${{ job.services.mysql.id }}" \
+              mysql -uoncall -poncall-pass oncall_diagnose < "$f"
+          done
+
+      - name: Prepare unattended action acceptance database
+        run: |
+          docker exec "${{ job.services.mysql.id }}" mysql -uroot -proot-pass -e \
+            'CREATE DATABASE oncall_acceptance; GRANT ALL PRIVILEGES ON `oncall\_acceptance`.* TO "oncall"@"%";'
+          for f in migrations/*.sql; do
+            docker exec -i "${{ job.services.mysql.id }}" mysql -uoncall -poncall-pass oncall_acceptance < "$f"
+          done
+          docker pull python:3.12-alpine
+
+      # 升级测试要求空 schema 和显式模式，不能在上面的已迁移库运行，
+      # 也不能依赖普通 go test 中的默认跳过路径。
+      - name: Test empty and legacy execution upgrades
+        run: |
+          for mode in empty legacy; do
+            database="oncallupgrade${mode}"
+            docker exec "${{ job.services.mysql.id }}" mysql -uroot -proot-pass -e \
+              "CREATE DATABASE ${database}; GRANT ALL PRIVILEGES ON ${database}.* TO 'oncall'@'%';"
+            TEST_EXECUTION_UPGRADE_MODE="$mode" \
+              TEST_MYSQL_DSN="oncall:oncall-pass@tcp(127.0.0.1:3306)/${database}?parseTime=true&loc=UTC" \
+              go test -count=1 -race ./internal/store -run '^TestExecutionUpgradeMigrations$'
+          done
+
+      - name: gofmt
+        run: |
+          # gofmt -l 列出"需要格式化"的文件，有输出即失败。
+          unformatted="$(gofmt -l ./cmd ./internal)"
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未格式化，请跑 gofmt -w："
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        env:
+          TEST_MYSQL_DSN: oncall:oncall-pass@tcp(127.0.0.1:3306)/oncall?parseTime=true&loc=UTC
+          TEST_API_MYSQL_DSN: oncall:oncall-pass@tcp(127.0.0.1:3306)/oncall_api?parseTime=true&loc=UTC
+          TEST_DIAGNOSE_MYSQL_DSN: oncall:oncall-pass@tcp(127.0.0.1:3306)/oncall_diagnose?parseTime=true&loc=UTC
+          TEST_UNATTENDED_DSN: oncall:oncall-pass@tcp(127.0.0.1:3306)/oncall_acceptance?parseTime=true&loc=UTC
+          TEST_DOCKER_SOCKET: /var/run/docker.sock
+          TEST_DOCKER_IMAGE: python:3.12-alpine
+        run: |
+          : "${TEST_MYSQL_DSN:?MySQL integration tests must not be skipped}"
+          : "${TEST_API_MYSQL_DSN:?Approval API MySQL integration tests must not be skipped}"
+          : "${TEST_DIAGNOSE_MYSQL_DSN:?Diagnosis/verifier MySQL integration tests must not be skipped}"
+          : "${TEST_UNATTENDED_DSN:?Unattended action acceptance must not be skipped}"
+          : "${TEST_DOCKER_SOCKET:?Real Docker acceptance must not be skipped}"
+          go test -count=1 -race ./...
+
+  web:
+    name: Web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install
+        working-directory: web
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: web
+        run: npm run typecheck
+
+      # web/dist 不入库；Go job 也会先构建，保证实际嵌入本次前端产物。
+      - name: Build
+        working-directory: web
+        run: npm run build
+
+      - name: Install browser
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+
+      # 这些浏览器交互测试拦截 API，不是 live-backend 全链路验收。
+      - name: Interaction tests
+        working-directory: web
+        run: npm test
