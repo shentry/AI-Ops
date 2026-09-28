@@ -231,6 +231,7 @@ flowchart TB
 | `internal/incident` | 不依赖 store 的归并/生命周期/路由纯规则；ExecutionContext、PlanHash、FaultFingerprint 与重诊规则 |
 | `internal/diagnose` | Evidence（含发布记录与上游账号采集）、诊断快照、Pipeline、Guard、按检查项的 Verifier 和持久验证/观察 Worker |
 | `internal/llm` | OpenAI 兼容模型工厂、Eino ReAct、只读 Questioner、模型切换；计划契约由已启用动作定义生成 |
+| `internal/topology` | 依赖拓扑：主服务节点由 `service` 生成，其余节点和边来自 `topology` 配置（启动时校验）；节点状态经 Registry 的 `docker_inspect` / `prom_instant_query` 读取，firing 告警按 component → container → service 标签映射到节点，15 秒缓存 |
 | `internal/grafana` | 看板 JSON（`dashboards/`）编进二进制；Grafana 从同一目录 provisioning，控制台监控页渲染同一份 |
 | `internal/tools` | 只读工具（Prometheus、Docker、Loki）注册、统一超时、脱敏、输出截断；动作定义与实现（Prepare / Execute / Reconcile）：`docker_restart`、`deployment_rollback`、`upstream_quarantine` |
 | `internal/sub2api` | sub2api 管理接口客户端（只读 ops、账号调度）与业务探针 |
@@ -357,6 +358,7 @@ flowchart TB
         DOCCOL["docker<br/>inspect + 日志模式聚合"]
         CHG["recent_changes<br/>发布记录与迁移声明"]
         UPS["upstream_accounts<br/>ops 接口：分组账号可用性与错误"]
+        TOPO["topology<br/>配置声明的依赖 + 容器/健康/告警实时状态"]
     end
 
     EVID --> SNAP
@@ -368,6 +370,7 @@ flowchart TB
     EVID --> DOCCOL
     EVID --> CHG
     EVID --> UPS
+    EVID --> TOPO
 
     SNAP --> COLLECTED["Evidence items"]
     REPLAY --> COLLECTED
@@ -378,6 +381,7 @@ flowchart TB
     DOCCOL --> COLLECTED
     CHG --> COLLECTED
     UPS --> COLLECTED
+    TOPO --> COLLECTED
     COLLECTED --> RENDER["Evidence.Render<br/>脱敏、截断、防 Prompt Injection"]
     COLLECTED --> DSNAP[("diagnosis_snapshot<br/>结构化证据 + 调用模型前的完整输入")]
     RENDER --> REASON["llm.Reasoner<br/>上下文预算 + 旧工具结果压缩<br/>兜底 full≤32步 / light≤16步"]
@@ -471,6 +475,7 @@ flowchart LR
 
 - LLM 只能看到 `Registry.ForLLM()` 导出的只读工具；动作从不作为工具暴露给 ReAct。
 - `Guard` 会拦截无真实目标身份的动作（例如依据匿名 OOM 重启健康目标），配置错误、镜像不存在、凭据错误等根因会禁止重启类动作并升级人工。
+- `docker_restart` 的目标在拓扑证据中直接 `depends_on` 的节点确认 `down` 或 `missing` 时，Guard 升级人工（依赖故障时重启下游无效）；`unknown` 不拦截，避免 Prometheus 故障卡住所有处置。
 - 只有 `remediation.rules` 能授权写操作：规则列出动作、覆盖的告警、模式与预算；firing 成员必须全部属于该服务且在规则覆盖的告警内。`observe` 只记录本会采取的动作。
 - `auto` 在维护窗口、规则被阻断、同一事件已执行过主要动作或监控数据不可用时降级为 `manual`；急停、服务正在处置、预算耗尽或动作拒绝准备时直接拒绝。模型置信度不授予执行权。
 - `incident.PlanHash = SHA256(canonicalJSON(tool_name, args, execution_context))`；版本 3 快照固定规则 ID/版本/模式、动作版本、目标身份与修订、执行前状态、证据引用、故障成员、验证检查项与参数、补偿和有效期。Hash 是内容绑定，不是身份签名。
@@ -503,12 +508,14 @@ flowchart LR
         SIDE["ApprovalCard · ActionCard<br/>ProblemsCard · MembersCard · ReviewCard"]
         OPS["Remediation / Report / Changes<br/>规则急停、效果评估、发布记录"]
         MON["Monitor<br/>原生渲染 Grafana 看板（拷自 ongrid）"]
+        TOPOPAGE["Topology<br/>依赖图与节点实时状态（拷自 ongrid）"]
 
         APP --> SHELL
         SHELL --> OVERVIEW
         SHELL --> ROOM
         SHELL --> OPS
         SHELL --> MON
+        SHELL --> TOPOPAGE
         ROOM --> FLOW
         ROOM --> TABS
         ROOM --> SIDE
@@ -569,6 +576,7 @@ flowchart LR
   - `/incidents/<id>` → `IncidentDetail`（诊断报告、处理流程、时间线/诊断轨迹/问 Agent 三个标签，右侧审批、最近变更、当前问题、告警成员、复盘标注）
   - `/remediation` → 处置规则、急停/复位、控制记录；`/report` → 效果评估与待复盘队列；`/changes` → 发布记录与「标记健康」
   - `/monitor` → `Monitor`（按需加载）：用 `PanelGrid` / `PromQLPanel`（recharts）原生渲染 `internal/grafana/dashboards` 的四个看板，支持时间范围、自定义窗口和自动刷新；Incident 详情的“监控”按钮打开事件前后各 30 分钟。代码拷自 ongrid（AGPL-3.0，见 NOTICE）
+  - `/topology` → `Topology`（按需加载）：`TopologyGraph`（@xyflow/react + dagre）画依赖图，节点颜色表示状态、带告警数；侧栏列出节点，选中后显示容器事实、告警、关系和监控链接；`?incident=ID` 高亮该事件告警映射到的节点（Incident 详情的“拓扑”按钮）。每 15 秒刷新。代码拷自 ongrid（AGPL-3.0，见 NOTICE）
 - 侧栏每 30 秒拉一次最近 50 个 Incident，供导航徽标、最近事件和 ⌘K 快速跳转使用；各页面需要筛选时自己查询服务端。
 - `IncidentDetail` 首屏读取控制室聚合、run steps 和对话历史。
 - 诊断结论与对话用 Markdown 渲染：不启用原始 HTML、去掉图片、链接新窗口且无 opener；step 输入输出在浏览器侧再按敏感键名脱敏一次。
@@ -645,6 +653,7 @@ sequenceDiagram
 | `/api/v1/session` | 个人令牌 / 会话 | 登录、当前身份、登出 |
 | `GET /api/v1/observability/dashboards`、`/dashboards/:uid` | viewer（不含机器令牌） | 编进二进制的看板定义 |
 | `POST /api/v1/prometheus/query_range` | viewer（不含机器令牌） | 监控页的 PromQL 区间查询代理，表达式 ≤ 4 KB，30 秒超时 |
+| `GET /api/v1/topology?incident=` | viewer（不含机器令牌） | 依赖图与节点状态；带 `incident` 时另返回该事件告警映射到的节点 |
 | `/api/v1/control-room/model` | 任一身份 | 当前模型和 allowlist |
 | `/api/v1/control-room/incidents`、`/incidents/:id/control-room`、`/events`、`/problems`、`/runs...`、`/stream`、`/conversation` | 任一身份 | 控制室读取与 SSE |
 | `POST /api/v1/incidents/:id/questions\|rediagnose\|request-evidence` | operator | 提问、重诊、补充证据入队 |

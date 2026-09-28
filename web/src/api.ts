@@ -894,3 +894,56 @@ export async function listApprovals(status = "pending"): Promise<ApprovalDTO[]> 
   const query = status ? `?status=${encodeURIComponent(status)}` : "";
   return list(await request<unknown>(`/api/v1/approvals${query}`), "approvals").map(toApproval);
 }
+
+export type NodeState = "up" | "down" | "unknown" | "missing";
+
+export interface TopologyNode {
+  id: string;
+  kind: string;
+  container: string;
+  state: NodeState;
+  detail: string;
+  container_id: string;
+  restart_count: number;
+  oom_killed: boolean;
+  alerts: string[];
+}
+
+export interface TopologyEdge {
+  from: string;
+  to: string;
+  type: string;
+}
+
+// Topology is the declared graph with states observed at checked_at. highlight
+// lists the nodes the requested incident's alerts map to.
+export interface Topology {
+  checked_at: string;
+  nodes: TopologyNode[];
+  edges: TopologyEdge[];
+  alerts_error: string;
+  highlight: string[];
+}
+
+const nodeStates: NodeState[] = ["up", "down", "unknown", "missing"];
+
+export async function getTopology(incidentID = 0): Promise<Topology> {
+  const body = object(await request<unknown>(`/api/v1/topology${incidentID > 0 ? `?incident=${incidentID}` : ""}`));
+  return {
+    checked_at: text(body.checked_at),
+    alerts_error: text(body.alerts_error),
+    highlight: strings(body.highlight),
+    nodes: list(body, "nodes").map((value) => {
+      const node = object(value);
+      const state = nodeStates.find((item) => item === node.state) ?? "unknown";
+      return {
+        id: text(node.id), kind: text(node.kind), container: text(node.container), state, detail: text(node.detail),
+        container_id: text(node.container_id), restart_count: number(node.restart_count), oom_killed: node.oom_killed === true, alerts: strings(node.alerts),
+      };
+    }),
+    edges: list(body, "edges").map((value) => {
+      const edge = object(value);
+      return { from: text(edge.from), to: text(edge.to), type: text(edge.type) };
+    }),
+  };
+}

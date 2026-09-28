@@ -73,6 +73,21 @@ service:
   #   work_dir: /opt/sub2api
   #   lock_file: /opt/sub2api/.deploy.lock
   #   timeout_seconds: 300
+# 依赖拓扑：主服务节点由 service 生成，这里只写其余节点和边。
+# 节点状态来自 container（docker inspect）和 health（PromQL，返回一个样本，1 为正常、0 为故障）；
+# 两者都没有的节点状态为未知。depends_on 的目标确认故障或不存在时，Guard 拒绝重启下游并转人工。
+# 启动时校验：id 唯一、类型已知、边的两端都存在、depends_on 不成环，否则拒绝启动。
+topology:
+  nodes:
+    - {id: postgres, kind: datastore, container: sub2api-postgres, health: "max(pg_up)"}
+    - {id: redis, kind: datastore, container: sub2api-redis, health: "max(redis_up)"}
+    - {id: upstream, kind: upstream}
+    - {id: host, kind: host, health: 'min(up{job="node-exporter"})'}
+  edges:
+    - {from: sub2api, to: postgres, type: depends_on}
+    - {from: sub2api, to: redis, type: depends_on}
+    - {from: sub2api, to: upstream, type: depends_on}
+    - {from: sub2api, to: host, type: runs_on}
 # 处置规则是受版本管理的配置发布：修改规则时同时修改 rules_version。
 # 规则、服务配置与验证标准的摘要参与授权版本，修改会撤销旧快照（含在途验证）。
 # mode: observe 只记录本会采取的动作；manual 需要操作人确认冻结快照；

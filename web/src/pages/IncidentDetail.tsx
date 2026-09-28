@@ -1,4 +1,4 @@
-import { Activity, MessagesSquare, OctagonAlert, RefreshCw, RotateCcw } from "lucide-react";
+import { Activity, MessagesSquare, Network, OctagonAlert, RefreshCw, RotateCcw } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router";
 
@@ -239,6 +239,10 @@ function IncidentDetail({ incidentId }: { incidentId: number }) {
             <Link to={monitorLink(incident.started_at, incident.resolved_at)} className={buttonClass()}>
               <Activity size={13} aria-hidden="true" />
               监控
+            </Link>
+            <Link to={`/topology?incident=${incident.id}`} className={buttonClass()}>
+              <Network size={13} aria-hidden="true" />
+              拓扑
             </Link>
             <Button onClick={openChat}>
               <MessagesSquare size={13} aria-hidden="true" />

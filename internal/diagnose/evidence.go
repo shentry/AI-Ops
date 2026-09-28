@@ -11,6 +11,7 @@ import (
 
 	"oncall-agent/internal/store"
 	"oncall-agent/internal/tools"
+	"oncall-agent/internal/topology"
 )
 
 // itemMaxRunes 是单个证据项的默认截断预算（rune）。
@@ -113,6 +114,7 @@ type EvidenceItem struct {
 	Release     *ReleaseFacts          `json:",omitempty"`
 	Upstream    *UpstreamFacts         `json:",omitempty"`
 	Business    *tools.BusinessTraffic `json:",omitempty"`
+	Topology    *topology.Snapshot     `json:",omitempty"`
 	Body        string
 	Truncated   bool
 	Err         string
@@ -190,6 +192,9 @@ func (e Evidence) Render() string {
 		}
 		if item.Business != nil {
 			writeFacts(&out, item.Business)
+		}
+		if item.Topology != nil {
+			writeFacts(&out, item.Topology)
 		}
 		if item.Truncated {
 			out.WriteString("- truncated: true\n")

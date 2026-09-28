@@ -58,6 +58,15 @@
   --series-6: #008300;
 }
 
+/* React Flow 的缩放按钮跟随控制台主题。 */
+.react-flow {
+  --xy-controls-button-background-color: var(--surface);
+  --xy-controls-button-background-color-hover: var(--surface-2);
+  --xy-controls-button-color: var(--fg-muted);
+  --xy-controls-button-color-hover: var(--fg);
+  --xy-controls-button-border-color: var(--line);
+}
+
 @theme inline {
   --color-canvas: var(--canvas);
   --color-sidebar: var(--sidebar);

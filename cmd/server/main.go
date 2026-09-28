@@ -33,6 +33,7 @@ import (
 	"oncall-agent/internal/store"
 	"oncall-agent/internal/sub2api"
 	"oncall-agent/internal/tools"
+	"oncall-agent/internal/topology"
 	"oncall-agent/web"
 )
 
@@ -189,6 +190,8 @@ func run() error {
 	if opsReader != nil {
 		upstreamEvidence, verifierAccounts = diagnose.NewUpstreamAccountsCollector(opsReader), opsReader
 	}
+	// 拓扑的实时状态只经由上面注册的只读工具读取；诊断证据和控制台共用一份缓存。
+	graph := topology.New(cfg.Topology, cfg.Service, registry)
 	collectors := []diagnose.Collector{
 		diagnose.NewSnapshotCollector(),
 		diagnose.NewPromReplayCollector(registry, cfg.Tools.Prometheus.RangeMinutes),
@@ -199,6 +202,7 @@ func run() error {
 		diagnose.NewRecentChangesCollector(db, cfg.Service),
 		diagnose.NewPostgresCollector(cfg.Service, cfg.Diagnose.Evidence),
 		diagnose.NewRedisCollector(cfg.Service, cfg.Diagnose.Evidence),
+		diagnose.NewTopologyCollector(graph),
 		diagnose.NewDockerInspectCollector(cfg.Service, registry),
 		diagnose.NewDockerLogsCollector(cfg.Service, cfg.Diagnose.Evidence, registry),
 	}
@@ -427,6 +431,7 @@ func run() error {
 		for _, route := range []string{"/api/v1/prometheus/query_range", "/api/v1/observability/dashboards", "/api/v1/observability/dashboards/:uid"} {
 			server.BindHandler(route, observabilityAPI.Handle)
 		}
+		server.BindHandler("/api/v1/topology", api.NewTopologyAPI(graph, db, auth).Handle)
 	}
 	if feishuCallback != nil {
 		server.BindHandler("/integrations/feishu/events", feishuCallback.Handle)

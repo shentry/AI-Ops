@@ -36,7 +36,7 @@ var commonRules = []guardRule{actionWithoutTarget, dependencyUnavailable}
 
 // actionRules 是每个动作要求的事实。没有规则的动作一律拒绝（fail closed）。
 var actionRules = map[string][]guardRule{
-	tools.ActionDockerRestart:      {nonRestartableFailure, restartTargetIdentity, restartPreconditions},
+	tools.ActionDockerRestart:      {nonRestartableFailure, restartTargetIdentity, brokenDependency, restartPreconditions},
 	tools.ActionDeploymentRollback: {rollbackPreconditions},
 	tools.ActionUpstreamQuarantine: {quarantinePreconditions},
 }
@@ -132,6 +132,19 @@ func restartTargetIdentity(_ string, plan llm.Plan, evidence Evidence) (string, 
 	}
 	if plan.Target.Kind != "container" || plan.Target.Name != item.Object.Name {
 		return DecisionDeny, "restart target is not the container identified by docker_inspect"
+	}
+	return "", ""
+}
+
+// brokenDependency：拓扑证据确认重启目标直接依赖的节点 down 或 missing 时，重启下游
+// 无效，升级人工。unknown 不拦截，否则 Prometheus 一出故障所有自动处置都会被卡住。
+func brokenDependency(_ string, plan llm.Plan, evidence Evidence) (string, string) {
+	item, ok := evidence.Item("topology")
+	if !ok || item.Topology == nil {
+		return "", ""
+	}
+	if broken := item.Topology.BrokenDependencies(plan.Target.Name); len(broken) > 0 {
+		return DecisionEscalate, fmt.Sprintf("dependency %s is %s; restarting %s does not fix it", broken[0].ID, broken[0].State, plan.Target.Name)
 	}
 	return "", ""
 }

@@ -73,6 +73,7 @@ journalctl -u oncall-agent -f   # 看到 "oncall-agent: server ready"
 - Alertmanager 在容器里通过 `host.docker.internal:18080` 访问 Agent（`host-gateway` 即 docker0 地址，通常是 `172.17.0.1`）。把 `server.listen_addr` 设为该地址（`ip -4 addr show docker0`），不要用 `0.0.0.0`。宿主防火墙若限制入站，只放行监控网络网段到 18080。
 - 控制台通过 SSH 隧道访问：`ssh -L 18080:172.17.0.1:18080 <host>`，`web.base_url` 写 `http://127.0.0.1:18080`。控制台没有匿名访问，每个操作人一个令牌（配置里只存 SHA-256）。
 - Agent 访问的地址都在宿主机本地：`tools.prometheus.base_url: http://127.0.0.1:9090`，`service.base_url` 为 sub2api 在宿主机上的端口（例如 `http://127.0.0.1:8080`）。sub2api 的 PostgreSQL / Redis 未映射到宿主机时，`service.postgres_dsn` / `redis_addr` 留空，依赖状态由 exporter 经 Prometheus 提供。
+- 依赖拓扑按 `config.example.yaml` 的 `topology` 声明 postgres、redis、upstream、host，容器名以 `docker ps` 为准。上一条留空 DSN 时，直连探测 postgres／redis 的 Guard 规则不会触发，依赖故障时阻止重启下游就只靠拓扑（容器状态 + `pg_up`／`redis_up`），所以生产必须配置。
 
 ### Docker 与发布入口
 
@@ -135,8 +136,9 @@ exporter 二进制来自上面的构建（`bin/sub2api-exporter`，Compose 以�
 3. `curl -s 127.0.0.1:3100/config | grep -E 'retention_(enabled|period)'` 为 `true` 和 `1w`；上线 8 天后确认 `loki-data` 卷不再增长，最早的日志不早于 7 天前。
 4. 控制台“监控”页四个看板都有数据；Grafana 里 `sub2api 服务` 底部能看到日志。
 5. 停掉 Loki（`docker compose stop loki`）后触发一次诊断：`loki_query` 返回错误，诊断照常完成；恢复后 `LogPipelineDropping` 不应持续触发。
+6. 控制台“拓扑”页：sub2api、postgres、redis、host 为正常，upstream 为未知（它没有可声明的检查）；任一节点显示不存在时，先核对配置里的容器名。
 
-从旧版本升级时，Agent 的 `config.yaml` 需删掉 `tools.logs` 和 `tools.mysql_select`（它们从未被读取，现已移除，严格配置会拒绝未知字段），并按需加上 `tools.loki`。
+从旧版本升级时，Agent 的 `config.yaml` 需删掉 `tools.logs` 和 `tools.mysql_select`（它们从未被读取，现已移除，严格配置会拒绝未知字段），并按需加上 `tools.loki` 和 `topology`。
 
 ## 4. 上线顺序（阶段 E）
 

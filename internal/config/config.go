@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -52,6 +53,40 @@ type Config struct {
 	Service ServiceConfig `yaml:"service"`
 	// Remediation holds the versioned action rules and their verification.
 	Remediation RemediationConfig `yaml:"remediation"`
+	// Topology declares what the service depends on. The service's own node
+	// comes from Service; only the other nodes and the edges are written here.
+	Topology TopologyConfig `yaml:"topology"`
+}
+
+// Topology node kinds and edge types. A depends_on edge propagates failure:
+// restarting a service whose dependency is down does not help. runs_on only
+// records placement.
+const (
+	TopologyDependsOn = "depends_on"
+	TopologyRunsOn    = "runs_on"
+)
+
+var topologyKinds = map[string]bool{"service": true, "container": true, "datastore": true, "upstream": true, "host": true}
+
+type TopologyConfig struct {
+	Nodes []TopologyNode `yaml:"nodes"`
+	Edges []TopologyEdge `yaml:"edges"`
+}
+
+// TopologyNode is observed through its container (docker inspect) and its
+// health expression: a PromQL instant query returning one sample, 1 for up and
+// 0 for down. A node with neither is shown but its state stays unknown.
+type TopologyNode struct {
+	ID        string `yaml:"id"`
+	Kind      string `yaml:"kind"`
+	Container string `yaml:"container"`
+	Health    string `yaml:"health"`
+}
+
+type TopologyEdge struct {
+	From string `yaml:"from"`
+	To   string `yaml:"to"`
+	Type string `yaml:"type"`
 }
 
 // ServiceConfig is the only place that names the monitored service. Evidence,
@@ -535,6 +570,9 @@ func validate(cfg Config) error {
 	if err := validateRemediation(cfg.Remediation, cfg.Service); err != nil {
 		return err
 	}
+	if err := validateTopology(cfg.Topology, cfg.Service); err != nil {
+		return err
+	}
 	if cfg.Diagnose.Evidence.LogMaxLines < 1 {
 		return fmt.Errorf("config: diagnose.evidence.log_max_lines must be at least 1")
 	}
@@ -702,6 +740,66 @@ func validateService(s ServiceConfig) error {
 		}
 		if err := validatePositiveSeconds("service.release.timeout_seconds", r.TimeoutSeconds); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// validateTopology rejects a graph the Guard could misread: duplicate or unknown
+// nodes, dangling edges and depends_on cycles. The service node is implicit.
+func validateTopology(t TopologyConfig, service ServiceConfig) error {
+	nodes := map[string]bool{service.Name: true}
+	for index, node := range t.Nodes {
+		field := fmt.Sprintf("topology.nodes[%d]", index)
+		if !serviceNamePattern.MatchString(node.ID) || nodes[node.ID] {
+			return fmt.Errorf("config: %s.id must be unique, differ from service.name and be 1-64 lowercase letters, digits and ._-", field)
+		}
+		nodes[node.ID] = true
+		if !topologyKinds[node.Kind] {
+			return fmt.Errorf("config: %s.kind must be service, container, datastore, upstream or host", field)
+		}
+		if node.Container != "" && !serviceNamePattern.MatchString(node.Container) {
+			return fmt.Errorf("config: %s.container must be 1-64 lowercase letters, digits and ._-", field)
+		}
+	}
+	dependsOn := map[string][]string{}
+	edges := map[TopologyEdge]bool{}
+	for index, edge := range t.Edges {
+		field := fmt.Sprintf("topology.edges[%d]", index)
+		if !nodes[edge.From] || !nodes[edge.To] || edge.From == edge.To {
+			return fmt.Errorf("config: %s must connect two different declared nodes", field)
+		}
+		if edge.Type != TopologyDependsOn && edge.Type != TopologyRunsOn {
+			return fmt.Errorf("config: %s.type must be depends_on or runs_on", field)
+		}
+		if edges[edge] {
+			return fmt.Errorf("config: %s duplicates an earlier edge", field)
+		}
+		edges[edge] = true
+		if edge.Type == TopologyDependsOn {
+			dependsOn[edge.From] = append(dependsOn[edge.From], edge.To)
+		}
+	}
+	// Depth-first search: reaching a node still on the stack closes a cycle.
+	state := map[string]int{} // 1 visiting, 2 done
+	var visit func(string) bool
+	visit = func(id string) bool {
+		if state[id] == 1 {
+			return true
+		}
+		if state[id] == 2 {
+			return false
+		}
+		state[id] = 1
+		if slices.ContainsFunc(dependsOn[id], visit) {
+			return true
+		}
+		state[id] = 2
+		return false
+	}
+	for id := range nodes {
+		if visit(id) {
+			return fmt.Errorf("config: topology depends_on edges form a cycle through %s", id)
 		}
 	}
 	return nil

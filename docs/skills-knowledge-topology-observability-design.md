@@ -1,6 +1,6 @@
 # 排查技能、知识库、拓扑与监控设计
 
-> 状态：第 1 步（监控）已实现，第 2–5 步待实施。编写日期：2026-09-28。
+> 状态：第 1 步（监控）、第 2 步（拓扑）已实现，第 3–5 步待实施。编写日期：2026-09-28。
 >
 > 现状基线：`feat/execution-trust` 分支，结论以源码为准。Ongrid 参考固定在 `81e08b5efbe9ccd9a5781574d5f3ba10215eccac`（v0.17.2）：监控页的代码直接拷自 ongrid（见 §7.3 与 `NOTICE`，本仓库因此为 AGPL-3.0），其余部分只借鉴设计，不复制内置知识内容。
 >
@@ -27,7 +27,7 @@
 | 技能 | 纯提示内容，只引用已注册的只读工具，启动时校验，出错即拒绝加载 | 不像 ongrid 那样让技能自带可执行实现，写操作仍然只走 Action |
 | 知识检索 | MySQL 8.4 `FULLTEXT ... WITH PARSER ngram` | 不引入 Qdrant 和 Embedding API；换义表述的召回不如向量检索，由评测决定是否升级 |
 | 拓扑来源 | 节点和边写在配置里；主服务节点由 `service` 配置生成 | 单机场景不做遥测自动发现；新增组件需要改配置 |
-| 拓扑展示 | 手写 SVG 分层布局，不新增前端依赖 | 节点超过约 30 个时再考虑 `@xyflow/react` + dagre |
+| 拓扑展示 | 拷 ongrid 的图组件（`@xyflow/react` + dagre，见 NOTICE） | 前端新增两个依赖；换来拖动、缩放和绕开节点的连线，不再手写布局（原方案是手写 SVG） |
 | 日志 | Loki 单体部署；Alloy 通过 Docker API 采集指定 Compose 项目的容器日志，并采集 Agent 的 journal | 新增 3 个容器和磁盘占用；Alloy 持有 Docker socket，与 cAdvisor 同等权限 |
 | 模型查日志 | `loki_query` 按拓扑节点由服务端拼 selector | 模型不能写任意 LogQL |
 | 看板 | 照搬 ongrid：看板 JSON 编进二进制，控制台用 recharts 原生渲染，查询走 `query_range` 代理；Grafana 用同一份 JSON，只负责 Explore 和日志面板 | 这部分代码拷自 ongrid，仓库因此改为 AGPL-3.0（见 NOTICE）；前端新增 recharts 依赖 |
@@ -56,7 +56,7 @@
 | 日志配置 | `tools.logs`（provider `cls`）已定义，但没有任何代码读取 | 删除，替换为 `tools.loki` |
 | 监控 | [`deploy/monitoring/compose.yaml`](../deploy/monitoring/compose.yaml)：Prometheus、Alertmanager、blackbox、node-exporter、cAdvisor、Postgres／Redis／sub2api exporter，端口只绑 127.0.0.1 | 在同一个 Compose 中追加组件 |
 | 告警标签 | [`alerts.yml`](../alerts.yml) 已带 `service`、`component`（postgres／redis）、`container` 标签 | 用于把告警映射到拓扑节点，不需要额外配置 |
-| 前端 | React 19 + React Router 7 + Tailwind v4，依赖中已有 `react-markdown` | 新增两个页面，不新增依赖 |
+| 前端 | React 19 + React Router 7 + Tailwind v4，依赖中已有 `react-markdown` | 新增页面；监控页引入 recharts，拓扑页引入 `@xyflow/react` 与 `@dagrejs/dagre` |
 | 评测 | [`tests/effectiveness`](../tests/effectiveness/) 共 12 个案例 | 所有新能力按开/关对比 |
 
 ## 3. 总体结构
@@ -84,7 +84,7 @@ flowchart LR
 代码归属如下，不新建多层抽象：
 
 - `internal/knowledge`：技能加载与匹配（`skills.go`）、知识条目同步与检索（`entries.go`）。它们都属于"给模型看的知识"。
-- `internal/topology`：拓扑配置校验、实时状态汇总。
+- `internal/topology`：实时状态汇总与告警到节点的映射；拓扑配置的校验和其他配置一起放在 `internal/config`。
 - `internal/tools`：新增 `loki.go`、`knowledge.go`（knowledge_search／read），以及 Registry 上的 Tool Search。
 - `internal/diagnose`：新增 `collector_topology.go`，在 Guard 中增加依赖规则。
 - `skills/`、`knowledge/`：仓库内的 Markdown 内容。
@@ -239,27 +239,30 @@ topology:
 
 - **容器节点**：通过 `docker_inspect` 取 running、health、restart_count、OOMKilled 和容器 ID。找不到容器时状态为 `missing`。
 - **健康**：执行节点声明的 `health` 表达式，1 为 `up`，0 为 `down`，查询失败或无数据为 `unknown`。
-- **告警**：用现有 Prometheus 客户端查询 `ALERTS{alertstate="firing"}`，按标签映射到节点：先看 `component`，再看 `container`，最后看 `service`。不需要新接 Alertmanager API。
+- **告警**：用现有 Prometheus 客户端查询 `ALERTS{alertstate="firing"}`，按标签映射到节点：先看 `component`，再看 `container`，最后看 `service`。不需要新接 Alertmanager API。告警读取失败时在结果中单独标出，节点上没有告警不代表没有触发中的告警。
+- **合并**：一个节点有多项检查时，`missing` 优先于 `down`，`down` 优先于 `unknown`；两项都没有声明的节点为 `unknown`。
+- 所有读取都走 Registry 的 `docker_inspect` 与 `prom_instant_query`，超时、脱敏、截断与模型的工具调用一致。缓存由诊断和页面共用；一次观察不受调用方取消的影响，避免被中途放弃的请求把 `unknown` 写进缓存。
 
 ### 6.3 进入诊断
 
 新增 `topology` Collector，产出一个证据项：
 
 - 主服务的依赖子图，以及每个节点的状态、firing 告警、容器身份；
-- 结构化字段 `Topology *TopologyFacts` 供 Guard 使用，`Body` 渲染成文字给模型看。
+- 结构化字段 `Topology *topology.Snapshot` 供 Guard 使用，并作为一行 facts 渲染给模型看（与 `docker_inspect` 一样，不再重复写正文）。
 
 本期不提供拓扑查询工具。整个图不到 10 个节点，直接放进证据即可。ongrid 需要 `expand_topology`、`find_topology_node` 是因为它面对的是一整个机群。
 
 ### 6.4 Guard 依赖规则
 
-`docker_restart` 的目标服务如果有 `depends_on` 节点在本次证据中为 `down`，Guard 直接拒绝并升级人工，理由是"依赖故障时重启下游无效"。
+`docker_restart` 的目标服务如果有直接 `depends_on` 的节点在本次证据中为 `down` 或 `missing`（容器不存在），Guard 直接拒绝并升级人工，理由是"依赖故障时重启下游无效"。现有的 `dependencyUnavailable`（直连探测 postgres／redis 失败）保留：它不依赖 Prometheus，两条规则都只会收紧。
 
 `unknown` 不拦截，只在报告中标出。否则 Prometheus 一出故障，所有自动处置都会被卡住。这条规则只会收紧，不会放宽任何现有判定。
 
 ### 6.5 页面
 
-- **拓扑页**：SVG 分层布局。按 `depends_on` 计算层级，`runs_on` 目标放在底层。节点颜色表示 up／down／unknown／missing，并带 firing 告警数和活跃 Incident 徽标。点击节点打开侧栏，显示结构化事实、告警、最近的 Incident，以及 Grafana 看板和日志链接。
-- **Incident 详情页**：复用同一个组件，高亮该 Incident 告警映射到的节点，以及诊断引用的节点。
+- **拓扑页**（`/topology`）：dagre 从左到右布局，节点边框颜色表示 up／down／unknown／missing，并带 firing 告警数；`depends_on` 为实线，指向故障依赖时标红，`runs_on` 为虚线。侧栏列出全部节点（窄屏和键盘可用），选中节点后显示结构化事实、告警、关系和监控页看板链接。页面每 15 秒刷新。
+- **Incident 详情页**："拓扑"按钮打开 `/topology?incident=ID`，服务端用同一套标签映射算出该 Incident 告警涉及的节点并高亮。
+- 未做：节点侧栏的最近 Incident、日志链接，以及高亮诊断引用的节点。
 
 ## 7. 监控
 
@@ -336,7 +339,7 @@ topology:
 
 | 接口 | 作用 | 权限 |
 | --- | --- | --- |
-| `GET /api/v1/topology` | 图结构、实时状态、Grafana 链接 | viewer |
+| `GET /api/v1/topology?incident=` | 图结构、实时状态；带 `incident` 时另返回该事件告警涉及的节点 | viewer |
 | `GET /api/v1/skills` | 技能列表、SHA、激活统计 | viewer |
 | `GET /api/v1/knowledge?q=&source=`、`GET /api/v1/knowledge/:id` | 检索和查看 | viewer |
 | `POST /api/v1/incidents/:id/knowledge` | 把已复盘的 Incident 加入知识库 | operator |
@@ -348,7 +351,7 @@ topology:
 | --- | --- |
 | migration | 新增 `knowledge_entry` |
 | `DiagnosisInput` | 新增 `Skills`；`Tools` 增加 `full` 或 `deferred` 标记 |
-| `EvidenceItem` | 新增 `Topology *TopologyFacts` |
+| `EvidenceItem` | 新增 `Topology *topology.Snapshot` |
 | 配置 | 新增 `topology`、`tools.loki`、`diagnose.defer_tools`；删除 `tools.logs` |
 | 审批、执行、验证表 | 不变 |
 
@@ -359,7 +362,7 @@ topology:
 | 步骤 | 内容 | 验收 | 单人估算 |
 | --- | --- | --- | --- |
 | 1 监控（已实现） | Loki、Alloy、Grafana，4 个看板（控制台原生渲染，代码拷自 ongrid），`loki_query`，删除 CLS 与 mysql_select 配置，平台告警 | 日志能在 Loki 查到，容器重建和日志轮转后仍能续读；retention 实际生效；Loki 停止后诊断照常完成 | 3–4 天 |
-| 2 拓扑 | 配置校验、实时状态、Collector、Guard 依赖规则、拓扑页与跳转链接 | 停掉 postgres 时拓扑显示 down，且 `docker_restart(sub2api)` 被拒；配置错误拒绝启动 | 4–5 天 |
+| 2 拓扑（已实现） | 配置校验、实时状态、Collector、Guard 依赖规则、拓扑页与跳转链接（图组件拷自 ongrid） | 停掉 postgres 时拓扑显示 down，且 `docker_restart(sub2api)` 被拒；配置错误拒绝启动 | 4–5 天 |
 | 3 技能 | 加载校验、匹配注入、快照录制、5 个技能、技能标签页 | 引用未知工具或告警时拒绝启动；回放使用录制的正文；12 案例开/关对比 | 3–4 天 |
 | 4 知识库 | 表与同步、两个工具、复盘入库、文档标签页 | ngram 检索在真实 MySQL 上通过；带注入内容的条目不改变执行判定；召回评测 | 4–5 天 |
 | 5 Tool Search | 延迟暴露、`tool_search`（含技能检索）、录制 | 检索不到 Action；延迟加载的工具经 Registry 执行；12 案例对比 token 和正确率 | 2 天 |
@@ -388,7 +391,7 @@ topology:
 | Skills | `SKILL.md` 中 `activation` 可为 always 或按用户问题匹配 keyword；技能可带 `impl` 实现，mutating 技能走 reviewer 二审 | 按告警名确定性匹配；只能引用已注册的只读工具；校验失败拒绝启动 |
 | Tool Search | 工具数超过 30（可用环境变量调整）时，按名字把工具分成 core 和 specialty，specialty 只给名字；`select:` 或子串检索 | 同样的暴露方式，另外把技能纳入检索，并录制暴露状态用于回放 |
 | 知识库 | Qdrant + Embedding；内置 vault、git 仓库同步、上传；`query_knowledge` 工具 | MySQL ngram 全文检索；来源为仓库手册加复盘 Incident；不引入向量服务 |
-| 拓扑 | 通用节点和关系表；每 30 秒从遥测同步 `service deployed_on device`；`expand_topology` 做 BFS（默认 2 跳，最多 5 跳）；前端用 xyflow + dagre | 声明式配置加实时状态；整图作为证据；向 Guard 提供依赖规则；手写 SVG |
+| 拓扑 | 通用节点和关系表；每 30 秒从遥测同步 `service deployed_on device`；`expand_topology` 做 BFS（默认 2 跳，最多 5 跳）；前端用 xyflow + dagre | 声明式配置加实时状态；整图作为证据；向 Guard 提供依赖规则；前端拷 ongrid 的 xyflow + dagre 图组件 |
 | 可观测 | 自带 Loki、Tempo、Pyroscope、Grafana 等完整数据面；Monitor 页原生渲染看板 | 只加 Loki、Alloy、Grafana，不做链路和 Profiles；Monitor 页的渲染代码直接拷自 ongrid（AGPL-3.0） |
 
 源码依据：[skill_registry.go](https://github.com/ongridio/ongrid/blob/81e08b5efbe9ccd9a5781574d5f3ba10215eccac/internal/manager/biz/aiops/chatruntime/skill_registry.go)、[toolbag.go](https://github.com/ongridio/ongrid/blob/81e08b5efbe9ccd9a5781574d5f3ba10215eccac/internal/manager/biz/aiops/tools/toolbag.go)、[query_knowledge_basetool.go](https://github.com/ongridio/ongrid/blob/81e08b5efbe9ccd9a5781574d5f3ba10215eccac/internal/manager/biz/aiops/tools/query_knowledge_basetool.go)、[knowledge/usecase.go](https://github.com/ongridio/ongrid/blob/81e08b5efbe9ccd9a5781574d5f3ba10215eccac/internal/manager/biz/knowledge/usecase.go)、[expand_topology_basetool.go](https://github.com/ongridio/ongrid/blob/81e08b5efbe9ccd9a5781574d5f3ba10215eccac/internal/manager/biz/aiops/tools/expand_topology_basetool.go)、[cmd/ongrid/service_topology.go](https://github.com/ongridio/ongrid/blob/81e08b5efbe9ccd9a5781574d5f3ba10215eccac/cmd/ongrid/service_topology.go)。

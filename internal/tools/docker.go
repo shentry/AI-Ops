@@ -113,7 +113,7 @@ func (c *DockerClient) get(ctx context.Context, path string, query url.Values) (
 		return nil, fmt.Errorf("response exceeds %d bytes", maxResponseBytes)
 	}
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, errContainerNotFound
+		return nil, ErrContainerNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("docker returned HTTP %d", resp.StatusCode)
@@ -121,7 +121,9 @@ func (c *DockerClient) get(ctx context.Context, path string, query url.Values) (
 	return body, nil
 }
 
-var errContainerNotFound = errors.New("container not found")
+// ErrContainerNotFound means Docker answered that no such container exists,
+// as opposed to Docker being unreachable.
+var ErrContainerNotFound = errors.New("container not found")
 
 type dockerContainerJSON struct {
 	ID    string `json:"Id"`
@@ -327,7 +329,7 @@ func (c *DockerClient) Restart(ctx context.Context, name string) error {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))
 	if resp.StatusCode == http.StatusNotFound {
-		return errContainerNotFound
+		return ErrContainerNotFound
 	}
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("docker returned HTTP %d", resp.StatusCode)

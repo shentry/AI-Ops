@@ -4,9 +4,10 @@ import (
 	"testing"
 	"time"
 
-	"oncall-agent/internal/tools"
-
+	"oncall-agent/internal/config"
 	"oncall-agent/internal/llm"
+	"oncall-agent/internal/tools"
+	"oncall-agent/internal/topology"
 )
 
 func restartPlan(target string) llm.Plan {
@@ -226,5 +227,43 @@ func TestGuardDeniesActionsWithoutRules(t *testing.T) {
 	result := Guard("", llm.Plan{Action: "config_restore", Target: llm.PlanTarget{Kind: "service", Name: "sub2api"}}, Evidence{})
 	if result.Decision != DecisionDeny || result.Plan.Action != "none" {
 		t.Fatalf("Guard() = %+v, want fail-closed deny", result)
+	}
+}
+
+// 依赖故障时重启下游无效：拓扑确认 down/missing 才拦截，unknown 与 runs_on 不拦截。
+func TestGuardEscalatesRestartWhenDependencyIsBroken(t *testing.T) {
+	withTopology := func(states map[string]string) Evidence {
+		evidence := restartEvidence(exitedWithoutSelfHealing(), nil)
+		snapshot := &topology.Snapshot{
+			Nodes: []topology.Node{{ID: "sub2api", Container: "sub2api", State: topology.StateDown}},
+			Edges: []topology.Edge{{From: "sub2api", To: "host", Type: config.TopologyRunsOn}},
+		}
+		for id, state := range states {
+			snapshot.Nodes = append(snapshot.Nodes, topology.Node{ID: id, State: state})
+			if id != "host" {
+				snapshot.Edges = append(snapshot.Edges, topology.Edge{From: "sub2api", To: id, Type: config.TopologyDependsOn})
+			}
+		}
+		evidence.Items = append(evidence.Items, EvidenceItem{Name: "topology", Status: ItemOK, Topology: snapshot})
+		return evidence
+	}
+	for name, test := range map[string]struct {
+		states map[string]string
+		want   string
+	}{
+		"postgres down":       {map[string]string{"postgres": topology.StateDown}, DecisionEscalate},
+		"redis missing":       {map[string]string{"redis": topology.StateMissing}, DecisionEscalate},
+		"upstream unknown":    {map[string]string{"upstream": topology.StateUnknown}, DecisionAllow},
+		"host down (runs_on)": {map[string]string{"host": topology.StateDown}, DecisionAllow},
+		"dependencies up":     {map[string]string{"postgres": topology.StateUp}, DecisionAllow},
+	} {
+		result := Guard("进程不可用", restartPlan("sub2api"), withTopology(test.states))
+		if result.Decision != test.want {
+			t.Errorf("%s: Guard() = %+v, want %s", name, result, test.want)
+		}
+	}
+	result := Guard("进程不可用", restartPlan("sub2api"), withTopology(map[string]string{"postgres": topology.StateDown}))
+	if !result.Overridden || result.Plan.Action != "none" || result.Reason != "dependency postgres is down; restarting sub2api does not fix it" {
+		t.Fatalf("escalation = %+v", result)
 	}
 }

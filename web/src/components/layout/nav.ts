@@ -1,4 +1,4 @@
-import { Activity, ChartColumnBig, LayoutDashboard, LucideIcon, Rocket, ShieldCheck, Siren } from "lucide-react";
+import { Activity, ChartColumnBig, LayoutDashboard, LucideIcon, Network, Rocket, ShieldCheck, Siren } from "lucide-react";
 
 export interface NavItem {
   to: string;
@@ -20,6 +20,7 @@ export const navGroups: NavGroup[] = [
       { to: "/", label: "概览", icon: LayoutDashboard, keywords: "overview home dashboard 首页" },
       { to: "/incidents", label: "事件", icon: Siren, keywords: "incident alert 告警 事件" },
       { to: "/monitor", label: "监控", icon: Activity, keywords: "monitor metrics dashboard grafana 监控 看板 指标" },
+      { to: "/topology", label: "拓扑", icon: Network, keywords: "topology dependency graph 拓扑 依赖" },
     ],
   },
   {

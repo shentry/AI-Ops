@@ -16,6 +16,8 @@ import { IncidentFeedProvider, SessionProvider } from "./context";
 
 // 监控页带着图表库，按需加载，其他页面不下载它。
 const Monitor = lazy(() => import("../pages/Monitor").then((module) => ({ default: module.Monitor })));
+// 拓扑页带着图布局库，同样按需加载。
+const Topology = lazy(() => import("../pages/Topology").then((module) => ({ default: module.Topology })));
 
 export function App() {
   // undefined: checking the session; null: signed out.
@@ -77,6 +79,7 @@ export function App() {
             <Route path="incidents" element={<Incidents />} />
             <Route path="incidents/:id" element={<IncidentDetailRoute />} />
             <Route path="monitor" element={<Suspense fallback={null}><Monitor /></Suspense>} />
+            <Route path="topology" element={<Suspense fallback={null}><Topology /></Suspense>} />
             <Route path="remediation" element={<Remediation />} />
             <Route path="report" element={<Report />} />
             <Route path="changes" element={<Changes />} />

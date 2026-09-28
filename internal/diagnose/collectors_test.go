@@ -14,6 +14,7 @@ import (
 	"oncall-agent/internal/store"
 	"oncall-agent/internal/sub2api"
 	"oncall-agent/internal/tools"
+	"oncall-agent/internal/topology"
 )
 
 // stubRegistry 用假 handler 装一个真 Registry：超时/截断纪律走真实现，
@@ -488,5 +489,17 @@ func TestRecentChangesCollectorIdentifiesCurrentRelease(t *testing.T) {
 	}
 	if !strings.Contains(item.Body, "release_id=v1 release") || !strings.Contains(item.Body, "verified="+verified.Format(time.RFC3339)) {
 		t.Fatalf("body = %s", item.Body)
+	}
+}
+
+func TestTopologyCollectorRecordsSnapshotAsFacts(t *testing.T) {
+	// No docker or Prometheus tools: every state is unknown, and that is recorded, not dropped.
+	graph := topology.New(config.TopologyConfig{}, config.ServiceConfig{Name: "sub2api", Container: "sub2api"}, tools.NewRegistry())
+	item := NewTopologyCollector(graph).Collect(context.Background(), Target{})
+	if item.Name != "topology" || item.Status != ItemOK || item.Topology == nil || item.Topology.Nodes[0].State != topology.StateUnknown || item.Topology.AlertsError == "" {
+		t.Fatalf("item = %+v", item)
+	}
+	if rendered := (Evidence{Items: []EvidenceItem{item}}).Render(); !strings.Contains(rendered, `- facts: {"checked_at":`) || !strings.Contains(rendered, `"state":"unknown"`) {
+		t.Fatalf("render = %s", rendered)
 	}
 }

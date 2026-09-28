@@ -538,3 +538,43 @@ func TestInMaintenance(t *testing.T) {
 		t.Fatal("window end is exclusive")
 	}
 }
+
+func TestLoadTopology(t *testing.T) {
+	const valid = `
+topology:
+  nodes:
+    - {id: postgres, kind: datastore, container: sub2api-postgres, health: "max(pg_up)"}
+    - {id: host, kind: host}
+  edges:
+    - {from: sub2api, to: postgres, type: depends_on}
+    - {from: sub2api, to: host, type: runs_on}
+`
+	cfg, err := Load(writeConfig(t, "mysql:\n  dsn: test\n"+valid))
+	if err != nil {
+		t.Fatalf("valid topology rejected: %v", err)
+	}
+	if len(cfg.Topology.Nodes) != 2 || cfg.Topology.Edges[0] != (TopologyEdge{From: "sub2api", To: "postgres", Type: TopologyDependsOn}) {
+		t.Fatalf("topology = %+v", cfg.Topology)
+	}
+	for name, yaml := range map[string]string{
+		"duplicate id":      "nodes: [{id: redis, kind: datastore}, {id: redis, kind: datastore}]",
+		"service id reused": "nodes: [{id: sub2api, kind: service}]",
+		"unknown kind":      "nodes: [{id: redis, kind: database}]",
+		"bad container":     "nodes: [{id: redis, kind: datastore, container: 'Redis Main'}]",
+		"dangling edge":     "edges: [{from: sub2api, to: redis, type: depends_on}]",
+		"self edge":         "edges: [{from: sub2api, to: sub2api, type: depends_on}]",
+		"unknown edge type": "nodes: [{id: redis, kind: datastore}]\n  edges: [{from: sub2api, to: redis, type: calls}]",
+		"duplicate edge":    "nodes: [{id: redis, kind: datastore}]\n  edges: [{from: sub2api, to: redis, type: depends_on}, {from: sub2api, to: redis, type: depends_on}]",
+		"depends_on cycle":  "nodes: [{id: a, kind: service}, {id: b, kind: service}]\n  edges: [{from: sub2api, to: a, type: depends_on}, {from: a, to: b, type: depends_on}, {from: b, to: sub2api, type: depends_on}]",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, "mysql:\n  dsn: test\ntopology:\n  "+yaml+"\n")); err == nil || !strings.Contains(err.Error(), "topology") {
+				t.Fatalf("Load() error = %v, want a topology error", err)
+			}
+		})
+	}
+	// runs_on is placement, not propagation: a runs_on back edge is not a cycle.
+	if _, err := Load(writeConfig(t, "mysql:\n  dsn: test\ntopology:\n  nodes: [{id: host, kind: host}]\n  edges: [{from: sub2api, to: host, type: depends_on}, {from: host, to: sub2api, type: runs_on}]\n")); err != nil {
+		t.Fatalf("runs_on back edge rejected: %v", err)
+	}
+}

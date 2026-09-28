@@ -16,7 +16,8 @@
 - **执行与验证**：同一服务同时只有一个执行或验证中的处置；领取时复验授权、急停、预算和对象修订，执行留下结构化回执（written / not_written / unknown），进程中断后按目标实际状态对账、不重放；验证要求连续通过，失败或不可判定时执行预先冻结的补偿并阻断规则，恢复后在观察窗口内识别复发；
 - **反馈与评测**：控制台“自动处置”页展示规则与阻断、急停/复位、发布记录和效果报表（错误执行率、无人介入恢复率、恢复耗时、复发率、人工占比、根因准确率，均附原始计数）；Incident 复盘标注；诊断输入完整落库，可用 `cmd/replay` 冻结回放；
 - **记忆**：验证成功的高置信案例入库；同类故障命中时 0 次 LLM（memory_hit），命中失败自动降级拉黑；
-- **可观测**：`/metrics`（Prometheus 文本格式）+ `agent_run_step` 逐步审计。
+- **可观测**：`/metrics`（Prometheus 文本格式）+ `agent_run_step` 逐步审计；
+- **拓扑**：依赖关系在配置中声明，节点状态来自 docker inspect 与 Prometheus（健康表达式、firing 告警），作为证据进入诊断；`docker_restart` 的目标所依赖的节点确认故障或不存在时，Guard 拒绝并转人工。
 
 诊断上下文按 `llm.models[].context_window_tokens` 配置；示例中的 DeepSeek 窗口为 1000000，第三方网关容量需单独验证。每次请求预留输出空间，接近输入额度的 80% 才压缩旧工具结果。Token 使用启发式估算与单次请求 usage 校准；旧 `diagnose.budget.context_tokens` 已移除。
 
@@ -128,7 +129,7 @@ cd web && npm ci && npm run build && cd ..
 
 `.gitkeep` 仅能让空目录通过 Go 编译，不能作为可用控制台；补建前端后必须重新编译/启动 Go 服务。
 
-打开 `http://127.0.0.1:18080/` 登录后进入概览（触发中事件、待审批、自动处置状态）。左侧导航分「事件」和「自动处置」两组，`⌘K`/`Ctrl+K` 快速跳转页面或事件。Incident 详情页是实时控制室：诊断报告、8 阶段处理流程、事件时间线 / 诊断轨迹 / 问 Agent 三个标签，右侧是审批、最近变更（执行回执/验证/观察）、当前问题、告警成员和复盘。「处置规则」「效果评估」「发布记录」分别对应规则与急停、效果报表与待复盘队列、发布与回退目标。前端默认深色主题，可在侧栏切换浅色；字体随前端打包，不依赖外部 CDN（CSP 只允许同源）。本地开发 `cd web && npm run dev` 会把 `/api` 代理到 `ONCALL_BACKEND`（默认 `http://127.0.0.1:18080`）。
+打开 `http://127.0.0.1:18080/` 登录后进入概览（触发中事件、待审批、自动处置状态）。左侧导航分「事件」和「自动处置」两组，`⌘K`/`Ctrl+K` 快速跳转页面或事件。Incident 详情页是实时控制室：诊断报告、8 阶段处理流程、事件时间线 / 诊断轨迹 / 问 Agent 三个标签，右侧是审批、最近变更（执行回执/验证/观察）、当前问题、告警成员和复盘。「处置规则」「效果评估」「发布记录」分别对应规则与急停、效果报表与待复盘队列、发布与回退目标。「监控」原生渲染看板，「拓扑」显示依赖和节点实时状态；Incident 详情页的「监控」「拓扑」按钮分别打开事件前后的时间窗和事件告警涉及的节点。前端默认深色主题，可在侧栏切换浅色；字体随前端打包，不依赖外部 CDN（CSP 只允许同源）。本地开发 `cd web && npm run dev` 会把 `/api` 代理到 `ONCALL_BACKEND`（默认 `http://127.0.0.1:18080`）。
 
 Webhook、API、控制台、SSE、飞书回调和 `/metrics` **共用一个 listener**，网络规则必须限制整个 listener；`/metrics` 不带鉴权。不要暴露公网。
 
@@ -182,6 +183,7 @@ llm:
 | `POST /api/v1/incidents/{id}/questions\|rediagnose\|request-evidence` | operator | 提问、重新诊断、请求补充证据 |
 | `GET /api/v1/observability/dashboards`、`/dashboards/{uid}` | viewer（不含机器令牌） | 监控页看板定义，与 Grafana provisioning 同一份 JSON |
 | `POST /api/v1/prometheus/query_range` | viewer（不含机器令牌） | 监控页的 PromQL 区间查询代理：表达式 ≤ 4 KB，30 秒超时 |
+| `GET /api/v1/topology?incident=` | viewer（不含机器令牌） | 依赖拓扑与节点实时状态（15 秒缓存）；带 `incident` 时另返回该事件告警映射到的节点 |
 | `POST /integrations/feishu/events` | 飞书验签 | 飞书事件与卡片回调 |
 
 ## 验证命令
@@ -214,7 +216,7 @@ MYSQL_DSN=... go run ./cmd/retire-approvals -apply
 
 ## 文档
 
-- [排查技能、知识库、拓扑与监控设计](docs/skills-knowledge-topology-observability-design.md)：Skills、Tool Search、知识库、拓扑、Loki/Grafana 的取舍、实施顺序与效果评估；待实施方案
+- [排查技能、知识库、拓扑与监控设计](docs/skills-knowledge-topology-observability-design.md)：Skills、Tool Search、知识库、拓扑、Loki/Grafana 的取舍、实施顺序与效果评估；第 1 步（监控）、第 2 步（拓扑）已实现
 - [生产自动处置实施方案](docs/production-auto-remediation-plan.md)：多动作自动处置的设计、阶段与演练矩阵；实施状态见文首
 - [生产部署](deploy/README.md)：阶段 A 核对清单、systemd、监控栈、密钥、心跳与上线顺序
 - [核心问答与答辩指南](docs/project-qa.md)：面试、评审与技术答辩高频 24 问及源码解析
@@ -240,4 +242,4 @@ MYSQL_DSN=... go run ./cmd/retire-approvals -apply
 
 ## 许可证
 
-AGPL-3.0，见 [LICENSE](LICENSE)。控制台的监控页（原生渲染 Grafana 看板、PromQL 查询代理、时间范围选择）的代码拷自 [ongrid](https://github.com/ongridio/ongrid)（AGPL-3.0），逐个文件的来源和改动见 [NOTICE](NOTICE) 与各文件头。
+AGPL-3.0，见 [LICENSE](LICENSE)。控制台的监控页（原生渲染 Grafana 看板、PromQL 查询代理、时间范围选择）和拓扑图的代码拷自 [ongrid](https://github.com/ongridio/ongrid)（AGPL-3.0），逐个文件的来源和改动见 [NOTICE](NOTICE) 与各文件头。
