@@ -1,6 +1,6 @@
 # sub2api 生产部署
 
-> 2026-09-26：无人值守修复与实际验收见 [验证记录](../docs/unattended-remediation-verification.md)。当前数据库需迁移到 015；自动规则缺少管理员、通知、业务探针或持续验证条件会被启动检查拒绝。
+> 2026-09-26：无人值守修复与实际验收见 [验证记录](../docs/unattended-remediation-verification.md)。当前数据库需迁移到 016（016 为知识库表，停服务后直接执行 `migrations/016_knowledge_entry.sql`）；自动规则缺少管理员、通知、业务探针或持续验证条件会被启动检查拒绝。
 
 对应 [自动处置方案](../docs/production-auto-remediation-plan.md) §9 与阶段 A/B/E。Agent 作为 sub2api 宿主机上的 systemd 进程运行；监控栈是独立 Compose 项目（[monitoring/](monitoring/)）。两者都不随 sub2api 发布或重启。
 
@@ -137,6 +137,7 @@ exporter 二进制来自上面的构建（`bin/sub2api-exporter`，Compose 以�
 4. 控制台“监控”页四个看板都有数据；Grafana 里 `sub2api 服务` 底部能看到日志。
 5. 停掉 Loki（`docker compose stop loki`）后触发一次诊断：`loki_query` 返回错误，诊断照常完成；恢复后 `LogPipelineDropping` 不应持续触发。
 6. 控制台“拓扑”页：sub2api、postgres、redis、host 为正常，upstream 为未知（它没有可声明的检查）；任一节点显示不存在时，先核对配置里的容器名。
+7. 启动日志有 `server: knowledge handbook N sections`；控制台“知识库”页的参考文档列出仓库手册，搜索“数据库密码错误”能命中 PostgreSQL 常见错误一段。
 
 从旧版本升级时，Agent 的 `config.yaml` 需删掉 `tools.logs` 和 `tools.mysql_select`（它们从未被读取，现已移除，严格配置会拒绝未知字段），并按需加上 `tools.loki` 和 `topology`。
 

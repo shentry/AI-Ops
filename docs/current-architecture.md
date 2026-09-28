@@ -233,7 +233,7 @@ flowchart TB
 | `internal/llm` | OpenAI 兼容模型工厂、Eino ReAct、只读 Questioner、模型切换；计划契约由已启用动作定义生成 |
 | `internal/topology` | 依赖拓扑：主服务节点由 `service` 生成，其余节点和边来自 `topology` 配置（启动时校验）；节点状态经 Registry 的 `docker_inspect` / `prom_instant_query` 读取，firing 告警按 component → container → service 标签映射到节点，15 秒缓存 |
 | `internal/grafana` | 看板 JSON（`dashboards/`）编进二进制；Grafana 从同一目录 provisioning，控制台监控页渲染同一份 |
-| `internal/knowledge` | 排查技能（`skills/*/SKILL.md`）编进二进制，启动时解析、格式错误拒绝启动；按告警名确定性匹配（最多 2 个、合计 6 KB），渲染成证据之前的"排查技能"段 |
+| `internal/knowledge` | 排查技能（`skills/*/SKILL.md`）编进二进制，启动时解析、格式错误拒绝启动；按告警名确定性匹配（最多 2 个、合计 6 KB），渲染成证据之前的"排查技能"段。仓库手册（`docs/*.md`）启动时按二级标题同步到 `knowledge_entry`；`knowledge_search`／`knowledge_read` 工具；把确认了根因的复盘组装成知识条目 |
 | `internal/tools` | 只读工具（Prometheus、Docker、Loki）注册、统一超时、脱敏、输出截断；动作定义与实现（Prepare / Execute / Reconcile）：`docker_restart`、`deployment_rollback`、`upstream_quarantine` |
 | `internal/sub2api` | sub2api 管理接口客户端（只读 ops、账号调度）与业务探针 |
 | `internal/approval` | 规则授权（Authority / Policy）、审批 CAS、审批 TTL、执行器（领取复验、回执、对账） |
@@ -577,7 +577,7 @@ flowchart LR
   - `/incidents/<id>` → `IncidentDetail`（诊断报告、处理流程、时间线/诊断轨迹/问 Agent 三个标签，右侧审批、最近变更、当前问题、告警成员、复盘标注）
   - `/remediation` → 处置规则、急停/复位、控制记录；`/report` → 效果评估与待复盘队列；`/changes` → 发布记录与「标记健康」
   - `/monitor` → `Monitor`（按需加载）：用 `PanelGrid` / `PromQLPanel`（recharts）原生渲染 `internal/grafana/dashboards` 的四个看板，支持时间范围、自定义窗口和自动刷新；Incident 详情的“监控”按钮打开事件前后各 30 分钟。代码拷自 ongrid（AGPL-3.0，见 NOTICE）
-  - `/knowledge` → `Knowledge`：排查技能标签页，列出名称、匹配告警、工具、SHA、近 30 天激活次数和正文；只读，技能只能通过仓库修改
+  - `/knowledge` → `Knowledge`：排查技能标签页（名称、匹配告警、工具、SHA、近 30 天激活次数和正文，只读）；参考文档标签页（`?tab=docs`，全文搜索、按来源筛选、Markdown 查看，admin 可删除复盘条目）。Incident 复盘卡片的"加入知识库"在有确认根因的复盘后可用
   - `/topology` → `Topology`（按需加载）：`TopologyGraph`（@xyflow/react + dagre）画依赖图，节点颜色表示状态、带告警数；侧栏列出节点，选中后显示容器事实、告警、关系和监控链接；`?incident=ID` 高亮该事件告警映射到的节点（Incident 详情的“拓扑”按钮）。每 15 秒刷新。代码拷自 ongrid（AGPL-3.0，见 NOTICE）
 - 侧栏每 30 秒拉一次最近 50 个 Incident，供导航徽标、最近事件和 ⌘K 快速跳转使用；各页面需要筛选时自己查询服务端。
 - `IncidentDetail` 首屏读取控制室聚合、run steps 和对话历史。
@@ -657,6 +657,9 @@ sequenceDiagram
 | `POST /api/v1/prometheus/query_range` | viewer（不含机器令牌） | 监控页的 PromQL 区间查询代理，表达式 ≤ 4 KB，30 秒超时 |
 | `GET /api/v1/topology?incident=` | viewer（不含机器令牌） | 依赖图与节点状态；带 `incident` 时另返回该事件告警映射到的节点 |
 | `GET /api/v1/skills` | viewer（不含机器令牌） | 排查技能与近 30 天激活次数（由回放目录统计） |
+| `GET /api/v1/knowledge?q=&source=`、`/knowledge/:id` | viewer（不含机器令牌） | 无 `q` 时列出全部条目，有 `q` 时 ngram 全文检索前 20 条（带片段）；按 id 读正文 |
+| `POST /api/v1/incidents/:id/knowledge` | operator | 把最近一条确认了根因的复盘写成知识条目；没有时 409 |
+| `DELETE /api/v1/knowledge/:id` | admin | 删除复盘条目；仓库条目 409 |
 | `/api/v1/control-room/model` | 任一身份 | 当前模型和 allowlist |
 | `/api/v1/control-room/incidents`、`/incidents/:id/control-room`、`/events`、`/problems`、`/runs...`、`/stream`、`/conversation` | 任一身份 | 控制室读取与 SSE |
 | `POST /api/v1/incidents/:id/questions\|rediagnose\|request-evidence` | operator | 提问、重诊、补充证据入队 |
@@ -692,6 +695,8 @@ sequenceDiagram
 - `012_verify_consecutive_passes.sql`：验证连续通过计数
 - `013_diagnosis_snapshot.sql`：1 张可回放诊断快照表
 - `014_remediation.sql`：审批的服务/规则/补偿关联与操作回执、验证观察阶段，以及 `service_lock`、`control_event`、`change_event`、`review` 4 张表
+- `015_notification_task.sql`：持久通知任务
+- `016_knowledge_entry.sql`：知识条目（仓库手册段落与事件复盘），`FULLTEXT(title, body) WITH PARSER ngram`
 
 下面关系是**业务逻辑关系**。当前 SQL 没有声明外键，图中的关系不是数据库 FK 约束。
 
@@ -1016,6 +1021,7 @@ erDiagram
 - `control_event` 只追加：急停/解除、规则复位和启动时加载的规则发布。急停状态和规则阻断都由事件计算，没有第二套计数表。
 - `change_event` 由 CI/人工登记发布、由 `deployment_rollback` 记录回退；只有人工确认健康（`verified_at`）的发布能作为回退目标。配置和密钥正文不入库。
 - `review` 区分诊断评价（关联 run）与动作评价（关联 approval）；`unknown` 不算正确，动作评价为错误会阻断规则。
+- `knowledge_entry` 的仓库条目（`ref` 为 `文件#标题`）每次启动按内容 SHA 与二进制同步，只读；复盘条目（`ref` 为 `incident/<id>`）由 operator 加入、admin 删除，写入与删除同事务追加 `knowledge.added`／`knowledge.deleted` 事件。
 
 ### 数据模型中的实际缺口
 
@@ -1082,6 +1088,7 @@ raw_event → incident
 - LLM 只接收脱敏、截断后的证据。
 - LLM 只能调用只读工具；动作从不作为工具暴露。
 - LLM 输出不是权限结论。
+- 知识库条目（`knowledge_search`／`knowledge_read` 的输出）是参考资料：工具输出与系统提示都注明它不是本次证据，不能写进 evidence_refs、不能单独支撑结论或动作；Guard 只读结构化证据，条目里的注入文字改变不了执行判定。
 - 排查技能是仓库审阅的内容，只说明怎么查；系统提示明确它不是证据、不能写进 evidence_refs。技能只能列只读工具（仓库测试用启用全部可选工具的 Registry 校验），不能声明实现。
 - 上下文窗口配置在 `llm.models[].context_window_tokens`，随模型切换；DeepSeek 示例值为 1000000，未指定模型窗口时应用缺省值为 131072（不是对供应商容量的保证）。诊断在同一锁内取得客户端与窗口快照，扣除 `max_tokens` 输出预留及 512 协议余量。旧 `diagnose.budget.context_tokens` 已删除，配置加载会拒绝该字段。
 - 每次请求估算系统提示、工具定义、Evidence 和完整消息历史：ASCII 约 3 字符/Token，非 ASCII 约 2 UTF-8 字节/Token，初始增加 20% 余量；根据本次诊断各轮实际 `prompt_tokens` 对低估偏差向上校准，保留 10% 余量。分母使用实际发送的压缩后输入，校准不跨模型或诊断共享。它是启发式估算，不是精确 tokenizer、累计费用上限或网关容量认证。

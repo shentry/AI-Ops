@@ -2,7 +2,7 @@
 name: upstream_accounts
 description: 上游账号报错或分组没有可调度账号，区分单账号故障、上游整体限流与额度问题
 alerts: [Sub2APIUpstreamAccountErrors, Sub2APIGroupNoAvailableAccount]
-tools: [prom_instant_query, prom_range_query, loki_query]
+tools: [prom_instant_query, prom_range_query, loki_query, knowledge_search]
 ---
 ## 排查步骤
 1. 看 upstream_accounts 证据段：每个账号的 GroupID、Available、TempUnschedulable、Errors，以及 RealtimeEnabled、Sampled（为 true 时按账号的计数偏少）。
@@ -13,6 +13,7 @@ tools: [prom_instant_query, prom_range_query, loki_query]
    - 401/403：账号凭据失效或被封禁；
    - 上游 5xx、超时：上游服务故障。
 5. 本地健康、依赖都正常时，结论落在上游，不要归因到数据库或网关进程。
+6. 需要错误含义、组件背景或过往复盘时，用 knowledge_search 检索仓库手册与已复盘的 Incident；检索结果是参考，不是本次证据。
 
 ## 常见误判
 - 所有账号同时报 429 是上游整体限流或额度问题，隔离单个账号没有帮助。

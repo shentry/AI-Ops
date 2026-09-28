@@ -1,6 +1,6 @@
 # 排查技能、知识库、拓扑与监控设计
 
-> 状态：第 1 步（监控）、第 2 步（拓扑）、第 3 步（技能）已实现，第 4–5 步待实施。编写日期：2026-09-28。
+> 状态：第 1–4 步（监控、拓扑、技能、知识库）已实现，第 5 步（Tool Search）待实施。编写日期：2026-09-28。
 >
 > 现状基线：`feat/execution-trust` 分支，结论以源码为准。Ongrid 参考固定在 `81e08b5efbe9ccd9a5781574d5f3ba10215eccac`（v0.17.2）：监控页的代码直接拷自 ongrid（见 §7.3 与 `NOTICE`，本仓库因此为 AGPL-3.0），其余部分只借鉴设计，不复制内置知识内容。
 >
@@ -163,8 +163,8 @@ tools: [prom_instant_query, prom_series_meta, loki_query, knowledge_search]
 
 ### 5.1 两个来源
 
-1. **仓库手册** `knowledge/**/*.md`：组件背景、配置说明、历史复盘。启动时按二级标题切段，按 `path#heading` 和内容 SHA 增删改，与仓库保持一致。
-2. **Incident 复盘**：人工 review 结论为"正确"或"已修正"的 Incident，由 operator 在复盘卡片上点"加入知识库"生成条目。内容包括告警、根因、处置、验证结果和 Incident 链接，这样形成"事件 → 复盘 → 知识 → 下次诊断引用"的闭环。
+1. **仓库手册** `internal/knowledge/docs/*.md`：组件背景、错误含义、监控限制、历史复盘，首批 5 篇 22 段。启动时按二级标题切段（代码围栏内不切，只有标题的段落不入库），按 `文件#标题` 和内容 SHA 增删改，与本次发布的二进制保持一致；缺迁移 016 时拒绝启动。仓库是公开的，手册不写地址、密钥和账号名。
+2. **Incident 复盘**：operator 在复盘卡片上点"加入知识库"，服务端取最近一条确认了根因的复盘生成条目：结论为"正确"（没填根因时用当次诊断的 RCA），或"部分正确／错误"且填写了真实根因；"无法判断"不入库。内容包括告警、根因、实际处置、当时的诊断与建议动作、执行与验证结果和 Incident 链接，这样形成"事件 → 复盘 → 知识 → 下次诊断引用"的闭环。再次加入会覆盖同一条目。
 
 ### 5.2 存储与检索
 
@@ -172,19 +172,19 @@ tools: [prom_instant_query, prom_series_meta, loki_query, knowledge_search]
 
 | 字段 | 说明 |
 | --- | --- |
-| `id`、`source`（repo／incident）、`ref`（`path#heading` 或 incident_id，唯一） | 来源定位 |
-| `title`、`tags`、`service`、`body`、`sha256` | 内容；入库前先 `tools.Sanitize` 脱敏，单条上限 8 KB |
+| `id`、`source`（repo／incident）、`ref`（`文件#标题` 或 `incident/<id>`，唯一） | 来源定位 |
+| `title`、`body`、`sha256` | 内容；入库前先 `tools.Sanitize` 脱敏，单条上限 8 KB |
 | `created_by`、`updated_at` | 审计 |
-| `FULLTEXT(title, body) WITH PARSER ngram` | 中文检索，MySQL 8.4 自带 |
+| `FULLTEXT(title, body) WITH PARSER ngram` | 中文检索，MySQL 8.0／8.4 自带，`ngram_token_size` 默认 2 |
 
-检索使用 `MATCH ... AGAINST` 自然语言模式，可按 `service` 和 `source` 过滤，返回前 5 条。
+检索使用 `MATCH ... AGAINST` 自然语言模式，可按 `source` 过滤，模型工具返回前 5 条。原设计的 `tags`、`service` 字段没有做：只有一个服务，标签也没有使用者，需要时再加。复盘条目的写入和删除与 `knowledge.added`／`knowledge.deleted` 事件同事务。
 
 ### 5.3 模型工具
 
 - `knowledge_search(query, source?)`：返回 id、标题、来源、片段和分数。
 - `knowledge_read(id)`：返回正文，受 MaxOutput 截断。
 
-两者都是普通只读 ToolSpec，输出会录制并用于回放。知识内容与证据一样按不可信数据处理，不能产生计划或授权。
+两者都是普通只读 ToolSpec，经 Registry 统一超时、脱敏、截断，输出会录制并用于回放。知识内容与证据一样按不可信数据处理，不能产生计划或授权：工具输出注明"参考资料，不是本次事件的证据"，系统提示也规定它不能写进 evidence_refs、不能单独支撑结论或动作。6 个技能的工具清单都包含 `knowledge_search`。Guard 只读结构化证据，知识条目里即使有注入文字也改变不了执行判定。
 
 ### 5.4 与记忆、技能的边界
 
@@ -203,7 +203,9 @@ tools: [prom_instant_query, prom_series_meta, loki_query, knowledge_search]
 
 ### 5.6 召回评测
 
-准备 20 条"问题 → 期望条目"的样例，覆盖中文换义说法。如果前 5 条的命中率达不到约定值，再评估是否引入向量检索。不预设数值。
+`tests/effectiveness/knowledge_recall.json` 有 20 条"问题 → 可接受条目"的样例，按值班时的真实问法写，刻意避开标题原词。测试在真实 MySQL 上同步手册后逐条检索（`TEST_KNOWLEDGE_MYSQL_DSN`，独立的库，CI 必跑）。
+
+2026-09-28 实测：语料 22 段，recall@5 = 20/20，recall@1 = 14/20，MRR = 0.81。语料只有 22 段，前 5 条已覆盖近四分之一，所以 recall@5 高并不说明检索质量好，看排序要看 recall@1 和 MRR。排第 2–5 位的 6 条，都是问法与另一段共享更多字面（如"redis 拒绝连接"先命中 PostgreSQL 段）。结论：现阶段 ngram 够用，不引入向量检索；测试以 recall@5 ≥ 18 作为回归下限。语料增长到几百段、recall@1 明显下降时再评估。
 
 ## 6. 拓扑
 
@@ -360,7 +362,7 @@ topology:
 | 1 监控（已实现） | Loki、Alloy、Grafana，4 个看板（控制台原生渲染，代码拷自 ongrid），`loki_query`，删除 CLS 与 mysql_select 配置，平台告警 | 日志能在 Loki 查到，容器重建和日志轮转后仍能续读；retention 实际生效；Loki 停止后诊断照常完成 | 3–4 天 |
 | 2 拓扑（已实现） | 配置校验、实时状态、Collector、Guard 依赖规则、拓扑页与跳转链接（图组件拷自 ongrid） | 停掉 postgres 时拓扑显示 down，且 `docker_restart(sub2api)` 被拒；配置错误拒绝启动 | 4–5 天 |
 | 3 技能（已实现） | 加载校验、匹配注入、快照录制、6 个技能、技能标签页 | 引用未知工具或告警时拒绝启动；回放使用录制的正文；12 案例开/关对比 | 3–4 天 |
-| 4 知识库 | 表与同步、两个工具、复盘入库、文档标签页 | ngram 检索在真实 MySQL 上通过；带注入内容的条目不改变执行判定；召回评测 | 4–5 天 |
+| 4 知识库（已实现） | 表与同步、两个工具、复盘入库、文档标签页 | ngram 检索在真实 MySQL 上通过；带注入内容的条目不改变执行判定；召回评测 | 4–5 天 |
 | 5 Tool Search | 延迟暴露、`tool_search`（含技能检索）、录制 | 检索不到 Action；延迟加载的工具经 Registry 执行；12 案例对比 token 和正确率 | 2 天 |
 
 估算是规划值，不是实测结果，合计约 3–4 周。

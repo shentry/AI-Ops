@@ -2,7 +2,7 @@
 name: container_exit_oom
 description: sub2api 健康探测失败、容器反复重启或出现 OOM，判断进程是否在运行、为何退出
 alerts: [Sub2APIDown, Sub2APIContainerRestarting, Sub2APIContainerOOM]
-tools: [docker_inspect, docker_logs, loki_query, prom_range_query]
+tools: [docker_inspect, docker_logs, loki_query, prom_range_query, knowledge_search]
 ---
 ## 排查步骤
 1. 先读 docker_inspect 证据的 facts：Running、Status、ExitCode、OOMKilled、RestartCount、StartedAt/FinishedAt、Health。容器不存在或 object 缺失时，不能认定任何容器身份。
@@ -13,6 +13,7 @@ tools: [docker_inspect, docker_logs, loki_query, prom_range_query]
 3. 进程在运行但探测失败：看 sub2api_health 的 StatusCode 与 LatencyMS，再看拓扑证据中依赖节点是否 down。
 4. 反复重启：用 loki_query(service=sub2api) 查最近几次启动前后的日志，确认每次退出原因是否相同；docker_logs 只包含当前实例。
 5. 告警已 resolved 且当前健康时，只能说明现在正常，故障时段的原因需要故障时段的证据（loki_query 指定 since/until）。
+6. 需要错误含义、组件背景或过往复盘时，用 knowledge_search 检索仓库手册与已复盘的 Incident；检索结果是参考，不是本次证据。
 
 ## 常见误判
 - OOMKilled 只描述最近一次退出，不能证明 RestartCount 中的每次重启都由 OOM 导致。

@@ -17,6 +17,7 @@ import (
 	"oncall-agent/internal/diagnose"
 	"oncall-agent/internal/knowledge"
 	"oncall-agent/internal/llm"
+	"oncall-agent/internal/store"
 	"oncall-agent/internal/tools"
 )
 
@@ -137,7 +138,9 @@ func alertRuleNames(t *testing.T) map[string]bool {
 
 type observation struct {
 	CaseID string `json:"case_id"`
-	// Skills are the skills placed before the evidence (EFFECT_EVAL_SKILLS=1).
+	// Variant names the enabled capabilities, e.g. "skills+knowledge"; Skills
+	// are the skills placed before the evidence.
+	Variant           string                `json:"variant"`
 	Skills            []string              `json:"skills"`
 	Trial             int                   `json:"trial"`
 	Model             string                `json:"model"`
@@ -196,6 +199,27 @@ func TestReasonerEffectiveness(t *testing.T) {
 	if err := registry.RegisterAction(sentinelRestart{t}); err != nil {
 		t.Fatal(err)
 	}
+	variant := []string{}
+	// The knowledge arm searches the handbook compiled into this build, synced
+	// into its own database (same as TestKnowledgeRecall).
+	if os.Getenv("EFFECT_EVAL_KNOWLEDGE") == "1" {
+		dsn := os.Getenv("TEST_KNOWLEDGE_MYSQL_DSN")
+		if dsn == "" {
+			t.Fatal("EFFECT_EVAL_KNOWLEDGE=1 needs TEST_KNOWLEDGE_MYSQL_DSN")
+		}
+		db, err := store.Open(dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if _, err := knowledge.SyncRepo(context.Background(), db); err != nil {
+			t.Fatal(err)
+		}
+		if err := knowledge.RegisterTools(registry, db); err != nil {
+			t.Fatal(err)
+		}
+		variant = append(variant, "knowledge")
+	}
 	reasoner := llm.NewReasoner(factory, registry, config.DefaultDiagnoseBudget())
 	// The skills arm uses the pipeline's own matching and rendering.
 	var skills *knowledge.Skills
@@ -204,6 +228,11 @@ func TestReasonerEffectiveness(t *testing.T) {
 		if skills, err = knowledge.LoadSkills(); err != nil {
 			t.Fatal(err)
 		}
+		variant = append([]string{"skills"}, variant...)
+	}
+	variantName := strings.Join(variant, "+")
+	if variantName == "" {
+		variantName = "baseline"
 	}
 	consecutiveErrors := 0
 	for _, c := range scenarios(t) {
@@ -213,7 +242,7 @@ func TestReasonerEffectiveness(t *testing.T) {
 			}
 			t.Run(fmt.Sprintf("%s/trial_%d", c.ID, trial), func(t *testing.T) {
 				matched := skills.Match(c.Alerts)
-				o := observation{CaseID: c.ID, Skills: []string{}, Trial: trial, Model: cfg.Roles.Reasoner.Model,
+				o := observation{CaseID: c.ID, Variant: variantName, Skills: []string{}, Trial: trial, Model: cfg.Roles.Reasoner.Model,
 					ExpectedDiagnosis: c.ExpectedDiagnosis, DiagnosisReview: "pending_human_review",
 					CheckFailures: []string{}, StartedAt: time.Now().UTC()}
 				for _, skill := range matched {

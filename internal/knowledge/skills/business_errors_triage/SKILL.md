@@ -2,7 +2,7 @@
 name: business_errors_triage
 description: sub2api 业务错误率高、变慢或业务探针失败时的分诊：先确定错误来自哪一层，再按对应技能深入
 alerts: [Sub2APIBusinessErrors, Sub2APISlow, Sub2APIRequestLatencyHigh, Sub2APIBusinessProbeFailed]
-tools: [prom_instant_query, prom_series_meta, docker_logs, loki_query]
+tools: [prom_instant_query, prom_series_meta, docker_logs, loki_query, knowledge_search]
 ---
 ## 排查步骤
 1. 看 sub2api_metrics：sla_error_ratio_5m 的告警前基线与当前值（突变还是常态）、upstream_errors_5m、top_upstream_accounts_5m、group_available_accounts。sub2api_ops_up=0 表示业务数据读不到，不是零流量。
@@ -13,6 +13,7 @@ tools: [prom_instant_query, prom_series_meta, docker_logs, loki_query]
    - 上游：429 / rate_limit_exceeded、401/403、上游 5xx，且错误集中在某些账号 → 按 upstream_accounts 技能继续；
    - 宿主机：no space left on device (ENOSPC)、cannot allocate memory → 按 host_resources 技能继续。
 4. 只有变慢没有错误时，对比 request_p95_seconds_5m 与上游错误、依赖状态；没有任何分层证据时如实说明缺失。
+5. 需要错误含义、组件背景或过往复盘时，用 knowledge_search 检索仓库手册与已复盘的 Incident；检索结果是参考，不是本次证据。
 
 ## 常见误判
 - 只读监控账号能连上数据库，不代表应用账号能认证。

@@ -969,3 +969,46 @@ export async function getSkills(): Promise<Skill[]> {
     };
   });
 }
+
+// KnowledgeEntry is a handbook section (source repo) or a reviewed incident
+// (source incident). snippet is set in search results, body when one is read.
+export interface KnowledgeEntry {
+  id: number;
+  source: "repo" | "incident";
+  ref: string;
+  title: string;
+  created_by: string;
+  updated_at: string;
+  snippet: string;
+  body: string;
+}
+
+function toKnowledgeEntry(value: unknown): KnowledgeEntry {
+  const entry = object(value);
+  return {
+    id: number(entry.id), source: entry.source === "incident" ? "incident" : "repo", ref: text(entry.ref), title: text(entry.title),
+    created_by: text(entry.created_by), updated_at: text(entry.updated_at), snippet: text(entry.snippet), body: text(entry.body),
+  };
+}
+
+export async function searchKnowledge(query = "", source = ""): Promise<KnowledgeEntry[]> {
+  const params = new URLSearchParams();
+  if (query) params.set("q", query);
+  if (source) params.set("source", source);
+  const search = params.toString();
+  return list(await request<unknown>(`/api/v1/knowledge${search ? `?${search}` : ""}`), "entries").map(toKnowledgeEntry);
+}
+
+export async function getKnowledgeEntry(id: number): Promise<KnowledgeEntry> {
+  return toKnowledgeEntry(await request<unknown>(`/api/v1/knowledge/${id}`));
+}
+
+export async function deleteKnowledgeEntry(id: number): Promise<void> {
+  await request(`/api/v1/knowledge/${id}`, { method: "DELETE" });
+}
+
+// addIncidentKnowledge writes the incident's latest confirmed review as a
+// knowledge entry; adding it again rewrites the same entry.
+export async function addIncidentKnowledge(incidentID: number): Promise<KnowledgeEntry> {
+  return toKnowledgeEntry(await request<unknown>(`/api/v1/incidents/${incidentID}/knowledge`, { method: "POST" }));
+}

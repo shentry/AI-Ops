@@ -95,6 +95,15 @@ jobs:
               mysql -uoncall -poncall-pass oncall_diagnose < "$f"
           done
 
+      # 知识召回评测会重写仓库条目，不能与 store 测试共库。
+      - name: Prepare isolated knowledge database (all migrations)
+        run: |
+          docker exec "${{ job.services.mysql.id }}" mysql -uroot -proot-pass -e \
+            'CREATE DATABASE oncall_knowledge; GRANT ALL PRIVILEGES ON `oncall\_knowledge`.* TO "oncall"@"%";'
+          for f in migrations/*.sql; do
+            docker exec -i "${{ job.services.mysql.id }}" mysql -uoncall -poncall-pass oncall_knowledge < "$f"
+          done
+
       - name: Prepare unattended action acceptance database
         run: |
           docker exec "${{ job.services.mysql.id }}" mysql -uroot -proot-pass -e \
@@ -139,6 +148,7 @@ jobs:
           TEST_API_MYSQL_DSN: oncall:oncall-pass@tcp(127.0.0.1:3306)/oncall_api?parseTime=true&loc=UTC
           TEST_DIAGNOSE_MYSQL_DSN: oncall:oncall-pass@tcp(127.0.0.1:3306)/oncall_diagnose?parseTime=true&loc=UTC
           TEST_UNATTENDED_DSN: oncall:oncall-pass@tcp(127.0.0.1:3306)/oncall_acceptance?parseTime=true&loc=UTC
+          TEST_KNOWLEDGE_MYSQL_DSN: oncall:oncall-pass@tcp(127.0.0.1:3306)/oncall_knowledge?parseTime=true&loc=UTC
           TEST_DOCKER_SOCKET: /var/run/docker.sock
           TEST_DOCKER_IMAGE: python:3.12-alpine
         run: |
@@ -146,6 +156,7 @@ jobs:
           : "${TEST_API_MYSQL_DSN:?Approval API MySQL integration tests must not be skipped}"
           : "${TEST_DIAGNOSE_MYSQL_DSN:?Diagnosis/verifier MySQL integration tests must not be skipped}"
           : "${TEST_UNATTENDED_DSN:?Unattended action acceptance must not be skipped}"
+          : "${TEST_KNOWLEDGE_MYSQL_DSN:?Knowledge recall must not be skipped}"
           : "${TEST_DOCKER_SOCKET:?Real Docker acceptance must not be skipped}"
           go test -count=1 -race ./...
 

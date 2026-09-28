@@ -113,9 +113,27 @@ test("an operator reviews the action; the reviewer is never sent by the page", a
   expect(state.reviews).toEqual([{ subject: "action", verdict: "wrong", approval_id: 42, root_cause: "数据库连接耗尽", actual_fix: "重启 postgres", manual_minutes: 25 }]);
 });
 
+test("a confirmed root cause can be added to the knowledge base", async ({ page }) => {
+  const state = await openRoom(page, controlRoom(approval({ status: "executed", verification: { status: "passed" } })));
+  const panel = page.getByRole("region", { name: "复盘标注" });
+  // Nothing confirmed yet: the button says why instead of failing on click.
+  await expect(panel.getByRole("button", { name: "加入知识库" })).toBeDisabled();
+  await panel.getByLabel("结论").selectOption("unknown");
+  await panel.getByLabel("真实根因").fill("还不确定");
+  await panel.getByRole("button", { name: "保存复盘" }).click();
+  await expect(panel.getByRole("button", { name: "加入知识库" })).toBeDisabled();
+  await panel.getByLabel("结论").selectOption("partial");
+  await panel.getByLabel("真实根因").fill("凭据轮换未同步");
+  await panel.getByRole("button", { name: "保存复盘" }).click();
+  await panel.getByRole("button", { name: "加入知识库" }).click();
+  await expect(panel).toContainText("已加入知识库");
+  expect(state.knowledgeAdds).toBe(1);
+});
+
 test("a viewer sees reviews but no review form", async ({ page }) => {
   await openRoom(page, controlRoom(approval({ status: "executed" })), "viewer");
   const panel = page.getByRole("region", { name: "复盘标注" });
   await expect(panel).toBeVisible();
   await expect(panel.getByRole("button", { name: "保存复盘" })).toHaveCount(0);
+  await expect(panel.getByRole("button", { name: "加入知识库" })).toHaveCount(0);
 });

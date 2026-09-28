@@ -2,7 +2,7 @@
 name: postgres_connection
 description: PostgreSQL 不可达、连接数接近上限或认证失败，判断数据库本身是否故障以及是否影响 sub2api
 alerts: [Sub2APIPostgresUnreachable, Sub2APIPostgresConnectionsHigh]
-tools: [prom_instant_query, prom_range_query, docker_logs, loki_query]
+tools: [prom_instant_query, prom_range_query, docker_logs, loki_query, knowledge_search]
 ---
 ## 排查步骤
 1. 看拓扑证据中 postgres 节点：容器状态（running、restart_count、OOMKilled）和 health（max(pg_up)）。postgres 证据段有直连探测时，看 SELECT 1 是否成功、total/waiting 连接数。
@@ -12,6 +12,7 @@ tools: [prom_instant_query, prom_range_query, docker_logs, loki_query]
    - SQLSTATE 53300 / sorry, too many clients already：连接槽位耗尽；
    - connection refused / no route to host：数据库端点不可达。
 4. 再用 loki_query(service=postgres) 看数据库自身日志：是否重启、崩溃恢复、磁盘写满。
+5. 需要错误含义、组件背景或过往复盘时，用 knowledge_search 检索仓库手册与已复盘的 Incident；检索结果是参考，不是本次证据。
 
 ## 常见误判
 - pg_up 是 exporter 用只读监控账号连接的结果；它为 1 不代表应用账号能认证，为 0 也可能是 exporter 自身故障（看 MonitoringTargetDown）。

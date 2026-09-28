@@ -250,7 +250,9 @@ func TestExecutionUpgradeMigrations(t *testing.T) {
 				t.Fatalf("repeat command changed rows: %s", out)
 			}
 		}
-		if i >= 7 && i < len(files)-1 {
+		// 015 completes the execution schema; later migrations (016 knowledge)
+		// are outside the execution preflight.
+		if i >= 7 && filepath.Base(path) < "015" {
 			if err := db.CheckExecutionReady(ctx); err == nil {
 				t.Fatalf("schema through %s passed incomplete preflight", path)
 			} else {

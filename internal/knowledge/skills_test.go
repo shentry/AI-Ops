@@ -85,7 +85,7 @@ func TestSkillToolsAreReadOnlyTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := errors.Join(prom.RegisterTools(registry), loki.RegisterTools(registry), docker.RegisterTools(registry, 200)); err != nil {
+	if err := errors.Join(prom.RegisterTools(registry), loki.RegisterTools(registry), docker.RegisterTools(registry, 200), RegisterTools(registry, nil)); err != nil {
 		t.Fatal(err)
 	}
 	registered := map[string]bool{}

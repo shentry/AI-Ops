@@ -71,9 +71,14 @@ func splitSections(doc string) (string, []section, error) {
 	title := strings.TrimSpace(strings.TrimPrefix(lines[0], "# "))
 	current := section{}
 	var sections []section
+	// A heading with nothing under it is not an entry.
 	flush := func() {
 		current.body = strings.TrimSpace(current.body)
-		if current.body != "" {
+		content := current.body
+		if current.heading != "" {
+			content = strings.TrimPrefix(content, "## "+current.heading)
+		}
+		if strings.TrimSpace(content) != "" {
 			sections = append(sections, current)
 		}
 	}
@@ -194,15 +199,29 @@ func RegisterTools(registry *tools.Registry, reader Reader) error {
 }
 
 // Snippet is the body around the first query term found, else its start.
+// Terms are the query, its words, then its two-character pieces: the ngram
+// index matches Chinese on those, so a query without spaces still finds its place.
 func Snippet(body, query string) string {
 	runes := []rune(body)
 	start := 0
-	for _, term := range append([]string{query}, strings.Fields(query)...) {
+	terms := append([]string{query}, strings.Fields(query)...)
+	for _, word := range strings.Fields(query) {
+		chars := []rune(word)
+		for i := 0; i+1 < len(chars); i++ {
+			terms = append(terms, string(chars[i:i+2]))
+		}
+	}
+	for _, term := range terms {
 		if at := strings.Index(body, term); at >= 0 {
 			start = max(len([]rune(body[:at]))-snippetRunes/4, 0)
 			break
 		}
 	}
 	end := min(start+snippetRunes, len(runes))
-	return strings.Join(strings.Fields(string(runes[start:end])), " ")
+	// Plain text for lists: Markdown markers only add noise to a snippet.
+	plain := strings.Join(strings.Fields(strings.NewReplacer("**", "", "`", "", "#", "").Replace(string(runes[start:end]))), " ")
+	if start > 0 {
+		plain = "…" + plain
+	}
+	return plain
 }

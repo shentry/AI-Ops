@@ -216,7 +216,7 @@ MYSQL_DSN=... go run ./cmd/retire-approvals -apply
 
 ## 文档
 
-- [排查技能、知识库、拓扑与监控设计](docs/skills-knowledge-topology-observability-design.md)：Skills、Tool Search、知识库、拓扑、Loki/Grafana 的取舍、实施顺序与效果评估；第 1–3 步（监控、拓扑、技能）已实现，第 4 步（知识库）进行中
+- [排查技能、知识库、拓扑与监控设计](docs/skills-knowledge-topology-observability-design.md)：Skills、Tool Search、知识库、拓扑、Loki/Grafana 的取舍、实施顺序与效果评估；第 1–4 步（监控、拓扑、技能、知识库）已实现
 - [生产自动处置实施方案](docs/production-auto-remediation-plan.md)：多动作自动处置的设计、阶段与演练矩阵；实施状态见文首
 - [生产部署](deploy/README.md)：阶段 A 核对清单、systemd、监控栈、密钥、心跳与上线顺序
 - [核心问答与答辩指南](docs/project-qa.md)：面试、评审与技术答辩高频 24 问及源码解析
