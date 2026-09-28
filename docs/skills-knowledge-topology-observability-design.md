@@ -331,7 +331,7 @@ topology:
 
 ### 7.4 平台自身告警与失效
 
-- 告警：Loki、Alloy、Grafana 纳入抓取，由现有的 `MonitoringTargetDown` 覆盖；新增 `LogPipelineDropping` 覆盖 Alloy 放弃发送和 Loki 拒收，超过保留期的拒收不计入；监控数据卷在宿主根分区上，由现有的 `HostDiskAlmostFull` 覆盖。这些都是 `layer=monitoring`，会同时直接通知人工。
+- 告警：Loki、Alloy、Grafana 纳入抓取，由现有的 `MonitoringTargetDown` 覆盖；新增 `LogPipelineDropping`，以 Alloy 最终放弃的条目为准（包括 Loki 拒收）；超过保留期的旧行在 Alloy 内先丢弃，不计入；监控数据卷在宿主根分区上，由现有的 `HostDiskAlmostFull` 覆盖。这些都是 `layer=monitoring`，会同时直接通知人工。
 - Loki 不可用时，`loki_query` 返回错误，对应证据标为缺失，诊断继续。
 - 观测组件任何故障都不能阻塞审批、执行或验证事务。
 

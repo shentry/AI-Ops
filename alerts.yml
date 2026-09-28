@@ -286,13 +286,12 @@ groups:
           summary: Prometheus rule evaluation is failing
           description: Alert rules may silently stop firing.
 
-      # Alloy gave up sending, or Loki rejected entries. Lines older than the
-      # retention are rejected by design (first start after a long uptime) and
-      # are not a pipeline fault.
+      # Alloy gave up on entries: Loki rejected them (4xx) or retries ran out.
+      # Loki's own discard counter is not used: it also counts 429s that Alloy
+      # retried successfully. Lines past the retention are dropped in Alloy
+      # before sending (config.alloy) and never reach this counter.
       - alert: LogPipelineDropping
-        expr: |
-          sum(increase(loki_write_dropped_entries_total[15m])) > 0
-          or sum(increase(loki_discarded_samples_total{reason!="greater_than_max_sample_age"}[15m])) > 0
+        expr: sum(increase(loki_write_dropped_entries_total[15m])) > 0
         labels:
           severity: warning
           layer: monitoring
