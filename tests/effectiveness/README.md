@@ -24,6 +24,9 @@ EFFECT_EVAL=1 EFFECT_EVAL_CONFIG="$PWD/config.yaml" \
   go test -count=1 -v -timeout=30m ./tests/effectiveness
 ```
 
+对比排查技能时，另加 `EFFECT_EVAL_SKILLS=1`：按案例的 `alerts` 匹配技能并放在证据之前，
+与流水线使用同一套匹配和渲染代码，每条结果的 `skills` 字段记录实际注入的技能。开、关两组须使用同一模型和同样的重复次数。
+
 也可不指定 `EFFECT_EVAL_CONFIG`，改用现有测试约定的
 `TEST_LLM_BASE_URL`、`TEST_LLM_API_KEY`、`TEST_LLM_MODEL` 环境变量。
 此方式使用 2048 输出 Token 上限和非思考模式；配置文件方式保留该文件的模型参数。

@@ -7,6 +7,7 @@ import { BrandMark } from "../components/layout/BrandMark";
 import { Changes } from "../pages/Changes";
 import { IncidentDetailRoute } from "../pages/IncidentDetail";
 import { Incidents } from "../pages/Incidents";
+import { Knowledge } from "../pages/Knowledge";
 import { Login } from "../pages/Login";
 import { NotFound } from "../pages/NotFound";
 import { Overview } from "../pages/Overview";
@@ -80,6 +81,7 @@ export function App() {
             <Route path="incidents/:id" element={<IncidentDetailRoute />} />
             <Route path="monitor" element={<Suspense fallback={null}><Monitor /></Suspense>} />
             <Route path="topology" element={<Suspense fallback={null}><Topology /></Suspense>} />
+            <Route path="knowledge" element={<Knowledge />} />
             <Route path="remediation" element={<Remediation />} />
             <Route path="report" element={<Report />} />
             <Route path="changes" element={<Changes />} />

@@ -51,3 +51,23 @@ func (db *DB) GetDiagnosisSnapshot(ctx context.Context, runID uint64) (Diagnosis
 	}
 	return snapshot, nil
 }
+
+// CountSkillActivations counts, per skill name, the diagnoses since the given
+// time whose recorded input carried that skill.
+func (db *DB) CountSkillActivations(ctx context.Context, since time.Time) (map[string]int, error) {
+	var rows []struct {
+		Name  string
+		Count int
+	}
+	err := db.WithContext(ctx).Raw(`SELECT jt.name AS name, COUNT(*) AS count FROM diagnosis_snapshot s,
+  JSON_TABLE(s.tools_json, '$.skills[*]' COLUMNS (name VARCHAR(64) PATH '$.name')) AS jt
+  WHERE s.created_at >= ? GROUP BY jt.name`, since).Scan(&rows).Error
+	if err != nil {
+		return nil, fmt.Errorf("store: count skill activations: %w", err)
+	}
+	counts := make(map[string]int, len(rows))
+	for _, row := range rows {
+		counts[row.Name] = row.Count
+	}
+	return counts, nil
+}

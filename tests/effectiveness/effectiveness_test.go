@@ -15,13 +15,16 @@ import (
 
 	"oncall-agent/internal/config"
 	"oncall-agent/internal/diagnose"
+	"oncall-agent/internal/knowledge"
 	"oncall-agent/internal/llm"
 	"oncall-agent/internal/tools"
 )
 
 // Expectations are evaluator-only data; only Evidence.Render() reaches the model.
 type scenario struct {
-	ID                 string                  `json:"id"`
+	ID string `json:"id"`
+	// Alerts are the firing alert names in the snapshot; skills match on them.
+	Alerts             []string                `json:"alerts"`
 	ExpectedDiagnosis  string                  `json:"expected_diagnosis"`
 	Evidence           []diagnose.EvidenceItem `json:"evidence"`
 	RequiredRefs       []string                `json:"required_refs"`
@@ -49,6 +52,7 @@ func scenarios(t *testing.T) []scenario {
 func TestScenarioSpecifications(t *testing.T) {
 	seen := map[string]bool{}
 	cases := scenarios(t)
+	rules := alertRuleNames(t)
 	if len(cases) == 0 {
 		t.Fatal("empty evaluation set")
 	}
@@ -58,6 +62,16 @@ func TestScenarioSpecifications(t *testing.T) {
 			t.Fatalf("incomplete or duplicate scenario: %q", c.ID)
 		}
 		seen[c.ID] = true
+		// Skills match real rule names; a case alert must be one and must be
+		// the alert its snapshot shows.
+		for _, alert := range c.Alerts {
+			if !rules[alert] || !strings.Contains(c.Evidence[0].Body, "alert "+alert+":") {
+				t.Fatalf("%s: alert %q is not a rule in alerts.yml shown by its alert_snapshot", c.ID, alert)
+			}
+		}
+		if len(c.Alerts) == 0 || c.Evidence[0].Name != "alert_snapshot" {
+			t.Fatalf("%s: needs its alerts and an alert_snapshot first", c.ID)
+		}
 		names := map[string]bool{}
 		for _, item := range c.Evidence {
 			if item.Name == "" || names[item.Name] || item.Source == "" || item.CollectedAt.IsZero() || !slices.Contains([]string{"ok", "partial", "error", "missing"}, item.Status) {
@@ -96,8 +110,35 @@ func TestRestartGuardOnScenarioEvidence(t *testing.T) {
 	}
 }
 
+func alertRuleNames(t *testing.T) map[string]bool {
+	t.Helper()
+	raw, err := os.ReadFile("../../alerts.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file struct {
+		Groups []struct {
+			Rules []struct {
+				Alert string `yaml:"alert"`
+			} `yaml:"rules"`
+		} `yaml:"groups"`
+	}
+	if err := yaml.Unmarshal(raw, &file); err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	for _, group := range file.Groups {
+		for _, rule := range group.Rules {
+			names[rule.Alert] = true
+		}
+	}
+	return names
+}
+
 type observation struct {
-	CaseID            string                `json:"case_id"`
+	CaseID string `json:"case_id"`
+	// Skills are the skills placed before the evidence (EFFECT_EVAL_SKILLS=1).
+	Skills            []string              `json:"skills"`
 	Trial             int                   `json:"trial"`
 	Model             string                `json:"model"`
 	StartedAt         time.Time             `json:"started_at"`
@@ -156,6 +197,14 @@ func TestReasonerEffectiveness(t *testing.T) {
 		t.Fatal(err)
 	}
 	reasoner := llm.NewReasoner(factory, registry, config.DefaultDiagnoseBudget())
+	// The skills arm uses the pipeline's own matching and rendering.
+	var skills *knowledge.Skills
+	if os.Getenv("EFFECT_EVAL_SKILLS") == "1" {
+		var err error
+		if skills, err = knowledge.LoadSkills(); err != nil {
+			t.Fatal(err)
+		}
+	}
 	consecutiveErrors := 0
 	for _, c := range scenarios(t) {
 		for trial := 1; trial <= repeats; trial++ {
@@ -163,12 +212,17 @@ func TestReasonerEffectiveness(t *testing.T) {
 				t.Fatal("stopped after three consecutive model execution errors; inspect connectivity/provider before retrying")
 			}
 			t.Run(fmt.Sprintf("%s/trial_%d", c.ID, trial), func(t *testing.T) {
-				o := observation{CaseID: c.ID, Trial: trial, Model: cfg.Roles.Reasoner.Model,
+				matched := skills.Match(c.Alerts)
+				o := observation{CaseID: c.ID, Skills: []string{}, Trial: trial, Model: cfg.Roles.Reasoner.Model,
 					ExpectedDiagnosis: c.ExpectedDiagnosis, DiagnosisReview: "pending_human_review",
 					CheckFailures: []string{}, StartedAt: time.Now().UTC()}
+				for _, skill := range matched {
+					o.Skills = append(o.Skills, skill.Name)
+				}
 				ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 				defer cancel()
-				result, err := reasoner.Diagnose(ctx, (diagnose.Evidence{IncidentID: 1, Items: c.Evidence}).Render(), "light", nil)
+				input := knowledge.RenderSkills(matched) + (diagnose.Evidence{IncidentID: 1, Items: c.Evidence}).Render()
+				result, err := reasoner.Diagnose(ctx, input, "light", nil)
 				o.ElapsedSeconds = time.Since(o.StartedAt).Seconds()
 				o.Result = result
 				if err != nil {

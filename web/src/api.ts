@@ -947,3 +947,25 @@ export async function getTopology(incidentID = 0): Promise<Topology> {
     }),
   };
 }
+
+// Skill is a reviewed investigation guide matched to incidents by alert name.
+export interface Skill {
+  name: string;
+  description: string;
+  alerts: string[];
+  tools: string[];
+  sha256: string;
+  body: string;
+  activations_30d: number;
+}
+
+export async function getSkills(): Promise<Skill[]> {
+  const body = object(await request<unknown>("/api/v1/skills"));
+  return list(body, "skills").map((value) => {
+    const skill = object(value);
+    return {
+      name: text(skill.name), description: text(skill.description), alerts: strings(skill.alerts), tools: strings(skill.tools),
+      sha256: text(skill.sha256), body: text(skill.body), activations_30d: number(skill.activations_30d),
+    };
+  });
+}

@@ -58,7 +58,7 @@ func TestPipelineReportCarriesCommittedApprovalSnapshot(t *testing.T) {
 	a := reportApproval(t, incident.ModeManual)
 	policy := &fakePolicy{decision: approval.Decision{Kind: approval.DecisionApproval, ToolName: a.ToolName, Args: json.RawMessage(a.ArgsJSON), ExecutionContext: json.RawMessage(a.ExecutionContext), PlanHash: a.PlanHash, Reason: a.Reason}}
 	reporter := &capturingReporter{}
-	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, &fakeReasoner{result: &llm.DiagnoseResult{RCA: "容器退出", Confidence: "high"}}, policy, approval.NewService(nil), reporter, nil, 0)
+	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, &fakeReasoner{result: &llm.DiagnoseResult{RCA: "容器退出", Confidence: "high"}}, policy, approval.NewService(nil), reporter, nil, 0, nil)
 	if err := pipeline.Run(context.Background(), store.AgentRun{ID: 31, IncidentID: 7, Mode: "full", Status: "running"}); err != nil {
 		t.Fatal(err)
 	}

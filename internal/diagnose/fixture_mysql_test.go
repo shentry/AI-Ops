@@ -202,7 +202,7 @@ func newDiagnoseMySQLFixture(t *testing.T, baseURL string, memoryHit bool) *diag
 		TokensIn: 21, TokensOut: 13, Steps: []llm.StepLog{{Name: "docker_logs", Input: `{"target_name":"sub2api"}`, Output: "process exited"}}}}
 	f.reporter = &fakeReporter{}
 	f.pipeline = NewPipeline(db, NewEvidenceBuilder(db, []Collector{f.collector, fixtureBusinessMetrics{}}), f.reasoner, approval.NewPolicy(f.authority, f.registry, 30*time.Minute, db),
-		approval.NewService(db), f.reporter, memory.NewStore(db, 3600, true), 0)
+		approval.NewService(db), f.reporter, memory.NewStore(db, 3600, true), 0, nil)
 	return f
 }
 

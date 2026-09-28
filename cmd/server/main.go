@@ -25,6 +25,7 @@ import (
 	"oncall-agent/internal/grafana"
 	"oncall-agent/internal/incident"
 	"oncall-agent/internal/ingest"
+	"oncall-agent/internal/knowledge"
 	"oncall-agent/internal/llm"
 	"oncall-agent/internal/memory"
 	"oncall-agent/internal/metrics"
@@ -131,6 +132,12 @@ func run() error {
 		}
 		worker.Wait()
 	}()
+
+	// 排查技能编译进二进制；格式错误拒绝启动。
+	skills, err := knowledge.LoadSkills()
+	if err != nil {
+		return fmt.Errorf("server: %w", err)
+	}
 
 	// 工具目录：只读工具与写动作。Prometheus 必须可用；Docker socket 缺席时
 	// 只跳过 Docker 工具和依赖它的动作，不影响其余证据段。
@@ -361,7 +368,7 @@ func run() error {
 		}
 		reasoner := llm.NewReasoner(llmFactory, registry, cfg.Diagnose.Budget)
 		pipeline := diagnose.NewPipeline(db, evidenceBuilder, reasoner, policy, approvalSvc,
-			diagnose.NewNotifyReporter(notifier, notificationWebURL(cfg)), faultMemory, cfg.Memory.CmdHistoryInject)
+			diagnose.NewNotifyReporter(notifier, notificationWebURL(cfg)), faultMemory, cfg.Memory.CmdHistoryInject, skills)
 		diagnosis := diagnose.NewWorker(db, pipeline, log.Default())
 		if err := diagnosis.Start(ctx); err != nil {
 			return fmt.Errorf("server: start diagnose worker: %w", err)
@@ -432,6 +439,7 @@ func run() error {
 			server.BindHandler(route, observabilityAPI.Handle)
 		}
 		server.BindHandler("/api/v1/topology", api.NewTopologyAPI(graph, db, auth).Handle)
+		server.BindHandler("/api/v1/skills", api.NewKnowledgeAPI(skills, db, auth).Handle)
 	}
 	if feishuCallback != nil {
 		server.BindHandler("/integrations/feishu/events", feishuCallback.Handle)

@@ -233,6 +233,7 @@ flowchart TB
 | `internal/llm` | OpenAI 兼容模型工厂、Eino ReAct、只读 Questioner、模型切换；计划契约由已启用动作定义生成 |
 | `internal/topology` | 依赖拓扑：主服务节点由 `service` 生成，其余节点和边来自 `topology` 配置（启动时校验）；节点状态经 Registry 的 `docker_inspect` / `prom_instant_query` 读取，firing 告警按 component → container → service 标签映射到节点，15 秒缓存 |
 | `internal/grafana` | 看板 JSON（`dashboards/`）编进二进制；Grafana 从同一目录 provisioning，控制台监控页渲染同一份 |
+| `internal/knowledge` | 排查技能（`skills/*/SKILL.md`）编进二进制，启动时解析、格式错误拒绝启动；按告警名确定性匹配（最多 2 个、合计 6 KB），渲染成证据之前的"排查技能"段 |
 | `internal/tools` | 只读工具（Prometheus、Docker、Loki）注册、统一超时、脱敏、输出截断；动作定义与实现（Prepare / Execute / Reconcile）：`docker_restart`、`deployment_rollback`、`upstream_quarantine` |
 | `internal/sub2api` | sub2api 管理接口客户端（只读 ops、账号调度）与业务探针 |
 | `internal/approval` | 规则授权（Authority / Policy）、审批 CAS、审批 TTL、执行器（领取复验、回执、对账） |
@@ -449,7 +450,7 @@ flowchart TB
 1. `LoadTarget`：读取 Incident、成员、当前告警。
 2. `memory.Lookup`：仅首次诊断查记忆，重诊不查；命中也照常采集当前证据，记忆只提供候选处置。
 3. `EvidenceBuilder.BuildForIncident`：执行各 collector（告警快照、Prometheus 回放与黄金指标、sub2api、PostgreSQL、Redis、Docker、发布记录、上游账号），每项记录采集状态；部分失败不能被一个 ok 隐藏。
-4. `SaveDiagnosisSnapshot`：结构化证据落库；调用模型**之前**再写入完整脱敏输入、模型、提示词摘要和工具/动作定义，写不进去就失败、不发布计划。
+4. `SaveDiagnosisSnapshot`：结构化证据落库；调用模型**之前**再写入完整脱敏输入、模型、提示词摘要和工具/动作定义，写不进去就失败、不发布计划。模型输入的开头是按告警名匹配的排查技能段（正文随输入录制），回放目录另记技能名与 SHA。
 5. `Reasoner.Diagnose`：Eino ReAct，只能调用只读工具；计划只能选择已启用动作并填写其声明的参数，非法 JSON 最多重试一次。工具调用与上下文裁剪记录随后写入快照。
 6. `Guard`：依据结构化证据校验动作前提（目标身份、容器状态、发布时序与迁移、上游错误集中度等），可覆盖 LLM 计划。
 7. `Policy`：匹配处置规则，调用动作的 `Prepare` 冻结目标、修订、执行前状态、检查项和补偿，决定 `none / denied / observe / approval / auto`。
@@ -576,6 +577,7 @@ flowchart LR
   - `/incidents/<id>` → `IncidentDetail`（诊断报告、处理流程、时间线/诊断轨迹/问 Agent 三个标签，右侧审批、最近变更、当前问题、告警成员、复盘标注）
   - `/remediation` → 处置规则、急停/复位、控制记录；`/report` → 效果评估与待复盘队列；`/changes` → 发布记录与「标记健康」
   - `/monitor` → `Monitor`（按需加载）：用 `PanelGrid` / `PromQLPanel`（recharts）原生渲染 `internal/grafana/dashboards` 的四个看板，支持时间范围、自定义窗口和自动刷新；Incident 详情的“监控”按钮打开事件前后各 30 分钟。代码拷自 ongrid（AGPL-3.0，见 NOTICE）
+  - `/knowledge` → `Knowledge`：排查技能标签页，列出名称、匹配告警、工具、SHA、近 30 天激活次数和正文；只读，技能只能通过仓库修改
   - `/topology` → `Topology`（按需加载）：`TopologyGraph`（@xyflow/react + dagre）画依赖图，节点颜色表示状态、带告警数；侧栏列出节点，选中后显示容器事实、告警、关系和监控链接；`?incident=ID` 高亮该事件告警映射到的节点（Incident 详情的“拓扑”按钮）。每 15 秒刷新。代码拷自 ongrid（AGPL-3.0，见 NOTICE）
 - 侧栏每 30 秒拉一次最近 50 个 Incident，供导航徽标、最近事件和 ⌘K 快速跳转使用；各页面需要筛选时自己查询服务端。
 - `IncidentDetail` 首屏读取控制室聚合、run steps 和对话历史。
@@ -654,6 +656,7 @@ sequenceDiagram
 | `GET /api/v1/observability/dashboards`、`/dashboards/:uid` | viewer（不含机器令牌） | 编进二进制的看板定义 |
 | `POST /api/v1/prometheus/query_range` | viewer（不含机器令牌） | 监控页的 PromQL 区间查询代理，表达式 ≤ 4 KB，30 秒超时 |
 | `GET /api/v1/topology?incident=` | viewer（不含机器令牌） | 依赖图与节点状态；带 `incident` 时另返回该事件告警映射到的节点 |
+| `GET /api/v1/skills` | viewer（不含机器令牌） | 排查技能与近 30 天激活次数（由回放目录统计） |
 | `/api/v1/control-room/model` | 任一身份 | 当前模型和 allowlist |
 | `/api/v1/control-room/incidents`、`/incidents/:id/control-room`、`/events`、`/problems`、`/runs...`、`/stream`、`/conversation` | 任一身份 | 控制室读取与 SSE |
 | `POST /api/v1/incidents/:id/questions\|rediagnose\|request-evidence` | operator | 提问、重诊、补充证据入队 |
@@ -1079,6 +1082,7 @@ raw_event → incident
 - LLM 只接收脱敏、截断后的证据。
 - LLM 只能调用只读工具；动作从不作为工具暴露。
 - LLM 输出不是权限结论。
+- 排查技能是仓库审阅的内容，只说明怎么查；系统提示明确它不是证据、不能写进 evidence_refs。技能只能列只读工具（仓库测试用启用全部可选工具的 Registry 校验），不能声明实现。
 - 上下文窗口配置在 `llm.models[].context_window_tokens`，随模型切换；DeepSeek 示例值为 1000000，未指定模型窗口时应用缺省值为 131072（不是对供应商容量的保证）。诊断在同一锁内取得客户端与窗口快照，扣除 `max_tokens` 输出预留及 512 协议余量。旧 `diagnose.budget.context_tokens` 已删除，配置加载会拒绝该字段。
 - 每次请求估算系统提示、工具定义、Evidence 和完整消息历史：ASCII 约 3 字符/Token，非 ASCII 约 2 UTF-8 字节/Token，初始增加 20% 余量；根据本次诊断各轮实际 `prompt_tokens` 对低估偏差向上校准，保留 10% 余量。分母使用实际发送的压缩后输入，校准不跨模型或诊断共享。它是启发式估算，不是精确 tokenizer、累计费用上限或网关容量认证。
 - 输入超过可用额度的 80% 时，仅压缩旧工具结果：Prometheus 数值序列保留标签、首尾点、最小/最大点与样本数；Docker 日志对连续相同行保存原文和次数。中间指标样本的省略有显式标记，不能据摘要推断完整波形或异常持续时间。

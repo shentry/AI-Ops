@@ -14,6 +14,7 @@ import (
 	"oncall-agent/internal/approval"
 	"oncall-agent/internal/eventlog"
 	"oncall-agent/internal/incident"
+	"oncall-agent/internal/knowledge"
 	"oncall-agent/internal/llm"
 	"oncall-agent/internal/metrics"
 	"oncall-agent/internal/store"
@@ -75,6 +76,9 @@ type Pipeline struct {
 	reporter         reporter
 	memories         memoryLookup
 	cmdHistoryInject int
+	// skills are matched by alert name and placed before the evidence; nil
+	// diagnoses on evidence alone.
+	skills *knowledge.Skills
 }
 
 // evidenceBuilder 是 Pipeline 对证据装配的收窄接口（单测换假实现）。
@@ -99,10 +103,10 @@ type approvalCreator interface {
 	Prepare(incidentID, runID uint64, decision approval.Decision, reason string) (store.Approval, error)
 }
 
-func NewPipeline(db runStore, builder evidenceBuilder, r reasoner, policy policyEngine, approvals approvalCreator, rep reporter, memories memoryLookup, cmdHistoryInject int) *Pipeline {
+func NewPipeline(db runStore, builder evidenceBuilder, r reasoner, policy policyEngine, approvals approvalCreator, rep reporter, memories memoryLookup, cmdHistoryInject int, skills *knowledge.Skills) *Pipeline {
 	return &Pipeline{
 		db: db, builder: builder, reasoner: r, policy: policy, approvals: approvals,
-		reporter: rep, memories: memories, cmdHistoryInject: cmdHistoryInject,
+		reporter: rep, memories: memories, cmdHistoryInject: cmdHistoryInject, skills: skills,
 	}
 }
 
@@ -190,8 +194,12 @@ func (p *Pipeline) Run(ctx context.Context, run store.AgentRun) error {
 			}
 		}
 
+		// 排查技能按告警名匹配，放在所有证据之前；正文随输入录制，回放不重读仓库。
+		skills := p.skills.Match(alertNames(target.Alerts))
+		evidence = knowledge.RenderSkills(skills) + evidence
+
 		// 阶段 3：LLM 推理。mode=skip 的行不会进队列（D05 已直接落 succeeded）。
-		result, err := p.runReasonStep(ctx, run, evidence, &snapshot)
+		result, err := p.runReasonStep(ctx, run, evidence, knowledge.Refs(skills), &snapshot)
 		if err != nil {
 			return p.fail(ctx, run, err)
 		}
@@ -356,11 +364,11 @@ func (p *Pipeline) retryContext(ctx context.Context, previousRunID uint64) strin
 // 工具调用另外逐条落库（recordToolSteps）—— 摘要回答"结论是什么"，
 // 工具 step 回答"结论是怎么来的、调了几次工具"。完整输入在调用模型前写入回放
 // 记录，工具调用及模型实际看到的输出在调用后补齐；任一写入失败本次诊断失败。
-func (p *Pipeline) runReasonStep(ctx context.Context, run store.AgentRun, evidence string, snapshot *store.DiagnosisSnapshot) (*llm.DiagnoseResult, error) {
+func (p *Pipeline) runReasonStep(ctx context.Context, run store.AgentRun, evidence string, skills []knowledge.SkillRef, snapshot *store.DiagnosisSnapshot) (*llm.DiagnoseResult, error) {
 	var result *llm.DiagnoseResult
 	var reasonErr error
 	record := func(input llm.DiagnosisInput) error {
-		catalog, err := json.Marshal(RecordedCatalog{Tools: input.Tools, Actions: input.Actions})
+		catalog, err := json.Marshal(RecordedCatalog{Tools: input.Tools, Actions: input.Actions, Skills: skills})
 		if err != nil {
 			return err
 		}
@@ -376,8 +384,8 @@ func (p *Pipeline) runReasonStep(ctx context.Context, run store.AgentRun, eviden
 		if reasonErr != nil {
 			return "", reasonErr
 		}
-		return fmt.Sprintf("context_compactions=%d estimated_input=%d->%d actual_prompt=%d estimate_factor=%.3f estimated_saved=%d tokens=%d/%d tool_calls=%d confidence=%s rca=%s",
-			out.Context.Compactions, out.Context.EstimatedBefore, out.Context.EstimatedAfter,
+		return fmt.Sprintf("skills=%s context_compactions=%d estimated_input=%d->%d actual_prompt=%d estimate_factor=%.3f estimated_saved=%d tokens=%d/%d tool_calls=%d confidence=%s rca=%s",
+			skillNames(skills), out.Context.Compactions, out.Context.EstimatedBefore, out.Context.EstimatedAfter,
 			out.Context.ActualPromptTokens, out.Context.EstimateFactor, out.Context.SavedEstimate,
 			out.TokensIn, out.TokensOut, len(out.Steps), out.Confidence, out.RCA), nil
 	}, func() ([]store.IncidentEvent, []store.ProblemMutation) {
@@ -404,10 +412,31 @@ func (p *Pipeline) runReasonStep(ctx context.Context, run store.AgentRun, eviden
 // finishSnapshot 补齐回放记录：工具调用（输出即模型所见；出错时模型看到的是
 // "tool error: " + Err）和上下文裁剪统计。失败的诊断同样补齐，便于回放失败原因。
 // RecordedCatalog is the tools_json of a replay record: the read-only tools
-// the model could call and the actions it could plan.
+// the model could call, the actions it could plan and the skills placed before
+// its evidence (their text is part of the recorded input).
 type RecordedCatalog struct {
 	Tools   []llm.ToolDefinition     `json:"tools"`
 	Actions []tools.ActionDefinition `json:"actions"`
+	Skills  []knowledge.SkillRef     `json:"skills,omitempty"`
+}
+
+func alertNames(alerts []store.Alert) []string {
+	names := make([]string, 0, len(alerts))
+	for _, alert := range alerts {
+		names = append(names, alert.Name)
+	}
+	return names
+}
+
+func skillNames(skills []knowledge.SkillRef) string {
+	if len(skills) == 0 {
+		return "none"
+	}
+	names := make([]string, 0, len(skills))
+	for _, skill := range skills {
+		names = append(names, skill.Name)
+	}
+	return strings.Join(names, ",")
 }
 
 func (p *Pipeline) finishSnapshot(ctx context.Context, snapshot *store.DiagnosisSnapshot, result *llm.DiagnoseResult) error {
