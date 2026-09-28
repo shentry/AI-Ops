@@ -1,90 +1,157 @@
 package incident_test
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"oncall-agent/internal/incident"
 )
 
-const testExecutionContext = `{"safety_level":"L2","dry_run":false,"verification":{"kind":"sub2api_http_health","target_name":"sub2api","base_url":"http://127.0.0.1:8080","member_fingerprints":["fp-1"],"interval_seconds":10,"window_seconds":120,"timeout_seconds":5}}`
+func testSnapshot() incident.ExecutionContext {
+	return incident.ExecutionContext{
+		Version: incident.ExecutionContextVersion, Kind: incident.KindPrimary, Service: "sub2api",
+		Rule:          incident.RuleRef{ID: "restart", Version: "r1@abc", Mode: incident.ModeManual, Alerts: []string{"Sub2APIDown"}},
+		ActionVersion: 1, Target: incident.Object{Kind: "container", Name: "sub2api", ID: "c0ffee"},
+		Revision: "started=2026-09-24T01:00:00Z", PreState: json.RawMessage(`{"status":"exited"}`),
+		Members: []string{"fp-1"}, FaultAlert: "Sub2APIDown",
+		Verification: incident.VerificationSpec{
+			Checks:          []incident.Check{{Kind: incident.CheckHealth, Params: json.RawMessage(`{"base_url":"http://127.0.0.1:8080"}`)}},
+			IntervalSeconds: 10, WindowSeconds: 120, TimeoutSeconds: 5, RequiredPasses: 1, WatchSeconds: 1800,
+		},
+		ExpiresAt: time.Date(2026, 9, 24, 2, 0, 0, 0, time.UTC),
+	}
+}
 
-func TestExecutionSnapshotBindsModeAndVerification(t *testing.T) {
-	args := []byte(`{"target_kind":"container","target_name":"sub2api"}`)
-	hash, err := incident.PlanHash("docker_restart", args, []byte(testExecutionContext))
+func encode(t *testing.T, c incident.ExecutionContext) []byte {
+	t.Helper()
+	raw, err := json.Marshal(c)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ordered, err := incident.PlanHash("docker_restart", []byte(`{ "target_name": "sub2api", "target_kind": "container" }`), []byte(testExecutionContext))
-	if err != nil || ordered != hash {
-		t.Fatalf("equivalent JSON changed hash: %q, %v", ordered, err)
+	return raw
+}
+
+func TestPlanHashCoversEverythingThatDecidedTheAction(t *testing.T) {
+	args := []byte(`{"container":"sub2api"}`)
+	raw := encode(t, testSnapshot())
+	hash, err := incident.PlanHash("docker_restart", args, raw)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, changed := range []string{
-		strings.Replace(testExecutionContext, `"dry_run":false`, `"dry_run":true`, 1),
-		strings.Replace(testExecutionContext, "127.0.0.1:8080", "127.0.0.1:8081", 1),
-		strings.Replace(testExecutionContext, "fp-1", "fp-2", 1),
+	var reordered map[string]any
+	_ = json.Unmarshal(raw, &reordered)
+	again, _ := json.Marshal(reordered)
+	if other, err := incident.PlanHash("docker_restart", []byte(`{ "container": "sub2api" }`), again); err != nil || other != hash {
+		t.Fatalf("equivalent JSON changed hash: %q %v", other, err)
+	}
+	for name, mutate := range map[string]func(*incident.ExecutionContext){
+		"rule mode": func(c *incident.ExecutionContext) { c.Rule.Mode = incident.ModeAuto },
+		"rules":     func(c *incident.ExecutionContext) { c.Rule.Version = "r2@def" },
+		"identity":  func(c *incident.ExecutionContext) { c.Target.ID = "beef" },
+		"revision":  func(c *incident.ExecutionContext) { c.Revision = "started=later" },
+		"members":   func(c *incident.ExecutionContext) { c.Members = []string{"fp-2"} },
+		"expiry":    func(c *incident.ExecutionContext) { c.ExpiresAt = c.ExpiresAt.Add(time.Minute) },
+		"checks":    func(c *incident.ExecutionContext) { c.Verification.RequiredPasses = 2 },
+		"evidence":  func(c *incident.ExecutionContext) { c.EvidenceRefs = []string{"docker_inspect"} },
+		"compensate": func(c *incident.ExecutionContext) {
+			c.Compensation = &incident.Compensation{Action: "undo", ActionVersion: 1, Args: json.RawMessage(`{}`), Revision: "x", Checks: c.Verification.Checks}
+		},
 	} {
-		other, err := incident.PlanHash("docker_restart", args, []byte(changed))
+		changed := testSnapshot()
+		mutate(&changed)
+		other, err := incident.PlanHash("docker_restart", args, encode(t, changed))
 		if err != nil || other == hash {
-			t.Fatalf("changed approval content must have a different hash: %q, %v", other, err)
+			t.Fatalf("%s: changed snapshot kept hash %q (%v)", name, other, err)
 		}
 	}
 }
 
-func TestExecutionSnapshotRejectsIncompleteOrUnsupportedActions(t *testing.T) {
-	for _, raw := range []string{
-		`null`, `{}`,
-		strings.Replace(testExecutionContext, `"dry_run":false,`, "", 1),
-		strings.Replace(testExecutionContext, `"L2"`, `"L4"`, 1),
-		strings.Replace(testExecutionContext, `"timeout_seconds":5`, `"timeout_seconds":10`, 1),
-		strings.Replace(testExecutionContext, `http://127.0.0.1:8080`, `http://user:secret@localhost`, 1),
-		testExecutionContext + `{}`,
+func TestSnapshotRejectsIncompleteOrOldContent(t *testing.T) {
+	for name, mutate := range map[string]func(*incident.ExecutionContext){
+		"old version":        func(c *incident.ExecutionContext) { c.Version = 2 },
+		"observe mode":       func(c *incident.ExecutionContext) { c.Rule.Mode = incident.ModeObserve },
+		"no rule alerts":     func(c *incident.ExecutionContext) { c.Rule.Alerts = nil },
+		"anonymous target":   func(c *incident.ExecutionContext) { c.Target.ID = "" },
+		"no revision":        func(c *incident.ExecutionContext) { c.Revision = "" },
+		"no checks":          func(c *incident.ExecutionContext) { c.Verification.Checks = nil },
+		"unknown check":      func(c *incident.ExecutionContext) { c.Verification.Checks[0].Kind = "shell" },
+		"passes beyond":      func(c *incident.ExecutionContext) { c.Verification.RequiredPasses = 13 },
+		"no expiry":          func(c *incident.ExecutionContext) { c.ExpiresAt = time.Time{} },
+		"fault outside rule": func(c *incident.ExecutionContext) { c.FaultAlert = "Other" },
+		"duplicate members":  func(c *incident.ExecutionContext) { c.Members = []string{"fp", "fp"} },
+		"compensation nested": func(c *incident.ExecutionContext) {
+			c.Kind = incident.KindCompensation
+			c.Compensation = &incident.Compensation{}
+		},
 	} {
-		if _, err := incident.ParseExecutionContext([]byte(raw)); err == nil {
-			t.Fatalf("invalid snapshot accepted: %s", raw)
+		c := testSnapshot()
+		mutate(&c)
+		if _, err := incident.ParseExecutionContext(encode(t, c)); err == nil {
+			t.Fatalf("%s accepted", name)
 		}
 	}
-	if _, err := incident.PlanHash("shell", []byte(`{"target_kind":"container","target_name":"sub2api"}`), []byte(testExecutionContext)); err == nil {
-		t.Fatal("unsupported action accepted")
+	raw := encode(t, testSnapshot())
+	for _, bad := range []string{`null`, `{}`, string(raw) + `{}`, strings.Replace(string(raw), `"version":3`, `"version":3,"dry_run":false`, 1)} {
+		if _, err := incident.ParseExecutionContext([]byte(bad)); err == nil {
+			t.Fatalf("invalid snapshot accepted: %.80s", bad)
+		}
 	}
-	if _, err := incident.PlanHash("docker_restart", []byte(`{"target_kind":"container","target_name":"other"}`), []byte(testExecutionContext)); err == nil {
-		t.Fatal("target not bound to verification accepted")
+	if _, err := incident.PlanHash("docker_restart", []byte(`[]`), raw); err == nil {
+		t.Fatal("non-object args accepted")
 	}
 }
 
-func TestExecutionSnapshotRejectsConfigAndMemberDrift(t *testing.T) {
-	snapshot, err := incident.ParseExecutionContext([]byte(testExecutionContext))
-	if err != nil {
+func TestSnapshotIsRevokedByRuleActionOrServiceChanges(t *testing.T) {
+	snapshot := testSnapshot()
+	binding := incident.ExecutionBinding{Service: "sub2api", RulesVersion: "r1@abc",
+		Rules: map[string]incident.RuleRef{"restart": {ID: "restart", Mode: incident.ModeManual}}, Actions: map[string]int{"docker_restart": 1}}
+	if err := snapshot.ValidateBinding("docker_restart", binding); err != nil {
 		t.Fatal(err)
 	}
-	binding := incident.ExecutionBinding{Container: "sub2api", BaseURL: "http://127.0.0.1:8080/", AllowedContainers: []string{"sub2api"}, SafetyLevel: "L2"}
-	if err := snapshot.ValidateBinding(binding, true); err != nil {
-		t.Fatal(err)
+	for name, mutate := range map[string]func(*incident.ExecutionBinding){
+		"rules release": func(b *incident.ExecutionBinding) { b.RulesVersion = "r2@def" },
+		"rule removed":  func(b *incident.ExecutionBinding) { b.Rules = map[string]incident.RuleRef{} },
+		"observe":       func(b *incident.ExecutionBinding) { b.Rules["restart"] = incident.RuleRef{Mode: incident.ModeObserve} },
+		"action gone":   func(b *incident.ExecutionBinding) { b.Actions = map[string]int{} },
+		"action newer":  func(b *incident.ExecutionBinding) { b.Actions = map[string]int{"docker_restart": 2} },
+		"service":       func(b *incident.ExecutionBinding) { b.Service = "other" },
+	} {
+		changed := binding
+		changed.Rules = map[string]incident.RuleRef{"restart": binding.Rules["restart"]}
+		mutate(&changed)
+		if err := snapshot.ValidateBinding("docker_restart", changed); err == nil {
+			t.Fatalf("%s did not revoke the snapshot", name)
+		}
 	}
-	binding.DryRun = true
-	if err := snapshot.ValidateBinding(binding, true); err == nil {
-		t.Fatal("real action allowed after dry-run enabled")
+	auto := snapshot
+	auto.Rule.Mode = incident.ModeAuto
+	if err := auto.ValidateBinding("docker_restart", binding); err == nil {
+		t.Fatal("auto authority survived demotion to manual")
 	}
-	if err := snapshot.ValidateBinding(binding, false); err != nil {
-		t.Fatal("dry-run switch must not prevent read-only verification")
-	}
-	binding.BaseURL = "http://127.0.0.1:8081"
-	if err := snapshot.ValidateBinding(binding, false); err == nil {
-		t.Fatal("verification silently redirected to another host")
-	}
-	members := []incident.ExecutionMember{{Fingerprint: "fp-1", Name: "Sub2APIDown", Status: "firing", Container: "sub2api", Service: "sub2api"}}
+}
+
+func TestSnapshotRejectsFaultScopeDrift(t *testing.T) {
+	snapshot := testSnapshot()
+	members := []incident.ExecutionMember{{Fingerprint: "fp-1", Name: "Sub2APIDown", Status: "firing", Service: "sub2api"}}
 	if err := snapshot.ValidateMembers(members, true); err != nil {
 		t.Fatal(err)
 	}
 	members[0].Status = "resolved"
 	if err := snapshot.ValidateMembers(members, true); err == nil {
-		t.Fatal("resolved incident allowed to execute")
+		t.Fatal("resolved fault allowed to execute")
 	}
 	if err := snapshot.ValidateMembers(members, false); err != nil {
-		t.Fatal("resolved notification should support verification")
+		t.Fatal("resolution must not prevent read-only verification")
 	}
-	members = append(members, incident.ExecutionMember{Fingerprint: "fp-2", Name: "Sub2APISlow", Status: "firing", Container: "sub2api", Service: "sub2api"})
+	members = append(members, incident.ExecutionMember{Fingerprint: "fp-2", Name: "Sub2APISlow", Status: "firing", Service: "sub2api"})
 	if err := snapshot.ValidateMembers(members, false); err == nil {
-		t.Fatal("mixed failure accepted")
+		t.Fatal("alert outside the rule accepted")
+	}
+	compensation := snapshot
+	compensation.Kind = incident.KindCompensation
+	if err := compensation.ValidateMembers(members, true); err != nil {
+		t.Fatal("compensation undoes our own write regardless of alert scope")
 	}
 }

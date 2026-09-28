@@ -1,11 +1,11 @@
-# D01 示例。敏感值使用 ${ENV} 占位符；IM webhook 可选，Web 控制台为公开操作面。
-# 最小配置只写 mysql.dsn 时只需 MYSQL_DSN；配置 web.base_url 后启用匿名控制台。
+# D01 示例。敏感值使用 ${ENV} 占位符；IM webhook 可选。
+# 最小配置只写 mysql.dsn 时只需 MYSQL_DSN；配置 web.base_url 后启用控制台，必须配置 web.operators。
 # validate() 除了要求 mysql.dsn 非空，还会校验全部数值字段的边界。
-# （超时、TTL、验证窗口、诊断预算、限频等）：无效值直接启动失败。
+# （超时、TTL、验证窗口、诊断预算、规则预算等）：无效值直接启动失败。
 # 未知/已删除配置键和多个 YAML 文档也会被拒绝。
 server:
   # 独立运行默认 127.0.0.1；此处为 Compose 的 host.docker.internal 显式绑定所有网卡。
-  # 必须用宿主防火墙限制整个 listener 到可信来源；匿名控制台、写接口和 /metrics 禁止暴露公网。
+  # 必须用宿主防火墙限制整个 listener 到可信来源；控制台、webhook 和 /metrics 禁止暴露公网。
   listen_addr: "0.0.0.0"
   port: 18080
   auth_token: "${AUTH_TOKEN}"
@@ -47,38 +47,89 @@ diagnose:
     info: skip
     low: skip
   evidence:
-    sub2api_base_url: "${SUB2API_BASE_URL}"
-    sub2api_metrics_job: sub2api
-    postgres_dsn: "${PG_RO_DSN}"
-    redis_addr: "${REDIS_ADDR}"
-    redis_password: "${REDIS_PASSWORD}"
-    docker_container: sub2api
     docker_socket: /var/run/docker.sock
     timeout_seconds: 5
     log_max_lines: 200
-  # 恢复验证超时独立于 evidence；要求 0 < timeout < interval < window，且 timeout < 30 秒。
+# 唯一的被监控服务描述：身份、Docker 目标、健康地址、管理接口和发布入口都只写在这里。
+service:
+  name: sub2api
+  container: sub2api
+  base_url: "${SUB2API_BASE_URL}"
+  # sub2api 管理员密钥拥有全部管理权限；采集器和每个动作只能调用自己登记的接口。
+  # 留空则不采集上游账号证据，upstream_quarantine 不可用。定期用 sub2api 审计日志核对调用。
+  admin_api_key: "${SUB2API_ADMIN_API_KEY}"
+  postgres_dsn: "${PG_RO_DSN}"
+  redis_addr: "${REDIS_ADDR}"
+  redis_password: "${REDIS_PASSWORD}"
+  # 可选业务探针：专用测试密钥 + 低成本模型，每次调用都会真实请求上游并产生费用。
+  # probe:
+  #   path: /v1/messages
+  #   model: "<cheap-model>"
+  #   api_key: "${SUB2API_PROBE_API_KEY}"
+  # 发布回退入口（deployment_rollback）：固定可执行文件 + 参数数组，追加批准的镜像引用。
+  # 必须与 CI/CD 共用 lock_file；未配置时发布回退不可用。
+  # release:
+  #   command: ["/opt/sub2api/deploy.sh"]
+  #   work_dir: /opt/sub2api
+  #   lock_file: /opt/sub2api/.deploy.lock
+  #   timeout_seconds: 300
+# 处置规则是受版本管理的配置发布：修改规则时同时修改 rules_version。
+# 规则、服务配置与验证标准的摘要参与授权版本，修改会撤销旧快照（含在途验证）。
+# mode: observe 只记录本会采取的动作；manual 需要操作人确认冻结快照；
+# auto 在事实、范围、预算和健康条件都满足时自动执行。新规则先 observe/manual 试运行。
+# auto 启动门槛：配置诊断模型、管理员身份、通知渠道；至少连续3次通过并保留观察窗。
+# auto 重启还必须配置 service.probe；回退/隔离必须有 min_requests 和 >300秒的验证窗。
+# 外部动作结果未知会触发全局急停，人工核查后通过控制台恢复；不会盲目重放。
+remediation:
+  rules_version: "2026-09-24.1"
+  rules:
+    - id: restart-stopped-process
+      action: docker_restart
+      mode: manual
+      alerts: [Sub2APIDown]
+      max_executions: 1
+      window_minutes: 60
+    # 需要 service.release；未配置发布入口时删除本条，否则启动失败（规则引用了未启用的动作）。
+    - id: rollback-bad-release
+      action: deployment_rollback
+      mode: observe
+      alerts: [Sub2APIBusinessErrors, Sub2APIDown]
+      max_executions: 1
+      window_minutes: 240
+      max_error_ratio: 0.05
+      min_requests: 20
+      # 业务错误率按 5 分钟滚动窗口统计，验证窗口需覆盖回退后的完整窗口。
+      verify_window_seconds: 900
+    - id: quarantine-upstream
+      action: upstream_quarantine
+      mode: observe
+      alerts: [Sub2APIUpstreamAccountErrors, Sub2APIBusinessErrors]
+      max_executions: 2
+      window_minutes: 60
+      min_available_accounts: 1
+      max_error_ratio: 0.05
+      min_requests: 20
+      verify_window_seconds: 900
+      compensate: true
+  # 维护窗口内不自动执行任何写操作。
+  maintenance: []
+  # 恢复验证：0 < timeout < interval < window，timeout < 30 秒；
+  # 连续 required_passes 次健康才判定恢复，(required_passes-1)*interval 必须小于 window。
+  # 通过后在 watch_seconds 内持续观察，识别复发。这些是待演练校准的初值。
   verification:
     interval_seconds: 10
-    window_seconds: 120
+    window_seconds: 300
     timeout_seconds: 5
+    required_passes: 3
+    watch_seconds: 1800
 memory:
   ttl_seconds: 3600
   only_high_confidence: true
   cmd_history_inject: 5
 approval:
+  # 人工审批单的有效期；是否需要人工由 remediation 规则决定。
   ttl_minutes: 30
-  auto_execute_l2: false
-  dry_run: true
-  # L2 自动路径限频：同一 target+action 在窗口内最多自动执行 l2_max_per_window 次，
-  # 超限降级为人工审批。
-  l2_rate_window_minutes: 60
-  l2_max_per_window: 1
 tools:
-  docker:
-    allowed_containers: [sub2api]
-    # 工具层兜底限频：即使决策放行，同一容器也不能被高频重启。
-    restart_min_interval_seconds: 60
-    restart_max_per_hour: 3
   prometheus:
     base_url: "http://127.0.0.1:9090"
     range_minutes: 15
@@ -105,6 +156,17 @@ notify:
     #   chat_id: "${FEISHU_CHAT_ID}"
     #   web_base_url: "https://oncall.example.com"
 web:
-  base_url: "http://127.0.0.1:18080"  # 非空即启用匿名控制台；不是监听地址或访问控制
-  # 飞书审批卡片的操作人 open_id 白名单（仅约束飞书回调，不影响公开控制台）。
+  base_url: "http://127.0.0.1:18080"  # 非空即启用控制台；不是监听地址。https 地址会给会话 Cookie 加 Secure
+  # 飞书审批卡片的操作人 open_id 白名单（仅约束飞书回调）。
   operator_allowlist: []
+  # 控制台和操作 API 的身份。启用控制台时至少一人；不存在匿名访问。
+  # 角色：viewer 只读；operator 可审批、提问、重诊、标注；admin 另可切换模型、急停和复位规则阻断。
+  # 个人令牌用 `openssl rand -hex 32` 生成（至少 32 字符），只把
+  # `printf %s "$TOKEN" | shasum -a 256` 的结果写进这里；明文只交给本人。
+  # 浏览器用令牌换取 12 小时的 HttpOnly 会话 Cookie；进程重启后需重新登录。
+  # server.auth_token 是机器身份（Alertmanager/脚本）：只能读取和触发诊断，不能审批或切换模型。
+  operators:
+    - id: "oncall-admin"
+      name: "值班管理员"
+      role: "admin"
+      token_sha256: "${ONCALL_ADMIN_TOKEN_SHA256}"

@@ -13,7 +13,7 @@ func TestFailedPublicationCanRecoverSameRunWithRepeatedStepSequence(t *testing.T
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	oldTime := now.Add(-10 * time.Minute)
-	previous, _ := executionFixture(t, db, oldTime, false, "pending")
+	previous, _ := executionFixture(t, db, oldTime, "pending")
 	if _, err := db.DecideApproval(ctx, previous.ID, "denied", previous.PlanHash, "ops", "new diagnosis", "web", oldTime); err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +29,7 @@ func TestFailedPublicationCanRecoverSameRunWithRepeatedStepSequence(t *testing.T
 		t.Fatal(err)
 	}
 	draft := previous
-	draft.ID, draft.RunID, draft.CreatedAt, draft.ExpiresAt = 0, run.ID, now, now.Add(time.Hour)
+	draft.ID, draft.RunID, draft.CreatedAt = 0, run.ID, now
 	completion := RunCompletion{RunID: run.ID, Status: "succeeded", RCA: "new diagnosis", FinishedAt: now, Approval: &draft}
 	drop := rejectInsert(t, db, "approval", fmt.Sprintf("NEW.run_id = %d", run.ID))
 	if err := db.CompleteRun(ctx, completion); err == nil {
@@ -68,8 +68,8 @@ func TestExpiredApprovalIsRejectedByCommittedClaim(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	approval, binding := executionFixture(t, db, now, false, "approved")
-	row, claimed, err := db.ClaimApprovalExecution(ctx, approval.ID, approval.ExpiresAt, binding)
+	approval, policy := executionFixture(t, db, now, "approved")
+	row, claimed, err := db.ClaimApprovalExecution(ctx, approval.ID, approval.ExpiresAt, policy)
 	if err != nil || claimed || row.Status != "expired" {
 		t.Fatalf("expired claim=%+v %v %v", row, claimed, err)
 	}

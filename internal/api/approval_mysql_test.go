@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -75,6 +76,7 @@ type apiMySQLApproval struct {
 	business *feishu.CallbackBusiness
 	patches  chan apiMySQLPatch
 	prefix   string
+	session  *http.Cookie
 }
 
 func newAPIApprovalMySQL(t *testing.T) *apiMySQLApproval {
@@ -117,7 +119,7 @@ func newAPIApprovalMySQL(t *testing.T) *apiMySQLApproval {
 		}
 	})
 	alert := store.Alert{
-		Fingerprint: fp, AlertHash: fp[:32], Source: "alertmanager", Name: incident.SupportedAlert,
+		Fingerprint: fp, AlertHash: fp[:32], Source: "alertmanager", Name: "Sub2APIDown",
 		Status: "firing", Severity: 5, Labels: datatypes.JSON(`{"service":"sub2api","container":"sub2api"}`),
 		Annotations: datatypes.JSON(`{}`), StartsAt: now, ReceivedAt: now,
 	}
@@ -136,21 +138,23 @@ func newAPIApprovalMySQL(t *testing.T) *apiMySQLApproval {
 		t.Fatalf("RequestRun: created=%v err=%v", created, err)
 	}
 	snapshot := apiMySQLJSON(t, incident.ExecutionContext{
-		SafetyLevel: "L2", DryRun: false,
-		Verification: incident.VerificationSpec{Kind: incident.HealthVerification, TargetName: "sub2api",
-			BaseURL: "http://private-target.invalid:8080", MemberFingerprints: []string{fp},
-			IntervalSeconds: 10, WindowSeconds: 120, TimeoutSeconds: 5},
+		Version: incident.ExecutionContextVersion, Kind: incident.KindPrimary, Service: "sub2api",
+		Rule:          incident.RuleRef{ID: "restart", Version: "r1@000000000000", Mode: incident.ModeManual, Alerts: []string{"Sub2APIDown"}},
+		ActionVersion: 2, Target: incident.Object{Kind: "container", Name: "sub2api", ID: "c0ffee"}, Revision: "started_at=x", PreState: json.RawMessage(`{}`),
+		Members: []string{fp}, FaultAlert: "Sub2APIDown", ExpiresAt: now.Add(30 * time.Minute),
+		Verification: incident.VerificationSpec{Checks: []incident.Check{{Kind: incident.CheckHealth, Params: json.RawMessage(`{"base_url":"http://private-target.invalid:8080"}`)}},
+			IntervalSeconds: 10, WindowSeconds: 120, TimeoutSeconds: 5, RequiredPasses: 1},
 	})
 	args := datatypes.JSON(`{"target_kind":"container","target_name":"sub2api"}`)
-	hash, err := incident.PlanHash(incident.RestartAction, args, snapshot)
+	hash, err := incident.PlanHash("docker_restart", args, snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Both actual handlers receive this exact *Service and *store.DB. Only
 	// outbound Feishu message delivery is replaced; no executor is started.
-	svc := approval.NewService(db, 30)
+	svc := approval.NewService(db)
 	draft, err := svc.Prepare(parent.ID, run.ID, approval.Decision{Kind: approval.DecisionApproval,
-		ToolName: incident.RestartAction, Args: json.RawMessage(args), ExecutionContext: snapshot, PlanHash: hash}, "server-authored approval reason")
+		ToolName: "docker_restart", Args: json.RawMessage(args), ExecutionContext: snapshot, PlanHash: hash}, "server-authored approval reason")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,10 +175,11 @@ func newAPIApprovalMySQL(t *testing.T) *apiMySQLApproval {
 		Store: db, Approval: svc, Client: apiMySQLMessageClient{patches},
 		ChatID: "oc_api_test", OperatorAllowlist: []string{"ou_api_test"},
 	})
-	web := httptest.NewServer(NewApprovalAPI(svc, "disposable-api-token", NewConsole()))
+	auth := testAuth(t)
+	web := httptest.NewServer(NewApprovalAPI(svc, auth))
 	web.Client().Timeout = 10 * time.Second
 	t.Cleanup(web.Close)
-	f := &apiMySQLApproval{db: db, row: draft, web: web, business: business, patches: patches, prefix: prefix}
+	f := &apiMySQLApproval{db: db, row: draft, web: web, business: business, patches: patches, prefix: prefix, session: login(t, auth, testOperatorToken)}
 	f.row = f.persisted(t) // MySQL JSON and DATETIME precision, not in-memory draft values.
 	return f
 }
@@ -204,9 +209,13 @@ func (f *apiMySQLApproval) request(method, action, body, token string) apiMySQLH
 		return apiMySQLHTTPResult{err: err}
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Operator", "must-not-override-anonymous")
+	req.Header.Set("X-Operator", "must-not-override-identity")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	} else {
+		// The console path: the operator's session cookie plus the CSRF header.
+		req.AddCookie(f.session)
+		req.Header.Set(csrfHeader, csrfValue)
 	}
 	resp, err := f.web.Client().Do(req)
 	if err != nil {
@@ -264,9 +273,9 @@ func (f *apiMySQLApproval) projection(t *testing.T, status string) {
 	if resp.err != nil || resp.code != http.StatusOK || json.Unmarshal(resp.body, &got) != nil {
 		t.Fatalf("GET projection: %+v body=%s", resp, resp.body)
 	}
-	if got.ID != f.row.ID || got.Status != status || got.PlanHash != f.row.PlanHash || got.ToolName != incident.RestartAction ||
-		got.Target != "container/sub2api" || got.Scope != "single_container" || got.SafetyLevel != "L2" ||
-		got.DryRun == nil || *got.DryRun || got.Reason != f.row.Reason || !got.ExpiresAt.Equal(f.row.ExpiresAt) {
+	if got.ID != f.row.ID || got.Status != status || got.PlanHash != f.row.PlanHash || got.ToolName != "docker_restart" ||
+		got.Target != "container/sub2api" || got.TargetID != "c0ffee" || got.RuleID != "restart" || got.Mode != incident.ModeManual ||
+		got.Reason != f.row.Reason || !got.ExpiresAt.Equal(f.row.ExpiresAt) {
 		t.Fatalf("fresh projection lost server snapshot: %+v", got)
 	}
 	for _, forbidden := range []string{"private-target.invalid", "base_url", "execution_context", "args_json", `"risk"`} {
@@ -343,7 +352,7 @@ func TestApprovalMySQLWebFeishuRace(t *testing.T) {
 				t.Fatalf("decision rewrote immutable server content: %+v", row)
 			}
 			status := map[string]string{"approve": "approved", "deny": "denied"}[webAction]
-			actor, source, reason := "anonymous", "web", "web race reason"
+			actor, source, reason := "ops", "web", "web race reason"
 			if web.code == http.StatusConflict {
 				status, actor, source, reason = "approved", "feishu:ou_api_test", "feishu", ""
 				if cardAction == "deny" {
@@ -356,7 +365,7 @@ func TestApprovalMySQLWebFeishuRace(t *testing.T) {
 				select {
 				case patch := <-f.patches:
 					if patch.messageID != f.prefix+"card" || !strings.Contains(patch.content, "container/sub2api") ||
-						!strings.Contains(patch.content, "**Dry run:** false") || strings.Contains(patch.content, "private-target.invalid") || strings.Contains(patch.content, `"type":"callback"`) {
+						!strings.Contains(patch.content, "**Mode:** manual") || strings.Contains(patch.content, "private-target.invalid") || strings.Contains(patch.content, `"type":"callback"`) {
 						t.Fatalf("decision patch lost snapshot/leaked actions: %+v", patch)
 					}
 				case <-time.After(5 * time.Second):
@@ -402,7 +411,7 @@ func TestApprovalMySQLWebFeishuRace(t *testing.T) {
 }
 
 func TestApprovalMySQLChangedContentFailsClosed(t *testing.T) {
-	for _, change := range []string{"target", "dry_run", "verification_binding"} {
+	for _, change := range []string{"target", "mode", "verification_check"} {
 		for _, rehash := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/rehash_%t", change, rehash), func(t *testing.T) {
 				f := newAPIApprovalMySQL(t)
@@ -414,11 +423,11 @@ func TestApprovalMySQLChangedContentFailsClosed(t *testing.T) {
 				switch change {
 				case "target":
 					args = datatypes.JSON(`{"target_kind":"container","target_name":"other-sub2api"}`)
-					snapshot.Verification.TargetName = "other-sub2api" // Keep shape valid: reject hash drift, not a malformed target.
-				case "dry_run":
-					snapshot.DryRun = true
-				case "verification_binding":
-					snapshot.Verification.BaseURL = "http://other-private-target.invalid:8080"
+					snapshot.Target.Name = "other-sub2api" // Keep shape valid: reject hash drift, not a malformed target.
+				case "mode":
+					snapshot.Rule.Mode = incident.ModeAuto
+				case "verification_check":
+					snapshot.Verification.Checks[0].Params = json.RawMessage(`{"base_url":"http://other-private-target.invalid:8080"}`)
 				}
 				content := apiMySQLJSON(t, snapshot)
 				changedHash, err := incident.PlanHash(f.row.ToolName, args, content)
@@ -456,7 +465,7 @@ func TestApprovalMySQLChangedContentFailsClosed(t *testing.T) {
 					}
 					projection := f.request(http.MethodGet, "", "", "")
 					var dto ApprovalDTO
-					if projection.err != nil || projection.code != http.StatusOK || json.Unmarshal(projection.body, &dto) != nil || dto.DryRun != nil || dto.Target != "" {
+					if projection.err != nil || projection.code != http.StatusOK || json.Unmarshal(projection.body, &dto) != nil || dto.Mode != "" || dto.Target != "" {
 						t.Fatalf("corrupt snapshot projected as actionable: %+v body=%s", projection, projection.body)
 					}
 					f.assertUnchanged(t, before, 0)
@@ -468,7 +477,7 @@ func TestApprovalMySQLChangedContentFailsClosed(t *testing.T) {
 
 func TestApprovalMySQLRequiredHashAndCanonicalProjection(t *testing.T) {
 	f := newAPIApprovalMySQL(t)
-	for _, token := range []string{"", "disposable-api-token"} {
+	for _, token := range []string{"", testOperatorToken} {
 		for _, action := range []string{"approve", "deny"} {
 			for _, body := range []string{`{"reason":"no hash"}`, `{"plan_hash":"","reason":"empty hash"}`, `{"plan_hash":"   ","reason":"blank hash"}`} {
 				resp := f.request(http.MethodPost, action, body, token)
@@ -485,7 +494,21 @@ func TestApprovalMySQLRequiredHashAndCanonicalProjection(t *testing.T) {
 	if err := json.Unmarshal(f.row.ExecutionContext, &snapshot); err != nil {
 		t.Fatal(err)
 	}
-	reordered := []byte(fmt.Sprintf("{\n  \"verification\": %s, \"dry_run\":false, \"safety_level\":\"L2\"\n}", snapshot["verification"]))
+	keys := make([]string, 0, len(snapshot))
+	for key := range snapshot {
+		keys = append(keys, key)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
+	var reorderedText strings.Builder
+	reorderedText.WriteString("{\n")
+	for i, key := range keys {
+		if i > 0 {
+			reorderedText.WriteString(",\n  ")
+		}
+		fmt.Fprintf(&reorderedText, "%q : %s", key, snapshot[key])
+	}
+	reorderedText.WriteString("\n}")
+	reordered := []byte(reorderedText.String())
 	args := []byte("{\n \"target_name\":\"sub2api\", \"target_kind\":\"container\"\n}")
 	hash, err := incident.PlanHash(f.row.ToolName, args, reordered)
 	if err != nil || hash != f.row.PlanHash {
@@ -503,7 +526,7 @@ func TestApprovalMySQLRequiredHashAndCanonicalProjection(t *testing.T) {
 		t.Fatalf("canonical snapshot rejected: %+v body=%s", resp, resp.body)
 	}
 	row := f.persisted(t)
-	if row.Status != "approved" || row.DecidedBy == nil || *row.DecidedBy != "anonymous" || row.DecisionSource == nil || *row.DecisionSource != "web" ||
+	if row.Status != "approved" || row.DecidedBy == nil || *row.DecidedBy != "ops" || row.DecisionSource == nil || *row.DecisionSource != "web" ||
 		row.DecisionReason == nil || *row.DecisionReason != "canonical snapshot" || row.DecidedAt == nil || len(f.decisionEvents(t)) != 1 {
 		t.Fatalf("canonical decision not durable: %+v", row)
 	}

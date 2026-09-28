@@ -70,7 +70,7 @@ func (c promReplayCollector) Collect(ctx context.Context, target Target) Evidenc
 		return missingItem(c.Name(), "prometheus:query_range", "no generatorURL with parseable PromQL")
 	}
 	var body strings.Builder
-	var firstErr error
+	failed := 0
 	// 排序后逐个回放：同一 incident 渲染出的证据文本稳定，可 diff。
 	sortedExprs := make([]string, 0, len(exprs))
 	for expr := range exprs {
@@ -91,19 +91,13 @@ func (c promReplayCollector) Collect(ctx context.Context, target Target) Evidenc
 			replay.alertName, replay.firingAt.Format(time.RFC3339), expr)
 		if err != nil {
 			fmt.Fprintf(&body, "  error: %s\n", err)
-			if firstErr == nil {
-				firstErr = err
-			}
+			failed++
 			continue
 		}
 		body.WriteString(out)
 		body.WriteString("\n")
 	}
-	// 全部 expr 都失败才算 collector 失败；部分失败已在正文留痕。
-	if firstErr != nil && len(exprs) == 1 {
-		return finishItem(c.Name(), "prometheus:query_range", "", firstErr)
-	}
-	return finishItem(c.Name(), "prometheus:query_range", body.String(), nil)
+	return queriesItem(c.Name(), "prometheus:query_range", body.String(), failed, len(sortedExprs))
 }
 
 // ExtractGeneratorExpr 从 Prometheus generatorURL 安全解析 g0.expr。

@@ -28,15 +28,15 @@ type ControlRoomStore interface {
 	GetApproval(context.Context, uint64) (store.Approval, error)
 }
 
-// ControlRoomAPI serves the public, read-only Incident projection.
+// ControlRoomAPI serves the read-only Incident projection to authenticated viewers.
 // Mutating operations live in ConversationAPI and are injected separately.
 type ControlRoomAPI struct {
-	db      ControlRoomStore
-	console *Console
+	db   ControlRoomStore
+	auth *Auth
 }
 
-func NewControlRoomAPI(db ControlRoomStore, console *Console) *ControlRoomAPI {
-	return &ControlRoomAPI{db: db, console: console}
+func NewControlRoomAPI(db ControlRoomStore, auth *Auth) *ControlRoomAPI {
+	return &ControlRoomAPI{db: db, auth: auth}
 }
 
 // Handle adapts the standard-library handler to GoFrame routing.
@@ -53,16 +53,16 @@ func (h *ControlRoomAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeMethodNotAllowed(w)
 		return
 	}
+	// Authenticate before any path-dependent store read.
+	if _, ok := h.auth.Require(w, r, RoleViewer, true); !ok {
+		return
+	}
 	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/"), "/")
 	parts := strings.Split(path, "/")
 	if len(parts) == 3 && parts[0] == "incidents" {
 		id, err := parseIncidentID(parts[1])
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid incident id")
-			return
-		}
-		if _, ok := h.console.Actor(); !ok {
-			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
 		switch parts[2] {
@@ -83,18 +83,10 @@ func (h *ControlRoomAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid approval id")
 			return
 		}
-		if _, ok := h.console.Actor(); !ok {
-			writeError(w, http.StatusUnauthorized, "unauthorized")
-			return
-		}
 		h.approval(w, r, id)
 		return
 	}
 	if len(parts) == 2 && parts[0] == "control-room" && parts[1] == "incidents" {
-		if _, ok := h.console.Actor(); !ok {
-			writeError(w, http.StatusUnauthorized, "unauthorized")
-			return
-		}
 		h.incidents(w, r)
 		return
 	}

@@ -2,86 +2,58 @@ package store
 
 import (
 	"context"
-	"strings"
+	"fmt"
 	"testing"
 	"time"
-
-	"oncall-agent/internal/incident"
 )
 
-func TestCountRecentExecutions(t *testing.T) {
+// An interrupted execution stays executing through TTL sweeps until the
+// executor reconciles it with the target; an unknown outcome is recorded as
+// failed with a manual check, blocks the rule and is never retried.
+func TestInterruptedExecutionAwaitsReconciliation(t *testing.T) {
 	db := openIntegrationDB(t)
 	t.Cleanup(func() { db.Close() })
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	cases := []struct {
-		status string
-		age    time.Duration
-		dry    bool
-		other  bool
-	}{
-		{"executed", 10 * time.Minute, false, false},
-		{"failed", 20 * time.Minute, false, false},
-		{"executing", time.Minute, false, false},
-		{"approved", 5 * time.Minute, false, false},
-		{"simulated", 6 * time.Minute, true, false},
-		{"executed", 90 * time.Minute, false, false},
-		{"executed", 2 * time.Minute, false, true},
-	}
-	for _, tc := range cases {
-		at := now.Add(-tc.age)
-		approval, binding := executionFixture(t, db, at, tc.dry, "approved")
-		if tc.status == "approved" {
-			continue
-		}
-		if _, claimed, err := db.ClaimApprovalExecution(ctx, approval.ID, at, binding); err != nil || !claimed {
-			t.Fatalf("claim=%v %v", claimed, err)
-		}
-		if tc.status != "executing" {
-			if err := db.FinishExecution(ctx, ExecutionCompletion{ApprovalID: approval.ID, Status: tc.status, ResultJSON: []byte(`{"output":"test"}`), FinishedAt: at}); err != nil {
-				t.Fatal(err)
-			}
-		}
-		// Historical tools outside this deployment still must not consume its budget.
-		if tc.other {
-			if err := db.Model(&Approval{}).Where("id = ?", approval.ID).Update("tool_name", "another_tool").Error; err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	count, err := db.CountRecentExecutions(ctx, incident.RestartAction, "sub2api", now.Add(-time.Hour))
-	if err != nil || count != 3 {
-		t.Fatalf("count=%d err=%v; hashes differ but target budget must remain shared", count, err)
-	}
-	if _, err := db.CountRecentExecutions(ctx, "", "sub2api", now); err == nil {
-		t.Fatal("empty tool accepted")
-	}
-}
-
-func TestRecoverExecutingApprovals(t *testing.T) {
-	db := openIntegrationDB(t)
-	t.Cleanup(func() { db.Close() })
-	ctx := context.Background()
-	now := time.Now().UTC().Truncate(time.Millisecond)
-	stuck, binding := executionFixture(t, db, now, false, "approved")
-	if _, claimed, err := db.ClaimApprovalExecution(ctx, stuck.ID, now, binding); err != nil || !claimed {
+	stuck, policy := executionFixture(t, db, now, "approved")
+	if _, claimed, err := db.ClaimApprovalExecution(ctx, stuck.ID, now, policy); err != nil || !claimed {
 		t.Fatalf("claim=%v %v", claimed, err)
 	}
 	if _, err := db.ExpireApprovals(ctx, now.Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := db.GetApproval(ctx, stuck.ID); got.Status != "executing" {
-		t.Fatalf("TTL changed executing to %s", got.Status)
+	rows, err := db.ListExecutingApprovals(ctx)
+	if err != nil || !containsApproval(rows, stuck.ID) {
+		t.Fatalf("executing=%v err=%v", rows, err)
 	}
-	recovered, err := db.RecoverExecutingApprovals(ctx, now)
-	if err != nil || recovered < 1 {
-		t.Fatalf("recover=%d err=%v", recovered, err)
+	t.Cleanup(func() {
+		db.Where("actor = ? AND reason = ?", "system:execution", fmt.Sprintf("approval %d outcome is unknown; reconcile before resuming", stuck.ID)).Delete(&ControlEvent{})
+	})
+	completion := ExecutionCompletion{ApprovalID: stuck.ID, Status: "failed", ManualCheck: true, ResultJSON: []byte(`{"outcome":"unknown","error":"target state could not be read"}`), FinishedAt: now.Add(time.Minute)}
+	if err := db.FinishExecution(ctx, completion); err != nil {
+		t.Fatal(err)
 	}
 	got, err := db.GetApproval(ctx, stuck.ID)
-	if err != nil || got.Status != "failed" || got.Verification != nil || got.ResultJSON == nil || !strings.Contains(string(*got.ResultJSON), "manual verification") {
+	if err != nil || got.Status != "failed" || got.Verification != nil {
 		t.Fatalf("approval=%+v err=%v", got, err)
 	}
-	if recovered, err := db.RecoverExecutingApprovals(ctx, now); err != nil || recovered != 0 {
-		t.Fatalf("duplicate recovery=%d err=%v", recovered, err)
+	for _, code := range []string{"execution_failed", "manual_check"} {
+		assertScopeRaceCount(t, db, &IncidentProblem{}, "incident_id = ? AND code = ? AND status = ?", []any{stuck.IncidentID, code, "open"}, 1)
 	}
+	if rows, err := db.ListExecutingApprovals(ctx); err != nil || containsApproval(rows, stuck.ID) {
+		t.Fatalf("reconciled execution still listed: %v", err)
+	}
+	state, err := db.RemediationState(ctx, RemediationQuery{Service: *stuck.Service, RuleID: *stuck.RuleID, IncidentID: stuck.IncidentID, Since: now.Add(-time.Hour)})
+	if err != nil || !state.Stopped || state.Executions != 1 || state.IncidentActions != 1 || state.Blocked == "" || state.BusyWith != 0 {
+		t.Fatalf("state after unknown outcome=%+v err=%v", state, err)
+	}
+}
+
+func containsApproval(rows []Approval, id uint64) bool {
+	for _, row := range rows {
+		if row.ID == id {
+			return true
+		}
+	}
+	return false
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Controlled real-dependency acceptance harness (Python stdlib + Go/npm/Docker).
 
-Commands: prepare, up, native, dry, real, report, snapshot, rebuild, stop, start, cleanup.
+Commands: prepare, up, native, observe, real, report, snapshot, rebuild, stop, start, cleanup.
 Artifacts: /tmp/oncall-execution-acceptance/live. No production files are written.
 Fixture passwords below are disposable, local-only, NOT real credentials.
 Read tests/acceptance/experiment.md before running. Cleanup never removes MySQL.
@@ -29,6 +29,8 @@ DB = "oncall_live_69a3"
 SERVICES = ["server", "boundary", "sub2api", "postgres", "redis", "prometheus", "blackbox", "alertmanager"]
 BASE = "http://127.0.0.1:28080"
 TOKEN = "disposable-acceptance-token"
+# Console/operator identity: the machine TOKEN can no longer approve.
+OPERATOR_TOKEN = "disposable-acceptance-operator-token-0123456789"
 SUB_IMAGE = "weishaw/sub2api@sha256:ccf47a1c62e355f51f896e489f8253e119fe4101b103cd701ba458cc6c6f0f77"
 
 
@@ -80,9 +82,8 @@ def query(sql):
 
 def http(path, body=None, base=BASE, auth=False, expected=200):
     url = base + path
-    headers = {"Content-Type": "application/json"}
-    if auth:
-        headers["Authorization"] = "Bearer " + TOKEN
+    # auth=True uses the machine token; everything else acts as the operator.
+    headers = {"Content-Type": "application/json", "Authorization": "Bearer " + (TOKEN if auth else OPERATOR_TOKEN)}
     request = urllib.request.Request(url, data=None if body is None else json.dumps(body).encode(), headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
@@ -115,22 +116,26 @@ def write(name, value):
     (OUT / name).write_text(json.dumps(value, indent=2) if not isinstance(value, str) else value)
 
 
-def config(dry=True, native=False):
+def config(mode="observe", native=False):
     return {
         "server": {"port": 28081 if native else 18080, "auth_token": TOKEN, **({} if native else {"listen_addr": "0.0.0.0"})},
         "mysql": {"dsn": f"oncall_live_69a3:disposable-live-db@tcp({'127.0.0.1:23306' if native else 'host.docker.internal:23306'})/{DB}?parseTime=true&loc=UTC"},
-        "web": {"base_url": "http://127.0.0.1:28081" if native else BASE},
+        "web": {"base_url": "http://127.0.0.1:28081" if native else BASE,
+                "operators": [{"id": "acceptance", "role": "operator", "token_sha256": hashlib.sha256(OPERATOR_TOKEN.encode()).hexdigest()}]},
         "llm": {} if native else {"roles": {"reasoner": {"base_url": "http://boundary:8888/v1", "api_key": "disposable-llm-key", "model": "acceptance-local"}}},
         "correlate": {"group_by": ["labels.service", "labels.experiment"]},
-        "diagnose": {"evidence": {
-            "sub2api_base_url": "http://127.0.0.1:28088" if native else "http://sub2api:8080",
-            "docker_container": PREFIX + "sub2api", "docker_socket": "/var/run/docker.sock" if native else "/bridge/docker.sock",
-            "timeout_seconds": 2, "log_max_lines": 20,
-            **({} if native else {"postgres_dsn": "postgres://sub2api:disposable-pg@postgres:5432/sub2api?sslmode=disable", "redis_addr": "redis:6379"})},
-            "verification": {"interval_seconds": 3, "window_seconds": 90, "timeout_seconds": 1}},
-        "approval": {"dry_run": dry, "auto_execute_l2": False},
-        "tools": {"docker": {"allowed_containers": [PREFIX + "sub2api"], "restart_min_interval_seconds": 1, "restart_max_per_hour": 10},
-                  "prometheus": {"base_url": "http://127.0.0.1:29090" if native else "http://prometheus:9090"}},
+        "diagnose": {"evidence": {"docker_socket": "/var/run/docker.sock" if native else "/bridge/docker.sock", "timeout_seconds": 2, "log_max_lines": 20}},
+        "service": {"name": "sub2api", "env": "acceptance", "container": PREFIX + "sub2api",
+                    "base_url": "http://127.0.0.1:28088" if native else "http://sub2api:8080",
+                    **({} if native else {"postgres_dsn": "postgres://sub2api:disposable-pg@postgres:5432/sub2api?sslmode=disable", "redis_addr": "redis:6379"})},
+        # One restart rule; observe proves the decision without writing, manual
+        # needs the operator. The watch window is off so verification ends at passed.
+        "remediation": {"rules_version": "acceptance-" + mode,
+                        "rules": [{"id": "restart-stopped-process", "action": "docker_restart", "mode": mode, "alerts": ["Sub2APIDown"],
+                                   "max_executions": 10, "window_minutes": 60}],
+                        "verification": {"interval_seconds": 3, "window_seconds": 90, "timeout_seconds": 1, "required_passes": 1, "watch_seconds": 0}},
+        "approval": {"ttl_minutes": 30},
+        "tools": {"prometheus": {"base_url": "http://127.0.0.1:29090" if native else "http://prometheus:9090"}},
         "notify": {"im": {"provider": "", "webhook": ""}}}
 
 
@@ -238,8 +243,8 @@ def up():
     wait(lambda: http("/health", base="http://127.0.0.1:28088").get("status") == "ok", timeout=240)
     compose("up", "-d", "server")
     wait(lambda: http("/api/v1/approvals").get("approvals") == [])
-    # Monitoring starts only in real phase to avoid bootstrap/dry-run alerts.
-    print("Dry-mode real dependencies ready.")
+    # Monitoring starts only in real phase to avoid bootstrap/observe alerts.
+    print("Observe-mode real dependencies ready.")
 
 
 def native():
@@ -256,7 +261,7 @@ def native():
         proc.terminate()
         proc.wait(timeout=20)
         record("native_stop", pid=proc.pid, returncode=proc.returncode)
-    for key in ["unknown_acceptance_key", "verify_delay_seconds"]:
+    for key in ["unknown_acceptance_key", "dry_run"]:
         cfg = config(native=True)
         cfg["approval"][key] = 30
         write("invalid.json", cfg)
@@ -298,27 +303,32 @@ def actions():
     return [e for e in boundary_events() if e["kind"] == "docker_action_start"]
 
 
-def dry():
-    assert config()["approval"]["dry_run"]
-    initial = owned(PREFIX + "sub2api")["State"]["StartedAt"]
+def policy_output(experiment):
+    rows = query(f"SELECT s.output_json FROM agent_run_step s JOIN agent_run r ON r.id=s.run_id JOIN incident i ON i.id=r.incident_id WHERE i.group_key LIKE '%{experiment}%' AND s.name='policy' AND r.status='succeeded' ORDER BY s.id DESC LIMIT 1;")
+    return rows[0] if rows else None
+
+
+def observe():
+    assert config()["remediation"]["rules"][0]["mode"] == "observe"
+    # A real stopped process: the observe rule decides exactly what it would do.
+    operation("sub2api", "stop", "--time", "10")
+    stopped = owned(PREFIX + "sub2api")["State"]["FinishedAt"]
     # A real container sends to the explicitly configured internal :18080 listener.
-    body = {"version": "4", "receiver": "acceptance", "status": "firing", "alerts": [alert("dry-run")]}
+    body = {"version": "4", "receiver": "acceptance", "status": "firing", "alerts": [alert("observe")]}
     command = "import urllib.request,json; r=urllib.request.urlopen(urllib.request.Request('http://server:18080/webhook/alertmanager',data=" + repr(json.dumps(body).encode()) + ",headers={'Content-Type':'application/json','Authorization':'Bearer " + TOKEN + "'})); print(r.status); print(r.read().decode())"
     output = run("docker", "exec", PREFIX + "boundary", "python", "-c", command)
     assert output.startswith("202"), output
-    row = wait(lambda: pending("dry-run"))
-    assert row["target"] == "container/" + PREFIX + "sub2api" and row["scope"] == "single_container" and row["safety_level"] == "L2" and row["dry_run"] is True
-    assert "risk" not in row and "base_url" not in json.dumps(row)
-    http(f"/api/v1/approvals/{row['id']}/approve", {"plan_hash": "0" * 64, "reason": "wrong hash negative gate"}, expected=409)
-    approve(row)
-    result = wait(lambda: status(row["id"], "simulated"))
+    decision = wait(lambda: policy_output("observe"))
+    assert "decision=observe" in decision and "would docker_restart container/" + PREFIX + "sub2api" in decision, decision
+    assert query("SELECT COUNT(*) FROM approval;") == ["0"]
     assert query("SELECT COUNT(*) FROM verify_task;") == ["0"]
     assert query("SELECT COUNT(*) FROM fault_memory;") == ["0"]
-    assert actions() == [] and owned(PREFIX + "sub2api")["State"]["StartedAt"] == initial
-    http(f"/api/v1/approvals/{row['id']}/approve", {"plan_hash": row["plan_hash"], "reason": "duplicate"}, expected=409)
-    write("dry-result.json", result)
-    deliver([alert("dry-run", status="resolved")])
-    record("gate_pass", gate="T1 container202, T2 projection, T3 wrong/duplicate hash, T15 simulated/no task/no memory/no Docker call")
+    assert actions() == [] and owned(PREFIX + "sub2api")["State"]["FinishedAt"] == stopped
+    write("observe-result.json", {"policy": decision})
+    deliver([alert("observe", status="resolved")])
+    operation("sub2api", "start")
+    wait(lambda: http("/health", base="http://127.0.0.1:28088").get("status") == "ok", timeout=120)
+    record("gate_pass", gate="T1 container202, T15 observe: decision recorded, no approval/task/memory/Docker call")
 
 
 def block_result(approval_id):
@@ -334,7 +344,9 @@ def scope_tests():
         deliver([alert(label, name) for name in names])
         wait(lambda: query(f"SELECT r.id FROM agent_run r JOIN incident i ON i.id=r.incident_id WHERE i.group_key LIKE '%{label}%' AND r.status='succeeded';"))
         assert query(f"SELECT COUNT(*) FROM approval a JOIN incident i ON i.id=a.incident_id WHERE i.group_key LIKE '%{label}%';") == ["0"]
-    # Snapshot exists, then source resolves before the executor claims it.
+    # Snapshot exists for a really stopped process, then the source resolves
+    # before the executor claims it.
+    operation("sub2api", "stop", "--time", "10")
     deliver([alert("scope-resolved")])
     row = wait(lambda: pending("scope-resolved"))
     deliver([alert("scope-resolved", status="resolved")])
@@ -342,13 +354,15 @@ def scope_tests():
     approve(row)
     wait(lambda: status(row["id"], "expired"))
     assert len(actions()) == 0
-    record("gate_pass", gate="T8 Slow/dependency/mixed denied and resolved-before-claim expired; real healthy target")
+    operation("sub2api", "start")
+    wait(lambda: http("/health", base="http://127.0.0.1:28088").get("status") == "ok", timeout=120)
+    record("gate_pass", gate="T8 Slow/dependency/mixed denied and resolved-before-claim expired")
 
 
 def real():
-    assert (OUT / "dry-result.json").exists(), "real execution requires successful dry validation first"
+    assert (OUT / "observe-result.json").exists(), "real execution requires a successful observe run first"
     operation("server", "stop", "--time", "20")
-    write("config.json", config(dry=False))
+    write("config.json", config(mode="manual"))
     operation("server", "start")
     wait(lambda: http("/api/v1/approvals"))
     scope_tests()
@@ -366,7 +380,10 @@ def real():
     with (OUT / "real-sse.txt").open("w") as stream:
         sse = subprocess.Popen(["curl", "-sS", "-N", "--max-time", "100", f"{BASE}/api/v1/incidents/{row['incident_id']}/stream"], stdout=stream, stderr=subprocess.DEVNULL)
     record("sse_capture", pid=sse.pid, incident_id=row["incident_id"], max_seconds=100)
-    assert row["dry_run"] is False
+    assert row["target"] == "container/" + PREFIX + "sub2api" and row["target_id"] and row["rule_id"] == "restart-stopped-process"
+    assert row["mode"] == "manual" and "container" in row["checks"] and "health" in row["checks"]
+    assert "risk" not in row and "base_url" not in json.dumps(row)
+    http(f"/api/v1/approvals/{row['id']}/approve", {"plan_hash": "0" * 64, "reason": "wrong hash negative gate"}, expected=409)
     # Read-only verification claim is blocked in THIS DB ONLY to expose durable
     # execution/task state and permit a deterministic restart recovery test.
     block_verification()
@@ -384,53 +401,57 @@ def real():
     wait(lambda: status(row["id"], "executed"))
     assert query(f"SELECT status FROM verify_task WHERE approval_id={row['id']};") == ["pending"]
     deadline = query(f"SELECT deadline_at FROM verify_task WHERE approval_id={row['id']};")[0]
-    # Independent incident executes while first verification is pending.
+    http(f"/api/v1/approvals/{row['id']}/approve", {"plan_hash": row["plan_hash"], "reason": "duplicate"}, expected=409)
+    # One service has one disposition at a time: a second incident on a really
+    # stopped process gets no approval while the first recovery is verifying.
+    operation("sub2api", "stop", "--time", "10")
     deliver([alert("second-incident")])
-    second = wait(lambda: pending("second-incident"))
-    approve(second)
-    wait(lambda: status(second["id"], "executed"))
+    second = wait(lambda: policy_output("second-incident"))
+    assert f"busy with approval {row['id']}" in second, second
+    assert query("SELECT COUNT(*) FROM approval a JOIN incident i ON i.id=a.incident_id WHERE i.group_key LIKE '%second-incident%';") == ["0"]
     assert query(f"SELECT status FROM verify_task WHERE approval_id={row['id']};") == ["pending"]
-    assert len(actions()) == 2
-    write("execution-isolation.json", {"first": http(f"/api/v1/incidents/{row['incident_id']}/control-room"), "second": http(f"/api/v1/incidents/{second['incident_id']}/control-room")})
+    assert len(actions()) == 1
+    operation("sub2api", "start")
+    write("service-mutex.json", {"first": http(f"/api/v1/incidents/{row['incident_id']}/control-room"), "second_policy": second})
     # Persisted execution resumes only verification after real backend restart.
     operation("server", "stop", "--time", "20")
     mysql("DROP TRIGGER acceptance_block_verify;")
     operation("server", "start")
     wait(lambda: http("/api/v1/approvals"))
     wait(lambda: query(f"SELECT status FROM verify_task WHERE approval_id={row['id']};") == ["passed"])
-    wait(lambda: query(f"SELECT status FROM verify_task WHERE approval_id={second['id']};") == ["passed"])
     assert query(f"SELECT deadline_at FROM verify_task WHERE approval_id={row['id']};") == [deadline]
-    assert len(actions()) == 2
-    # The second incident has NO resolved webhook at all: passed cannot close it.
-    assert query(f"SELECT status FROM incident WHERE id={second['incident_id']};") == ["firing"]
-    write("passed-before-resolved.json", {"real": http(f"/api/v1/incidents/{row['incident_id']}/control-room"), "independent_unresolved": http(f"/api/v1/incidents/{second['incident_id']}/control-room")})
+    assert len(actions()) == 1
+    write("passed-before-resolved.json", {"real": http(f"/api/v1/incidents/{row['incident_id']}/control-room")})
     wait(lambda: any(e["kind"] == "alertmanager_arrival" and e["body"].get("status") == "resolved" for e in boundary_events()), timeout=120)
     wait(lambda: query(f"SELECT status FROM incident WHERE id={row['incident_id']};") == ["resolved"])
-    # Result-unknown crash: a third real request succeeds but result persistence
-    # is rejected. Restart must mark failed/manual_check, not replay the action.
+    # Crash after the external write: a real restart succeeds but its result is
+    # not persisted. Restart reconciles against the container (its start time
+    # moved), records the write once and never replays the action.
+    operation("sub2api", "stop", "--time", "10")
     deliver([alert("unknown-result")])
     third = wait(lambda: pending("unknown-result"))
     block_result(third["id"])
     approve(third)
-    wait(lambda: len(actions()) == 3)
-    wait(lambda: len([e for e in boundary_events() if e["kind"] == "docker_action_finish"]) == 3)
+    wait(lambda: len(actions()) == 2)
+    wait(lambda: len([e for e in boundary_events() if e["kind"] == "docker_action_finish"]) == 2)
     wait(lambda: query(f"SELECT status FROM approval WHERE id={third['id']};") == ["executing"])
     operation("server", "kill", "--signal", "KILL")
     mysql("DROP TRIGGER acceptance_block_result;")
     operation("server", "start")
-    result = wait(lambda: status(third["id"], "failed"))
+    result = wait(lambda: status(third["id"], "executed"))
     time.sleep(3)
-    assert len(actions()) == 3
-    assert query(f"SELECT COUNT(*) FROM verify_task WHERE approval_id={third['id']};") == ["0"]
+    assert len(actions()) == 2
+    assert result["result"]["outcome"] == "written" and "interrupted" in result["result"]["detail"]
+    wait(lambda: query(f"SELECT status FROM verify_task WHERE approval_id={third['id']};") == ["passed"])
     write("unknown-result-recovery.json", result)
-    for item in [row, second]:
+    for item in [row, third]:
         assert query(f"SELECT COUNT(*) FROM fault_cmd_history WHERE approval_id={item['id']};") == ["1"]
         assert query(f"SELECT COUNT(*) FROM verify_task WHERE approval_id={item['id']};") == ["1"]
         assert query(f"SELECT COUNT(*) FROM incident_event WHERE approval_id={item['id']} AND event_type='execution.completed';") == ["1"]
-    write("experiment-ids.json", {"real": row, "second": second, "unknown": third})
+    write("experiment-ids.json", {"real": row, "unknown": third})
     snapshot()
     report()
-    record("gate_pass", gate="T5 durable dual-state/isolation; T9 rollback+persistence retry one physical action; T10 persisted verify recovery and unknown-action no replay; T16 real fault chain")
+    record("gate_pass", gate="T2 projection, T3 wrong/duplicate hash, T5 service mutex, T9 rollback+persistence retry one physical action; T10 persisted verify recovery and crash reconciliation without replay; T16 real fault chain")
     print("Real experiment completed; leave backend live at " + BASE)
 
 
@@ -461,7 +482,7 @@ def snapshot():
 
 def report():
     ids = json.loads((OUT / "experiment-ids.json").read_text())
-    first, second, third = [ids[key] for key in ["real", "second", "unknown"]]
+    first, third = ids["real"], ids["unknown"]
     observations = json.loads((OUT / "passed-before-resolved.json").read_text())
     for room in observations.values():
         assert room["incident"]["status"] == "firing"
@@ -469,7 +490,7 @@ def report():
         assert room["latest_action"]["verification"]["status"] == "passed"
         assert room.get("pending_approval") is None
         assert "base_url" not in json.dumps(room["latest_action"])
-    assert len(actions()) == 3
+    assert len(actions()) == 2
     owned(PREFIX + "live-net", "network")
     owned(PREFIX + "bridge", "volume")
     for service in SERVICES:
@@ -477,14 +498,13 @@ def report():
         for mappings in container["NetworkSettings"]["Ports"].values():
             assert all(mapping["HostIp"] == "127.0.0.1" for mapping in mappings or [])
         assert all(mount.get("Name") == PREFIX + "bridge" for mount in container["Mounts"] if mount["Type"] == "volume")
-    assert query(f"SELECT status FROM approval WHERE id={third['id']};") == ["failed"]
-    assert query(f"SELECT JSON_EXTRACT(result_json,'$.manual_check') FROM approval WHERE id={third['id']};") == ["true"]
+    assert query(f"SELECT status FROM approval WHERE id={third['id']};") == ["executed"]
+    assert query(f"SELECT JSON_UNQUOTE(JSON_EXTRACT(result_json,'$.outcome')) FROM approval WHERE id={third['id']};") == ["written"]
     assert query("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA='oncall_live_69a3';") == []
-    for item in [first, second]:
+    for item in [first, third]:
         assert query(f"SELECT COUNT(*) FROM fault_cmd_history WHERE approval_id={item['id']};") == ["1"]
         assert query(f"SELECT status FROM verify_task WHERE approval_id={item['id']};") == ["passed"]
         assert query(f"SELECT COUNT(*) FROM incident_event WHERE approval_id={item['id']} AND event_type='execution.completed';") == ["1"]
-    assert query(f"SELECT status FROM incident WHERE id={second['incident_id']};") == ["firing"]
     assert query(f"SELECT status FROM incident WHERE id={first['incident_id']};") == ["resolved"]
     # Replay after backend restart resumes from the last durable SSE event ID.
     last = re.findall(r'^id: (\d+)$', (OUT / "real-sse.txt").read_text(), re.M)[-1]
@@ -503,13 +523,13 @@ def report():
               "timing": {"physical_action_start": started, "physical_action_finish": finished, "direct_probe_completion_db": probe,
                          "independent_resolved_arrival": resolved, "action_seconds": (parse(finished)-parse(started)).total_seconds(),
                          "resolved_after_probe_seconds": (parse(resolved)-parse(probe)).total_seconds()},
-              "physical_restart_requests": len(actions()), "successful_executions": 2, "unknown_result_manual_checks": 1,
-              "dry_run": "simulated; no task, no memory, no Docker request",
+              "physical_restart_requests": len(actions()), "successful_executions": 2, "denied_by_service_mutex": 1, "reconciled_after_crash": 1,
+              "observe": "decision recorded; no approval, task, memory or Docker request",
               "overrides": {"verification_timeout_interval_window_seconds": [1,3,90], "prometheus_scrape_evaluate_seconds": 2,
                             "rule_group_interval_seconds": 2, "down_firing_for_seconds": 4, "alertmanager_group_wait_seconds": 1,
-                            "alertmanager_group_interval_seconds": 30, "docker_restart_min_interval_seconds": 1},
+                            "alertmanager_group_interval_seconds": 30, "watch_seconds": 0},
               "limitations": ["Single instrumented trial, not recovery latency calibration; default 5/10/120 not measured",
-                              "Two independent Incidents target the same allowed container; first probe follows both approved restarts", 
+                              "The recovery watch window is disabled here; recurrence is covered by store and worker tests",
                               "Actual Sub2API health handler always emits 200; literal 503-to-200/persistent-503 gates not exercised",
                               "Verification pending was held with a claim-failing trigger in our DB, not a slow HTTP health response",
                               "T9 already-committed ambiguous retry is not available over public HTTP; tested precommit rollback and persistence-only retry",
@@ -541,7 +561,7 @@ def cleanup():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["prepare", "up", "native", "dry", "real", "report", "snapshot", "rebuild", "start", "stop", "cleanup"])
+    parser.add_argument("command", choices=["prepare", "up", "native", "observe", "real", "report", "snapshot", "rebuild", "start", "stop", "cleanup"])
     args = parser.parse_args()
     if args.command in ["start", "stop"]:
         operation("server", args.command)

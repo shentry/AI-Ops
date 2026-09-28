@@ -26,9 +26,34 @@ func (db *DB) CheckExecutionReady(ctx context.Context) error {
 	if !strings.Contains(statusType, "'simulated'") {
 		return errors.New("apply migration 009: approval status must support simulated")
 	}
+	if !strings.Contains(statusType, "'aborted'") {
+		return errors.New("apply migration 014: approval status must support aborted")
+	}
 	var task VerifyTask
 	if err := db.WithContext(ctx).Select("approval_id, status, next_check_at, deadline_at, claimed_at, last_checked_at, last_result_json, created_at, finished_at").Limit(1).Find(&task).Error; err != nil {
 		return fmt.Errorf("apply migration 010: %w", err)
+	}
+	if err := db.WithContext(ctx).Select("consecutive_passes").Limit(1).Find(&task).Error; err != nil {
+		return fmt.Errorf("apply migration 012: %w", err)
+	}
+	var snapshot DiagnosisSnapshot
+	if err := db.WithContext(ctx).Limit(1).Find(&snapshot).Error; err != nil {
+		return fmt.Errorf("apply migration 013: %w", err)
+	}
+	var approval Approval
+	if err := db.WithContext(ctx).Select("service, rule_id, parent_approval_id, operation_id, operation_started_at").Limit(1).Find(&approval).Error; err != nil {
+		return fmt.Errorf("apply migration 014: %w", err)
+	}
+	if err := db.WithContext(ctx).Select("phase, consecutive_failures").Limit(1).Find(&task).Error; err != nil {
+		return fmt.Errorf("apply migration 014: %w", err)
+	}
+	for _, table := range []any{&ServiceLock{}, &ControlEvent{}, &ChangeEvent{}, &Review{}} {
+		if err := db.WithContext(ctx).Model(table).Limit(1).Find(table).Error; err != nil {
+			return fmt.Errorf("apply migration 014: %w", err)
+		}
+	}
+	if err := db.WithContext(ctx).Limit(1).Find(&NotificationTask{}).Error; err != nil {
+		return fmt.Errorf("apply migration 015: %w", err)
 	}
 	var count int64
 	if err := db.WithContext(ctx).Raw(`SELECT COUNT(DISTINCT table_name, index_name) FROM information_schema.statistics
@@ -104,7 +129,8 @@ func (db *DB) RetireLegacyApprovals(ctx context.Context, now time.Time) (int, er
 			if result.RowsAffected == 0 {
 				return nil
 			}
-			if err := appendApprovalEvent(ctx, tx, row, eventType, status, summary, now); err != nil {
+			if _, err := appendIncidentEvent(ctx, tx, IncidentEvent{IncidentID: row.IncidentID, RunID: &row.RunID, ApprovalID: &row.ID,
+				EventType: string(eventType), Phase: "upgrade", Status: status, Summary: summary, CreatedAt: now}); err != nil {
 				return err
 			}
 			if status == "failed" {

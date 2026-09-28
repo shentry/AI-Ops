@@ -1,0 +1,140 @@
+# Production monitoring for the sub2api host. Run from this directory:
+#   docker compose --env-file .env up -d
+# Every port binds to 127.0.0.1: Prometheus and Alertmanager have no
+# authentication and must never be reachable from the public network.
+# Secrets live in ./secrets and .env (see ../README.md), never in this file.
+name: sub2api-monitoring
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    logging: *logging
+    ports:
+      - "127.0.0.1:9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../../alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --storage.tsdb.retention.size=5GB
+      - --web.listen-address=0.0.0.0:9090
+    networks: [monitoring, sub2api]
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    restart: unless-stopped
+    logging: *logging
+    ports:
+      - "127.0.0.1:9093:9093"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ./secrets:/etc/alertmanager/secrets:ro
+      - alertmanager-data:/alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    networks: [monitoring]
+
+  blackbox:
+    image: prom/blackbox-exporter:v0.25.0
+    restart: unless-stopped
+    logging: *logging
+    volumes:
+      - ./blackbox.yml:/config/blackbox.yml:ro
+    command:
+      - --config.file=/config/blackbox.yml
+    networks: [monitoring, sub2api]
+
+  # Real host metrics: the root filesystem and host PID namespace are mounted
+  # read-only, otherwise disk and memory alerts describe the container.
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    restart: unless-stopped
+    logging: *logging
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    command:
+      - --path.rootfs=/host
+    networks: [monitoring]
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    restart: unless-stopped
+    logging: *logging
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=15s
+    networks: [monitoring]
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      DATA_SOURCE_NAME: ${POSTGRES_EXPORTER_DSN:?set a read-only monitoring DSN}
+    networks: [monitoring, sub2api]
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.62.0
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      REDIS_ADDR: ${REDIS_EXPORTER_ADDR:-redis://sub2api-redis:6379}
+      REDIS_PASSWORD: ${REDIS_EXPORTER_PASSWORD:-}
+    networks: [monitoring, sub2api]
+
+  # Built from this repository: CGO_ENABLED=0 GOOS=linux go build -o bin/sub2api-exporter ./cmd/sub2api-exporter
+  sub2api-exporter:
+    image: alpine:3.20
+    restart: unless-stopped
+    logging: *logging
+    read_only: true
+    user: "65534:65534"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    entrypoint: ["/app/sub2api-exporter"]
+    volumes:
+      - ../../bin/sub2api-exporter:/app/sub2api-exporter:ro
+    environment:
+      SUB2API_BASE_URL: ${SUB2API_BASE_URL:-http://sub2api:8080}
+      SUB2API_ADMIN_API_KEY: ${SUB2API_ADMIN_API_KEY:?set the exporter admin API key}
+      SUB2API_PROBE_API_KEY: ${SUB2API_PROBE_API_KEY:-}
+      SUB2API_PROBE_MODEL: ${SUB2API_PROBE_MODEL:-}
+      SUB2API_PROBE_PATH: ${SUB2API_PROBE_PATH:-/v1/messages}
+      SUB2API_PROBE_INTERVAL: ${SUB2API_PROBE_INTERVAL:-5m}
+    networks: [monitoring, sub2api]
+
+networks:
+  monitoring: {}
+  # The sub2api Compose project's network, so targets resolve by service name.
+  sub2api:
+    external: true
+    name: ${SUB2API_NETWORK:-sub2api_default}
+
+volumes:
+  prometheus-data:
+  alertmanager-data:

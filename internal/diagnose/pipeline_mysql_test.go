@@ -6,8 +6,6 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-
-	"oncall-agent/internal/incident"
 )
 
 func TestPipelineMySQLCriticalAuditGates(t *testing.T) {
@@ -75,14 +73,19 @@ func TestPipelineMySQLCriticalAuditGates(t *testing.T) {
 }
 
 func TestPipelineMySQLUnsupportedScopeCannotPublishApproval(t *testing.T) {
-	for _, name := range []string{"Sub2APISlow", "PostgresDown", "RedisDown", "mixed"} {
+	for _, name := range []string{"Sub2APISlow", "PostgresDown", "RedisDown", "mixed", "other_service"} {
 		t.Run(name, func(t *testing.T) {
 			server := diagnoseMySQLHealthServer(t, func(http.ResponseWriter, *http.Request) { t.Error("unsupported policy must not probe") })
 			f := newDiagnoseMySQLFixture(t, server.URL, false)
-			if name == "mixed" {
-				f.addMember(t, "Sub2APISlow", "sub2api", "sub2api")
-			} else if err := f.db.Exec("UPDATE alert SET name = ? WHERE fingerprint = ?", name, f.fingerprints[0]).Error; err != nil {
-				t.Fatal(err)
+			switch name {
+			case "mixed":
+				f.addMember(t, "Sub2APISlow", f.service)
+			case "other_service":
+				f.addMember(t, diagnoseAlert, "postgres")
+			default:
+				if err := f.db.Exec("UPDATE alert SET name = ? WHERE fingerprint = ?", name, f.fingerprints[0]).Error; err != nil {
+					t.Fatal(err)
+				}
 			}
 			if err := f.pipeline.Run(context.Background(), f.run); err != nil {
 				t.Fatal(err)
@@ -105,9 +108,9 @@ func TestPipelineMySQLScopeRecheckedBeforeExecutionClaim(t *testing.T) {
 					t.Fatal(err)
 				}
 			} else {
-				f.addMember(t, incident.SupportedAlert, "sub2api", "sub2api")
+				f.addMember(t, diagnoseAlert, f.service)
 			}
-			row, claimed, err := f.db.ClaimApprovalExecution(context.Background(), f.approval.ID, f.approval.CreatedAt, f.binding)
+			row, claimed, err := f.db.ClaimApprovalExecution(context.Background(), f.approval.ID, f.approval.CreatedAt, f.authority.Policy(f.approval.CreatedAt))
 			if err != nil || claimed || row.Status != "expired" || f.eventCount(t, "execution.started") != 0 || f.count(t, "verify_task", "approval_id = ?", f.approval.ID) != 0 {
 				t.Fatalf("stale execution admitted: row=%+v claimed=%v err=%v", row, claimed, err)
 			}

@@ -133,17 +133,26 @@ func (n *WebhookNotifier) sendText(ctx context.Context, markdown string) error {
 		return errors.New("notify: send failed")
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4097))
+	if err != nil || len(body) > 4096 {
+		return errors.New("notify: webhook acknowledgement unreadable or too large")
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("notify: webhook returned HTTP %d", resp.StatusCode)
 	}
-	// Legacy WeCom/Feishu webhook acknowledgements use errcode=0. Do not
-	// include errmsg because providers may echo sensitive request material.
 	var ack struct {
-		ErrCode int `json:"errcode"`
+		ErrCode *int `json:"errcode"`
+		Code    *int `json:"code"`
 	}
-	if err := json.Unmarshal(body, &ack); err == nil && ack.ErrCode != 0 {
-		return fmt.Errorf("notify: webhook rejected: errcode=%d", ack.ErrCode)
+	if json.Unmarshal(body, &ack) != nil {
+		return errors.New("notify: webhook acknowledgement is not valid JSON")
+	}
+	code := ack.ErrCode
+	if n.provider == "feishu" && ack.Code != nil {
+		code = ack.Code
+	}
+	if code == nil || *code != 0 || ack.ErrCode != nil && *ack.ErrCode != 0 || ack.Code != nil && *ack.Code != 0 {
+		return errors.New("notify: webhook did not explicitly acknowledge success")
 	}
 	return nil
 }

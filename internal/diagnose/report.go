@@ -51,13 +51,9 @@ func (r *NotifyReporter) NotifyDiagnosis(ctx context.Context, report DiagnosisRe
 		if err != nil || hash != a.PlanHash || a.ID == 0 {
 			return fmt.Errorf("notify: approval content is not a committed immutable snapshot")
 		}
-		target, err := snapshot.Target(a.ToolName, a.ArgsJSON)
-		if err != nil {
-			return err
-		}
 		payload["action"], payload["tool_name"] = a.ToolName, a.ToolName
-		payload["target"], payload["scope"] = target.Kind+"/"+target.Name, "single_container"
-		payload["safety_level"], payload["dry_run"] = snapshot.SafetyLevel, snapshot.DryRun
+		payload["target"], payload["target_id"] = snapshot.Target.Kind+"/"+snapshot.Target.Name, snapshot.Target.ID
+		payload["rule_id"], payload["rule_mode"] = snapshot.Rule.ID, snapshot.Rule.Mode
 		payload["reason"], payload["plan_hash"] = a.Reason, a.PlanHash
 		payload["approval_status"], payload["expires_at"] = a.Status, a.ExpiresAt.UTC().Format(time.RFC3339)
 		if a.Status == "pending" {

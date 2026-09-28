@@ -156,8 +156,10 @@ func checkActiveProcessing(ctx context.Context, tx *gorm.DB, incidentID uint64) 
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err
 	}
+	// Only deciding recovery blocks a new diagnosis; the post-recovery watch is
+	// passive, and a second action in the incident already needs a person.
 	var task VerifyTask
-	err = tx.WithContext(ctx).Table("verify_task").Select("verify_task.*").Joins("JOIN approval ON approval.id = verify_task.approval_id").Where("approval.incident_id = ? AND verify_task.status IN ?", incidentID, []string{"pending", "running"}).Order("verify_task.approval_id ASC").Take(&task).Error
+	err = tx.WithContext(ctx).Table("verify_task").Select("verify_task.*").Joins("JOIN approval ON approval.id = verify_task.approval_id").Where("approval.incident_id = ? AND verify_task.phase = ? AND verify_task.status IN ?", incidentID, "verify", []string{"pending", "running"}).Order("verify_task.approval_id ASC").Take(&task).Error
 	if err == nil {
 		return &RunAdmissionError{Code: "active_processing", ApprovalID: task.ApprovalID}
 	}

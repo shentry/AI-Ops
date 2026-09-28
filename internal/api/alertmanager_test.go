@@ -52,7 +52,7 @@ func TestAlertmanagerWebhookRejectsMethodAndTokenBeforePersistence(t *testing.T)
 		t.Run(test.name, func(t *testing.T) {
 			db := &fakeRawEventStore{}
 			notifier := &fakeNotifier{}
-			handler := NewAlertmanagerWebhook(db, notifier, "secret")
+			handler := NewAlertmanagerWebhook(db, notifier, testAuth(t))
 			req := httptest.NewRequest(test.method, "/webhook/alertmanager", strings.NewReader(`{"version":"4"}`))
 			req.Header.Set("Authorization", test.token)
 			response := httptest.NewRecorder()
@@ -74,13 +74,14 @@ func TestAlertmanagerWebhookClassifiesInputAndStorageErrors(t *testing.T) {
 		want int
 	}{
 		{name: "invalid json", err: store.ErrInvalidRawEvent, want: http.StatusBadRequest},
+		{name: "pending queue full", err: store.ErrRawEventQueueFull, want: http.StatusServiceUnavailable},
 		{name: "storage unavailable", err: errors.New("database unavailable"), want: http.StatusServiceUnavailable},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			db := &fakeRawEventStore{err: test.err}
 			notifier := &fakeNotifier{}
-			handler := NewAlertmanagerWebhook(db, notifier, "secret")
+			handler := NewAlertmanagerWebhook(db, notifier, testAuth(t))
 			req := httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", strings.NewReader(`{"version":"4"}`))
 			req.Header.Set("Authorization", "Bearer secret")
 			response := httptest.NewRecorder()
@@ -98,7 +99,7 @@ func TestAlertmanagerWebhookClassifiesInputAndStorageErrors(t *testing.T) {
 func TestAlertmanagerWebhookPersistsThenNotifies(t *testing.T) {
 	db := &fakeRawEventStore{}
 	notifier := &fakeNotifier{}
-	handler := NewAlertmanagerWebhook(db, notifier, "secret")
+	handler := NewAlertmanagerWebhook(db, notifier, testAuth(t))
 	payload := `{"version":"4","alerts":[]}`
 	ctx := context.WithValue(context.Background(), webhookContextKey{}, "request-context")
 	req := httptest.NewRequest(http.MethodPost, "/webhook/alertmanager", strings.NewReader(payload)).WithContext(ctx)

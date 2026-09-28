@@ -20,11 +20,31 @@ import (
 )
 
 // ExecutionCompletion records an external result; retrying it never retries the action.
+// Status is executed (the write happened: verification follows), failed (the
+// write errored or its effect is unknown) or aborted (refused before writing).
 type ExecutionCompletion struct {
 	ApprovalID uint64
 	Status     string
 	ResultJSON []byte
+	// ManualCheck marks a result nobody can confirm without looking.
+	ManualCheck bool
+	// Change is a deployment change the action made, recorded with the result.
+	Change     *ChangeEvent
 	FinishedAt time.Time
+}
+
+// RemediationPolicy is the current trusted configuration a claim rechecks
+// under locks, together with the persisted remediation state.
+type RemediationPolicy struct {
+	Binding incidentrule.ExecutionBinding
+	Budgets map[string]RuleBudget
+	// Maintenance is the reason of the maintenance window now in effect, if any.
+	Maintenance string
+}
+
+type RuleBudget struct {
+	Max    int
+	Window time.Duration
 }
 
 func (db *DB) NextApprovedApproval(ctx context.Context, now time.Time) (Approval, bool, error) {
@@ -56,7 +76,7 @@ func lockApproval(ctx context.Context, tx *gorm.DB, id uint64) (Approval, Incide
 	return row, parent, err
 }
 
-func (db *DB) ClaimApprovalExecution(ctx context.Context, id uint64, now time.Time, binding incidentrule.ExecutionBinding) (row Approval, claimed bool, err error) {
+func (db *DB) ClaimApprovalExecution(ctx context.Context, id uint64, now time.Time, policy RemediationPolicy) (row Approval, claimed bool, err error) {
 	if id == 0 || now.IsZero() {
 		return row, false, errors.New("store: execution id and claim time required")
 	}
@@ -74,31 +94,9 @@ func (db *DB) ClaimApprovalExecution(ctx context.Context, id uint64, now time.Ti
 		if row.Status != "approved" {
 			return nil
 		}
-		reason := ""
-		if !row.ExpiresAt.After(now) {
-			reason = "approval expired"
-		}
-		snapshot, parseErr := incidentrule.ParseExecutionContext(row.ExecutionContext)
-		hash, hashErr := incidentrule.PlanHash(row.ToolName, row.ArgsJSON, row.ExecutionContext)
-		if parseErr != nil || hashErr != nil || hash != row.PlanHash {
-			reason = "approval execution snapshot is invalid"
-		}
-		if reason == "" {
-			if err := snapshot.ValidateBinding(binding, true); err != nil {
-				reason = err.Error()
-			}
-		}
-		if reason == "" && parent.Status != incidentrule.StatusFiring {
-			reason = "incident is no longer firing"
-		}
-		if reason == "" {
-			members, err := listIncidentExecutionMembers(ctx, tx, parent.ID)
-			if err != nil {
-				return err
-			}
-			if err := snapshot.ValidateMembers(members, true); err != nil {
-				reason = err.Error()
-			}
+		reason, err := claimRefusal(ctx, tx, row, parent, now, policy)
+		if err != nil {
+			return err
 		}
 		if reason != "" {
 			if err := tx.WithContext(ctx).Model(&Approval{}).Where("id = ? AND status = ?", id, "approved").Update("status", "expired").Error; err != nil {
@@ -107,28 +105,96 @@ func (db *DB) ClaimApprovalExecution(ctx context.Context, id uint64, now time.Ti
 			row.Status = "expired"
 			return appendApprovalEvent(ctx, tx, row, eventlog.EventApprovalExpired, "expired", truncateStoreText(reason, 512), now)
 		}
-		result := tx.WithContext(ctx).Model(&Approval{}).Where("id = ? AND status = ?", id, "approved").Update("status", "executing")
+		operation := fmt.Sprintf("op-%d", row.ID)
+		result := tx.WithContext(ctx).Model(&Approval{}).Where("id = ? AND status = ?", id, "approved").
+			Updates(map[string]any{"status": "executing", "operation_id": operation, "operation_started_at": now})
 		if result.Error != nil {
 			return result.Error
 		}
 		if result.RowsAffected != 1 {
 			return nil
 		}
-		if err := appendApprovalEvent(ctx, tx, row, eventlog.EventExecutionStarted, "executing", "approval execution started", now); err != nil {
+		if err := appendApprovalEvent(ctx, tx, row, eventlog.EventExecutionStarted, "executing", "approval execution started as "+operation, now); err != nil {
 			return err
 		}
-		row.Status = "executing"
+		row.Status, row.OperationID, row.OperationStartedAt = "executing", &operation, &now
 		claimed = true
 		return nil
 	}, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	return row, claimed && err == nil, err
 }
 
+// claimRefusal rechecks, under the incident, approval and service locks, every
+// condition the policy checked when the snapshot was frozen. A non-empty
+// reason expires the approval: an old snapshot is never re-targeted.
+func claimRefusal(ctx context.Context, tx *gorm.DB, row Approval, parent Incident, now time.Time, policy RemediationPolicy) (string, error) {
+	if !row.ExpiresAt.After(now) {
+		return "approval expired", nil
+	}
+	snapshot, parseErr := incidentrule.ParseExecutionContext(row.ExecutionContext)
+	hash, hashErr := incidentrule.PlanHash(row.ToolName, row.ArgsJSON, row.ExecutionContext)
+	if parseErr != nil || hashErr != nil || hash != row.PlanHash {
+		return "approval execution snapshot is invalid", nil
+	}
+	if err := snapshot.ValidateBinding(row.ToolName, policy.Binding); err != nil {
+		return err.Error(), nil
+	}
+	primary := snapshot.Kind == incidentrule.KindPrimary
+	if primary && parent.Status != incidentrule.StatusFiring {
+		return "incident is no longer firing", nil
+	}
+	members, err := listIncidentExecutionMembers(ctx, tx, parent.ID)
+	if err != nil {
+		return "", err
+	}
+	if err := snapshot.ValidateMembers(members, true); err != nil {
+		return err.Error(), nil
+	}
+	if err := lockService(ctx, tx, snapshot.Service, now); err != nil {
+		return "", err
+	}
+	family := row.ID
+	if row.ParentApprovalID != nil {
+		family = *row.ParentApprovalID
+	}
+	budget := policy.Budgets[snapshot.Rule.ID]
+	state, err := remediationState(ctx, tx, RemediationQuery{Service: snapshot.Service, RuleID: snapshot.Rule.ID, IncidentID: parent.ID, Since: now.Add(-budget.Window), Family: family})
+	if err != nil {
+		return "", err
+	}
+	switch {
+	case state.Stopped:
+		return "emergency stop is active: " + state.StopReason, nil
+	case state.BusyWith != 0:
+		return fmt.Sprintf("service %s is busy with approval %d", snapshot.Service, state.BusyWith), nil
+	case !primary:
+		return "", nil
+	case policy.Maintenance != "":
+		return "maintenance window: " + policy.Maintenance, nil
+	case budget.Max < 1 || state.Executions >= budget.Max:
+		return fmt.Sprintf("rule %s budget exhausted (%d executions in %s)", snapshot.Rule.ID, state.Executions, budget.Window), nil
+	case snapshot.Rule.Mode == incidentrule.ModeAuto && state.Blocked != "":
+		return "rule " + snapshot.Rule.ID + " is blocked: " + state.Blocked, nil
+	case snapshot.Rule.Mode == incidentrule.ModeAuto && state.IncidentActions > 0:
+		return "a primary action already ran in this incident; a new action needs a new authorization", nil
+	}
+	return "", nil
+}
+
+// ListExecutingApprovals returns executions interrupted by a previous process.
+func (db *DB) ListExecutingApprovals(ctx context.Context) ([]Approval, error) {
+	var rows []Approval
+	if err := db.WithContext(ctx).Where("status = ?", "executing").Order("id ASC").Find(&rows).Error; err != nil {
+		return nil, fmt.Errorf("store: list executing approvals: %w", err)
+	}
+	return rows, nil
+}
+
 func (db *DB) FinishExecution(ctx context.Context, completion ExecutionCompletion) error {
 	if completion.ApprovalID == 0 || completion.FinishedAt.IsZero() {
 		return errors.New("store: execution id and completion time required")
 	}
-	if completion.Status != "executed" && completion.Status != "simulated" && completion.Status != "failed" {
+	if completion.Status != "executed" && completion.Status != "aborted" && completion.Status != "failed" {
 		return errors.New("store: invalid execution final status")
 	}
 	if !json.Valid(completion.ResultJSON) {
@@ -153,116 +219,85 @@ func (db *DB) FinishExecution(ctx context.Context, completion ExecutionCompletio
 			if err != nil || !bytes.Equal(previous, bounded) {
 				return ErrApprovalConflict
 			}
-			if row.Status == "executed" {
-				var task VerifyTask
-				if err := tx.WithContext(ctx).First(&task, "approval_id = ?", row.ID).Error; err != nil {
-					return err
-				}
-			}
 			return nil
 		}
-		snapshot, err := incidentrule.ParseExecutionContext(row.ExecutionContext)
-		if err != nil {
-			return err
-		}
-		if (completion.Status == "executed" && snapshot.DryRun) || (completion.Status == "simulated" && !snapshot.DryRun) {
-			return errors.New("store: execution mode differs from approved snapshot")
+		// An old-format snapshot cannot be verified; its interrupted execution
+		// is recorded as failed with a manual check and nothing else.
+		snapshot, snapshotErr := incidentrule.ParseExecutionContext(row.ExecutionContext)
+		if snapshotErr != nil && completion.Status != "failed" {
+			return snapshotErr
 		}
 		if err := tx.WithContext(ctx).Model(&Approval{}).Where("id = ? AND status = ?", row.ID, "executing").Updates(map[string]any{"status": completion.Status, "result_json": bounded}).Error; err != nil {
 			return err
 		}
-		eventType := eventlog.EventExecutionCompleted
-		if completion.Status == "simulated" {
-			eventType = eventlog.EventExecutionSimulated
-		}
-		if completion.Status == "failed" {
-			eventType = eventlog.EventExecutionFailed
-		}
+		eventType := map[string]eventlog.EventType{"executed": eventlog.EventExecutionCompleted, "failed": eventlog.EventExecutionFailed, "aborted": eventlog.EventExecutionAborted}[completion.Status]
 		if err := appendApprovalEvent(ctx, tx, row, eventType, completion.Status, "approval execution "+completion.Status, now); err != nil {
 			return err
 		}
-		if completion.Status == "executed" {
-			task := VerifyTask{ApprovalID: row.ID, Status: "pending", NextCheckAt: now, DeadlineAt: now.Add(time.Duration(snapshot.Verification.WindowSeconds) * time.Second), CreatedAt: now}
+		switch completion.Status {
+		case "executed":
+			task := VerifyTask{ApprovalID: row.ID, Status: "pending", Phase: "verify", NextCheckAt: now, DeadlineAt: now.Add(time.Duration(snapshot.Verification.WindowSeconds) * time.Second), CreatedAt: now}
 			if err := tx.WithContext(ctx).Create(&task).Error; err != nil {
 				return err
 			}
 			if err := appendApprovalEvent(ctx, tx, row, eventlog.EventVerifyQueued, "pending", "recovery verification queued", now); err != nil {
 				return err
 			}
-		}
-		if !snapshot.DryRun {
-			var result struct {
-				Output string `json:"output"`
-				Error  string `json:"error"`
-			}
-			if err := json.Unmarshal(bounded, &result); err != nil {
+			if _, err := resolveIncidentProblem(ctx, tx, row.IncidentID, "execution_failed", &row.RunID, now); err != nil {
 				return err
 			}
-			brief := completion.Status + ": " + result.Output
-			if result.Error != "" {
-				brief += " " + result.Error
-			}
-			history := FaultCmdHistory{Fingerprint: incidentrule.FaultFingerprint(parent.GroupKey, incidentrule.SupportedAlert), ToolName: row.ToolName, ArgsJSON: row.ArgsJSON, ResultBrief: truncateStoreText(brief, 1024), ApprovalID: &row.ID, CreatedAt: now}
-			if err := tx.WithContext(ctx).Create(&history).Error; err != nil {
+		case "aborted":
+			if _, err := openIncidentProblem(ctx, tx, IncidentProblem{IncidentID: row.IncidentID, RunID: &row.RunID, Code: "execution_aborted", Severity: "warning", Summary: "action refused before writing: the approved snapshot no longer matched the live object", FirstSeenAt: now, LastSeenAt: now}); err != nil {
 				return err
 			}
-		}
-		if completion.Status == "failed" {
-			for _, code := range []string{"execution_failed", "manual_check"} {
+		case "failed":
+			codes := []string{"execution_failed"}
+			if completion.ManualCheck {
+				codes = append(codes, "manual_check")
+				// An unchanged read after timeout does not fence a late external write.
+				// Stop every new action until an operator reconciles the target and resumes.
+				if err := tx.WithContext(ctx).Create(&ControlEvent{Kind: ControlEmergencyStop, Actor: "system:execution",
+					Reason: fmt.Sprintf("approval %d outcome is unknown; reconcile before resuming", row.ID), CreatedAt: now}).Error; err != nil {
+					return err
+				}
+			}
+			for _, code := range codes {
 				if _, err := openIncidentProblem(ctx, tx, IncidentProblem{IncidentID: row.IncidentID, RunID: &row.RunID, Code: code, Severity: "error", Summary: "execution failed or result uncertain; manual verification required", FirstSeenAt: now, LastSeenAt: now}); err != nil {
 					return err
 				}
 			}
-		} else if _, err := resolveIncidentProblem(ctx, tx, row.IncidentID, "execution_failed", &row.RunID, now); err != nil {
-			return err
+		}
+		if completion.Change != nil && completion.Status == "executed" {
+			change := *completion.Change
+			change.ApprovalID, change.Source, change.IdempotencyKey = &row.ID, "agent", fmt.Sprintf("approval-%d", row.ID)
+			change.OccurredAt, change.CreatedAt = now, now
+			// A rollback returns to a recorded release: it inherits that release's
+			// declared migration and verification, which the next rollback reads.
+			if change.ChangeType == "rollback" && change.ReleaseID != nil {
+				var target ChangeEvent
+				if err := tx.WithContext(ctx).Where("service = ? AND change_type = ? AND release_id = ?", change.Service, "release", *change.ReleaseID).Order("id DESC").Limit(1).Find(&target).Error; err != nil {
+					return err
+				}
+				change.DBMigration, change.VerifiedAt = target.DBMigration, target.VerifiedAt
+			}
+			if err := insertChange(ctx, tx, change); err != nil {
+				return err
+			}
+		}
+		if snapshotErr == nil && snapshot.Kind == incidentrule.KindPrimary && completion.Status != "aborted" {
+			var result struct {
+				Detail string `json:"detail"`
+				Error  string `json:"error"`
+			}
+			_ = json.Unmarshal(bounded, &result)
+			brief := strings.TrimSpace(completion.Status + ": " + result.Detail + " " + result.Error)
+			history := FaultCmdHistory{Fingerprint: incidentrule.FaultFingerprint(parent.GroupKey, snapshot.FaultAlert), ToolName: row.ToolName, ArgsJSON: row.ArgsJSON, ResultBrief: truncateStoreText(brief, 1024), ApprovalID: &row.ID, CreatedAt: now}
+			if err := tx.WithContext(ctx).Create(&history).Error; err != nil {
+				return err
+			}
 		}
 		return nil
 	}, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
-}
-
-// RecoverExecutingApprovals is intentionally conservative and single-instance only.
-// A committed executed/simulated row is never reclassified or re-executed.
-func (db *DB) RecoverExecutingApprovals(ctx context.Context, now time.Time) (recovered int64, err error) {
-	if now.IsZero() {
-		return 0, errors.New("store: recovery time required")
-	}
-	var rows []Approval
-	if err := db.WithContext(ctx).Where("status = ?", "executing").Order("id ASC").Find(&rows).Error; err != nil {
-		return 0, err
-	}
-	for _, candidate := range rows {
-		changed := false
-		err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			row, _, err := lockApproval(ctx, tx, candidate.ID)
-			if err != nil {
-				return err
-			}
-			if row.Status != "executing" {
-				return nil
-			}
-			result := datatypes.JSON(`{"error":"executor interrupted; manual verification required","manual_check":true}`)
-			if err := tx.WithContext(ctx).Model(&Approval{}).Where("id = ? AND status = ?", row.ID, "executing").Updates(map[string]any{"status": "failed", "result_json": result}).Error; err != nil {
-				return err
-			}
-			if err := appendApprovalEvent(ctx, tx, row, eventlog.EventExecutionFailed, "failed", "execution interrupted; manual verification required", now); err != nil {
-				return err
-			}
-			for _, code := range []string{"manual_check", "execution_failed"} {
-				if _, err := openIncidentProblem(ctx, tx, IncidentProblem{IncidentID: row.IncidentID, RunID: &row.RunID, Code: code, Severity: "critical", Summary: "manual verification required after interrupted execution", FirstSeenAt: now, LastSeenAt: now}); err != nil {
-					return err
-				}
-			}
-			changed = true
-			return nil
-		})
-		if err != nil {
-			return recovered, err
-		}
-		if changed {
-			recovered++
-		}
-	}
-	return recovered, nil
 }
 
 const maxExecutionResultBytes = 8192
@@ -275,21 +310,4 @@ func boundedExecutionResult(result []byte) datatypes.JSON {
 	digest := sha256.Sum256(result)
 	bounded, _ := json.Marshal(map[string]any{"truncated": true, "reason": "execution result omitted", "result_sha256": fmt.Sprintf("%x", digest)})
 	return datatypes.JSON(bounded)
-}
-
-// CountRecentExecutions deliberately does not use PlanHash: snapshot membership
-// and timing change the content hash, but must not reset the action/target budget.
-func (db *DB) CountRecentExecutions(ctx context.Context, toolName, targetName string, since time.Time) (int, error) {
-	if strings.TrimSpace(toolName) == "" || strings.TrimSpace(targetName) == "" {
-		return 0, errors.New("store: rate limit tool and target required")
-	}
-	var count int64
-	err := db.WithContext(ctx).Table("approval").Distinct("approval.id").
-		Joins("JOIN incident_event ON incident_event.approval_id = approval.id AND incident_event.event_type = ?", eventlog.EventExecutionStarted).
-		Where("approval.tool_name = ? AND JSON_UNQUOTE(JSON_EXTRACT(approval.args_json, '$.target_name')) = ? AND incident_event.created_at >= ?", toolName, targetName, since).
-		Where("approval.execution_context IS NULL OR JSON_UNQUOTE(JSON_EXTRACT(approval.execution_context, '$.dry_run')) = 'false'").Count(&count).Error
-	if err != nil {
-		return 0, fmt.Errorf("store: count executions: %w", err)
-	}
-	return int(count), nil
 }

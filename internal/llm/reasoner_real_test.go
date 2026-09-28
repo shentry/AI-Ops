@@ -29,7 +29,7 @@ func TestReasonerAgainstRealLLM(t *testing.T) {
 
 	registry := tools.NewRegistry()
 	if err := registry.Register(tools.ToolSpec{
-		Name: tools.ToolPromSeriesMeta, Description: "List series metadata for a selector", Level: tools.L1ReadOnly,
+		Name: tools.ToolPromSeriesMeta, Description: "List series metadata for a selector",
 		Timeout: 10 * time.Second, MaxOutput: 1024,
 		Params: []tools.ParamSpec{{Name: "match", Description: "series selector", Required: true}},
 		Handler: func(context.Context, json.RawMessage) (string, error) {
@@ -74,7 +74,7 @@ container_state:
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	result, err := reasoner.Diagnose(ctx, evidence, os.Getenv("TEST_LLM_MODE"))
+	result, err := reasoner.Diagnose(ctx, evidence, os.Getenv("TEST_LLM_MODE"), nil)
 	if err != nil {
 		t.Fatalf("Diagnose() error = %v", err)
 	}

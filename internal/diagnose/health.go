@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"oncall-agent/internal/incident"
+	"oncall-agent/internal/tools"
 )
 
 // VerificationObservation is a single read, not a recovery verdict. The worker
@@ -68,7 +69,7 @@ func readHTTPHealth(ctx context.Context, client *http.Client, baseURL string) he
 }
 
 func verifyText(text string) string {
-	text = Sanitize(ToSafeText(text))
+	text = tools.Sanitize(tools.ToSafeText(text))
 	runes := []rune(text)
 	if len(runes) <= 480 {
 		return text

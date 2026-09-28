@@ -43,22 +43,22 @@ func pgPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 // 连通性、连接数、等待中的会话数。DSN 未配置时记 missing。
 // DSN 里的密码只用于建连，正文只落统计数字，错误经 finishItem 脱敏。
 type postgresCollector struct {
-	cfg config.EvidenceConfig
+	dsn     string
+	timeout time.Duration
 }
 
-func NewPostgresCollector(cfg config.EvidenceConfig) Collector {
-	return &postgresCollector{cfg: cfg}
+func NewPostgresCollector(service config.ServiceConfig, evidence config.EvidenceConfig) Collector {
+	return &postgresCollector{dsn: service.PostgresDSN, timeout: time.Duration(evidence.TimeoutSeconds) * time.Second}
 }
 
 func (*postgresCollector) Name() string { return "postgres" }
 
 func (c *postgresCollector) Collect(ctx context.Context, _ Target) EvidenceItem {
-	dsn := strings.TrimSpace(c.cfg.PostgresDSN)
+	dsn := strings.TrimSpace(c.dsn)
 	if dsn == "" {
 		return missingItem(c.Name(), "postgres:pg_stat_activity", "postgres dsn is not configured")
 	}
-	timeout := time.Duration(c.cfg.TimeoutSeconds) * time.Second
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 	pool, err := pgPool(ctx, dsn)
 	if err != nil {

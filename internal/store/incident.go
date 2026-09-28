@@ -340,7 +340,7 @@ func ExecutionMembersFromAlerts(alerts []Alert) ([]incidentrule.ExecutionMember,
 		if err := json.Unmarshal(alert.Labels, &labels); err != nil {
 			return nil, fmt.Errorf("store: invalid labels for alert %d", alert.ID)
 		}
-		members = append(members, incidentrule.ExecutionMember{Fingerprint: alert.Fingerprint, Name: alert.Name, Status: alert.Status, Container: labels["container"], Service: labels["service"]})
+		members = append(members, incidentrule.ExecutionMember{Fingerprint: alert.Fingerprint, Name: alert.Name, Status: alert.Status, Service: labels["service"]})
 	}
 	return members, nil
 }

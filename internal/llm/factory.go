@@ -94,13 +94,14 @@ func (f *Factory) Build() (model.ToolCallingChatModel, error) {
 	return f.buildLocked()
 }
 
-// buildForDiagnosis snapshots the client and its window under the same lock;
-// a concurrent model switch must not pair the old client with new limits.
-func (f *Factory) buildForDiagnosis() (model.ToolCallingChatModel, int, error) {
+// buildForDiagnosis snapshots the client, its model id and window under the same
+// lock; a concurrent model switch must not pair the old client with new limits
+// or record a model the request did not use.
+func (f *Factory) buildForDiagnosis() (model.ToolCallingChatModel, string, int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	client, err := f.buildLocked()
-	return client, f.contextWindowTokens - f.cfg.Roles.Reasoner.MaxTokens - 512, err
+	return client, f.cfg.Roles.Reasoner.Model, f.contextWindowTokens - f.cfg.Roles.Reasoner.MaxTokens - 512, err
 }
 
 func (f *Factory) buildLocked() (model.ToolCallingChatModel, error) {

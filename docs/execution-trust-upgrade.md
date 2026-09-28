@@ -1,6 +1,11 @@
 # Execution-trust 离线升级与回退
 
-对应 [设计 §9.3](execution-trust-design.md#93-发布迁移)。适用 **MySQL 8、单实例、先停旧进程再启新进程**；不支持新旧 server 重叠运行。历史迁移 001–008 不改写。以下命令从仓库根目录执行；数据库和服务进程必须由操作者明确确认，不要直接照搬测试库到业务环境。
+对应 [设计 §9.3](execution-trust-design.md#93-发布迁移) 和 [自动处置方案 §5.2、§9](production-auto-remediation-plan.md)。当前版本包含迁移 **001–015**。适用 **MySQL 8、单实例、先停旧进程再启新进程**；不支持新旧 server 重叠运行。历史迁移不改写。以下命令从仓库根目录执行；数据库和服务进程必须由操作者明确确认，不要直接照搬测试库到业务环境。
+
+- 已有 001–008 的库：按下文第 1–3 步完整执行（退役旧审批，再执行 009–015）。
+- 已有 009–011 的库：执行第 1 步和“从 011 升级到 015”，再做第 3 步。
+- 已有 001–014 的库：停进程并备份后执行 `migrations/015_notification_task.sql`，再运行 `-check`；新版本授权摘要会使旧待执行审批失效，旧在途验证因授权不匹配进入人工核查。
+- 空库：按文件名顺序执行全部迁移一次。
 
 ## 不变量与命令
 
@@ -25,7 +30,7 @@ go run ./cmd/retire-approvals -apply
 
 每张审批独立事务，依次锁 Incident、审批并重新检查状态/SQL NULL；审批状态、事件、必要问题一起提交。某张失败会停止，前面已提交的审批保持提交。输出数量只包含数据库确认提交的行。提交回包丢失时不推断该行是否提交；排查数据库后离线重跑即可，已终结的行不会重复产生事件/问题。命令有一分钟超时，超时同样允许重跑，不需要手工重置状态。
 
-`-check` 与 server 启动前使用同一个 `CheckExecutionReady`：检查 009 的 simulated 状态、execution_context 列，010 验证队列表字段/索引、011 准入/队列索引，并拒绝残留的 active NULL-context 审批。检查不写数据，不自动迁移、不隐式失效审批。它不是全库一致性审计，也不校验每张现代快照的内容；现代快照仍由裁决/领取时的契约校验把关。
+`-check` 与 server 启动前使用同一个 `CheckExecutionReady`：检查 009–014 的执行、验证、诊断及处置表字段/索引，以及 015 的持久通知表，并拒绝残留的 active NULL-context 审批。检查不写数据，不自动迁移、不隐式失效审批。现代快照由裁决、领取、恢复及验证的契约检查把关。离线退役事件标记为 `phase=upgrade`，由维护人处理，因此该命令仍可在迁移 015 之前运行。
 
 ## 升级步骤（已有 001–008 数据库）
 
@@ -67,18 +72,15 @@ go run ./cmd/retire-approvals -apply
 mysql --login-path=oncall-maint "$DB_NAME" -e \
   "SELECT COUNT(*) AS remaining_legacy_active FROM approval WHERE status IN ('pending','approved','executing')"
 # 此时应为 0；有错误或残留则停止排查，不启动 server。
-for migration in \
-  migrations/009_approval_execution_context.sql \
-  migrations/010_verify_task.sql \
-  migrations/011_queue_admission_indexes.sql; do
+for migration in migrations/009_*.sql migrations/01[0-5]_*.sql; do
   mysql --login-path=oncall-maint "$DB_NAME" < "$migration"
 done
 go run ./cmd/retire-approvals -check
 ```
 
-MySQL DDL 会隐式提交，009–011 **不是一个事务，也不是可整批重复执行的幂等脚本**。任何失败都应保持停机，检查 `SHOW CREATE TABLE` / 索引及已执行语句，确认进度后只执行尚未完成的 DDL；不盲目重跑、不改历史迁移。如果 009 已先执行，维护命令仍可处理 NULL-context 活跃记录，现代非 NULL 快照不受影响；全部完成后再 `-check`。
+MySQL DDL 会隐式提交，009–015 **不是一个事务，也不是可整批重复执行的幂等脚本**。任何失败都应保持停机，检查 `SHOW CREATE TABLE` / 索引及已执行语句，确认进度后只执行尚未完成的 DDL；不盲目重跑、不改历史迁移。如果 009 已先执行，维护命令仍可处理 NULL-context 活跃记录，现代非 NULL 快照不受影响；全部完成后再 `-check`。
 
-空库则按文件名顺序执行 **001–011 全部迁移一次**，无需退役数据：
+空库则按文件名顺序执行 **全部迁移一次**，无需退役数据：
 
 ```sh
 for migration in migrations/*.sql; do
@@ -86,6 +88,28 @@ for migration in migrations/*.sql; do
 done
 go run ./cmd/retire-approvals -check
 ```
+
+### 从 011 升级到 015（多动作自动处置）
+
+012–015 同样是**离线迁移**：先按第 1 步停入口、停进程、备份。执行快照为版本 3，规则、服务配置、验证标准都绑定授权摘要；新增持久通知保证故障结果提交后仍可重试投递。旧快照不会被默认为新授权：
+
+| 升级时的旧记录 | 新进程的处理 |
+|---|---|
+| pending / approved 的旧快照 | 领取时判定失效（expired），不执行；需要时重新诊断生成新快照 |
+| 未完成的旧 verify_task | 结束为 inconclusive，需人工确认目标状态 |
+| executing 的旧审批 | 按结果未知处理：failed + `manual_check`，不重放 |
+| 历史终态 | 不动；没有规则 ID 的旧执行不计入任何规则预算或阻断 |
+
+因此升级前最好等在途执行和验证结束，并把仍要处理的待审批单先在旧版本裁决或放弃。然后：
+
+```sh
+for migration in migrations/01[2-5]_*.sql; do
+  mysql --login-path=oncall-maint "$DB_NAME" < "$migration"
+done
+go run ./cmd/retire-approvals -check
+```
+
+失败时的处理与上面相同：保持停机，确认已执行到哪条语句，只补执行未完成的 DDL。
 
 ### 3. 检查事实、配置与构建，最后启服务
 
@@ -106,8 +130,10 @@ SQL
 
 最后两个计数应为 0。与备份比对历史终态、Hash、裁决及命令记录；历史 NULL 上下文仍表示“旧版未知”，不是验证成功。
 
-- 删除 `approval.verify_delay_seconds`；按新配置设置独立的 `diagnose.verification.timeout_seconds / interval_seconds / window_seconds`，满足 `0 < timeout < interval < window` 且 `timeout < 30`。
-- 明确 `server.listen_addr` 与可信网络边界。升级首次运行保持 `approval.dry_run: true`；不要为试运行启用真实动作。
+- 配置按 [config.example.yaml](../config.example.yaml) 重写，已删除的键会让启动失败：`approval.dry_run`、`approval.auto_execute_l2`、`approval.verify_delay_seconds`、`tools.docker`、`diagnose.evidence` 下的目标地址（`docker_container`、`sub2api_base_url`、`postgres_dsn`、`redis_addr`）和 `diagnose.verification`。
+- 被监控服务的身份、容器、健康地址、管理密钥和发布入口只写在 `service`；恢复验证参数在 `remediation.verification`（`0 < timeout < interval < window`、`timeout < 30`、连续通过次数和复发观察窗口）。
+- 处置规则写在 `remediation.rules`，同时设置 `rules_version`。升级后首次运行把所有规则设为 `observe`：只记录本会采取的动作，不产生写操作；核对无误后逐条改为 `manual`，完成演练后才改为 `auto`。
+- 控制台没有匿名访问：启用 `web.base_url` 时必须配置 `web.operators`（令牌只存 SHA-256）。明确 `server.listen_addr` 与可信网络边界。
 - 使用新配置，不用旧配置启动新二进制。先构建前端，再构建包含该前端的 Go 二进制：
 
 ```sh
@@ -117,7 +143,7 @@ go build -o bin/oncall-agent ./cmd/server
 CONFIG_FILE=/secure/config/oncall-new.yaml ./bin/oncall-agent
 ```
 
-在可信入口执行新诊断/新审批，验证新 Hash/快照、simulated 和事件链，无 verify_task/真实变更；旧待审批不能复活。完成独立部署验收、处理人工核查问题后，才能明确决策允许真实动作并恢复全部入口。本维护脚本的通过不替代前端、工具调用、健康验证或真实故障实验验收。
+在可信入口触发新诊断，确认 observe 规则只在 policy 步骤记录“would …”，没有审批、verify_task 或真实变更；旧待审批不能复活。完成独立部署验收、处理人工核查问题后，才能逐条把规则改为 manual/auto 并恢复全部入口。本维护脚本的通过不替代前端、工具调用、健康验证或真实故障实验验收。
 
 ## 回退（不能只换回旧二进制）
 
@@ -150,6 +176,6 @@ export MYSQL_TEST_APP_PASSWORD
 bash tests/migrations/execution-upgrade.sh
 ```
 
-覆盖空库顺序 001–011；含七种旧状态的 001–008 库通过真实 `go run ./cmd/retire-approvals -apply` 再升级 009–011；逐阶段只读 preflight 拒绝；现代快照/旧终态保护；重复命令；事件/问题触发器故障回滚；提交前取消只统计成功提交；两个维护者同时看见同一候选的行锁幂等性。常规 store 测试使用 `TEST_MYSQL_DSN`，迁移测试额外要求 `TEST_EXECUTION_UPGRADE_MODE=empty|legacy` 且目标库为空，否则拒绝；脚本显式设置这些参数，不会把 skip 算作通过。
+覆盖空库顺序 001–015；含七种旧状态的 001–008 库通过真实 `go run ./cmd/retire-approvals -apply` 再升级 009–015；逐阶段只读 preflight 拒绝；现代快照/旧终态保护；重复命令；事件/问题触发器故障回滚；提交前取消只统计成功提交；两个维护者同时看见同一候选的行锁幂等性。常规 store 测试使用 `TEST_MYSQL_DSN`，迁移测试额外要求 `TEST_EXECUTION_UPGRADE_MODE=empty|legacy` 且目标库为空，否则拒绝；脚本显式设置这些参数，不会把 skip 算作通过。
 
 证据输出到 `/tmp/oncall-execution-acceptance/upgrade-<UTC>_<PID>/verification.log`（实际目录时间/PID 以脚本输出为准，可用 `EXECUTION_UPGRADE_EVIDENCE_DIR` 覆盖）。测试数据会按测试清理，新建库结构保留用于检查。该日志仅证明离线迁移/维护范围，不代表整个 execution-trust 目标或真实故障发布验收已完成。

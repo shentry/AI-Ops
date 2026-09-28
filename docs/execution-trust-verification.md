@@ -1,5 +1,7 @@
 # 执行安全与恢复验证：实施与验收记录
 
+> 历史记录：本文记录执行安全阶段的验收，其中的 dry-run、匿名控制台和 001–011 迁移已被后续改造取代；当前状态见[生产自动处置实施方案 §13](production-auto-remediation-plan.md#13-实施状态2026-09-25)。
+
 对应 [execution-trust-design.md](execution-trust-design.md)。范围保持单实例 Go 单体、MySQL 持久队列、可信网络匿名控制台；未向业务环境发布，未提交 Git commit。
 
 ## 验证环境与结果

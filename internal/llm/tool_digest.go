@@ -4,39 +4,18 @@ import (
 	"encoding/json"
 	"math"
 	"strconv"
-	"strings"
 
 	"oncall-agent/internal/tools"
 )
 
 // compactToolResult uses known tool formats only. Unknown, malformed or already
 // truncated data is kept intact instead of guessing which facts can be dropped.
+// docker_logs needs no digest here: the tool already returns pattern counts.
 func compactToolResult(name, content string) string {
 	var compacted string
 	switch name {
 	case tools.ToolPromRangeQuery:
 		compacted = compactRangeResult(content)
-	case tools.ToolDockerLogs:
-		lines := strings.Split(content, "\n")
-		type run struct {
-			Line  string `json:"line"`
-			Count int    `json:"count"`
-		}
-		var runs []run
-		for _, line := range lines {
-			if len(runs) > 0 && runs[len(runs)-1].Line == line {
-				runs[len(runs)-1].Count++
-			} else {
-				runs = append(runs, run{Line: line, Count: 1})
-			}
-		}
-		encoded, err := json.Marshal(struct {
-			Compacted bool  `json:"compacted"`
-			Runs      []run `json:"ordered_line_runs"`
-		}{true, runs})
-		if err == nil {
-			compacted = string(encoded)
-		}
 	}
 	if compacted != "" && len(compacted) < len(content) {
 		return compacted

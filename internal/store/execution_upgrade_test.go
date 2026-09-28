@@ -212,8 +212,8 @@ func TestExecutionUpgradeMigrations(t *testing.T) {
 		t.Fatal("empty database passed preflight")
 	}
 	files, err := filepath.Glob("../../migrations/*.sql")
-	if err != nil || len(files) != 11 {
-		t.Fatalf("expected migrations 001–011: %v %v", files, err)
+	if err != nil || len(files) != 15 {
+		t.Fatalf("expected migrations 001–015: %v %v", files, err)
 	}
 	var history []Approval
 	for i, path := range files {
@@ -250,7 +250,7 @@ func TestExecutionUpgradeMigrations(t *testing.T) {
 				t.Fatalf("repeat command changed rows: %s", out)
 			}
 		}
-		if i >= 7 && i < 10 {
+		if i >= 7 && i < len(files)-1 {
 			if err := db.CheckExecutionReady(ctx); err == nil {
 				t.Fatalf("schema through %s passed incomplete preflight", path)
 			} else {
@@ -312,10 +312,11 @@ func upgradeApproval(t *testing.T, db *DB, status string, modern bool) Approval 
 	actor, reason, source := "legacy-operator", "original decision", "web"
 	result := datatypes.JSON(`{"original":"must survive unless executing"}`)
 	row := Approval{IncidentID: incident.ID, RunID: run.ID, ToolName: "docker_restart", ArgsJSON: datatypes.JSON(`{"target_name":"sub2api"}`), Reason: "original reason", PlanHash: strings.Repeat("a", 64), Status: status, ExpiresAt: now.Add(time.Hour), DecidedBy: &actor, DecidedAt: &now, DecisionReason: &reason, DecisionSource: &source, ResultJSON: &result, CreatedAt: now}
-	query := db.Omit("ExecutionContext", "Verification") // Works before 009 too.
+	// Works before 009 and 014 too: columns those migrations add are omitted.
+	query := db.Omit("ExecutionContext", "Verification", "Service", "RuleID", "ParentApprovalID", "OperationID", "OperationStartedAt")
 	if modern {
-		row.ExecutionContext = datatypes.JSON(`{"safety_level":"L2","dry_run":true,"verification":{"kind":"sub2api_http_health","target_name":"sub2api","base_url":"http://127.0.0.1:8080","member_fingerprints":["fixture"],"interval_seconds":10,"window_seconds":120,"timeout_seconds":5}}`)
-		query = db.Omit("Verification")
+		row.ExecutionContext = datatypes.JSON(`{"version":2,"safety_level":"L2","dry_run":true,"verification":{"kind":"sub2api_http_health","target_name":"sub2api","base_url":"http://127.0.0.1:8080","member_fingerprints":["fixture"],"interval_seconds":10,"window_seconds":120,"timeout_seconds":5,"required_passes":1}}`)
+		query = db.Omit("Verification", "Service", "RuleID", "ParentApprovalID", "OperationID", "OperationStartedAt")
 	}
 	if err := query.Create(&row).Error; err != nil {
 		t.Fatal(err)

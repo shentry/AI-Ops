@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"crypto/subtle"
 	"errors"
 	"net/http"
 	"strings"
@@ -20,18 +19,16 @@ type approvalService interface {
 	Get(ctx context.Context, id uint64) (store.Approval, error)
 }
 
-// ApprovalAPI exposes approval decisions and list/query operations. Automation
-// authenticates with the Bearer token; the browser reaches the same handlers
-// through the public console, which requires no login and records a fixed
-// anonymous operator on every decision.
+// ApprovalAPI exposes approval decisions and list/query operations. Reads accept
+// any identity including automation; a decision needs an operator whose identity
+// the server proved (session or personal token), and records that identity.
 type ApprovalAPI struct {
-	svc       approvalService
-	authToken string
-	console   *Console
+	svc  approvalService
+	auth *Auth
 }
 
-func NewApprovalAPI(svc approvalService, authToken string, console *Console) *ApprovalAPI {
-	return &ApprovalAPI{svc: svc, authToken: authToken, console: console}
+func NewApprovalAPI(svc approvalService, auth *Auth) *ApprovalAPI {
+	return &ApprovalAPI{svc: svc, auth: auth}
 }
 
 func (h *ApprovalAPI) Handle(r *ghttp.Request) {
@@ -43,12 +40,12 @@ func (h *ApprovalAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "approval service unavailable")
 		return
 	}
-	web, ok := h.authenticate(r)
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
 	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/approvals"), "/")
+	if r.Method == http.MethodGet {
+		if _, ok := h.auth.Require(w, r, RoleViewer, true); !ok {
+			return
+		}
+	}
 	if rest == "" {
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -97,19 +94,13 @@ func (h *ApprovalAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	actor, ok := h.auth.Require(w, r, RoleOperator, false)
+	if !ok {
+		return
+	}
 	id, err := parseIncidentID(parts[0])
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid approval id")
-		return
-	}
-	operator := strings.TrimSpace(r.Header.Get("X-Operator"))
-	source := "api"
-	if web {
-		actor, _ := h.console.Actor()
-		operator = actor.ID
-		source = "web"
-	} else if operator == "" {
-		writeError(w, http.StatusBadRequest, "X-Operator header is required")
 		return
 	}
 	var input struct {
@@ -120,20 +111,7 @@ func (h *ApprovalAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "plan_hash and reason are required")
 		return
 	}
-	h.decide(w, r, id, parts[1] == "approve", strings.TrimSpace(input.PlanHash), operator, *input.Reason, source)
-}
-
-// authenticate reports whether the caller is allowed and whether the request
-// arrived through the browser console rather than Bearer automation. The two
-// channels differ only in the operator recorded on a decision.
-func (h *ApprovalAPI) authenticate(r *http.Request) (web bool, ok bool) {
-	if r != nil && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+h.authToken)) == 1 {
-		return false, true
-	}
-	if _, enabled := h.console.Actor(); !enabled {
-		return false, false
-	}
-	return true, true
+	h.decide(w, r, id, parts[1] == "approve", strings.TrimSpace(input.PlanHash), actor.ID, *input.Reason, actor.Source)
 }
 
 func (h *ApprovalAPI) decide(w http.ResponseWriter, r *http.Request, id uint64, approve bool, planHash, operator, reason, source string) {

@@ -7,7 +7,6 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"oncall-agent/internal/incident"
 	"oncall-agent/internal/store"
 )
 
@@ -57,9 +56,10 @@ func (f fakeControlRoomStore) GetApproval(context.Context, uint64) (store.Approv
 	return store.Approval{}, store.ErrApprovalNotFound
 }
 
-func TestControlRoomRejectsRequestsWhenConsoleIsDisabled(t *testing.T) {
-	api := NewControlRoomAPI(fakeControlRoomStore{incident: store.Incident{ID: 1, Status: "open"}}, nil)
+func TestControlRoomRejectsAnonymousRequests(t *testing.T) {
+	api := NewControlRoomAPI(fakeControlRoomStore{incident: store.Incident{ID: 1, Status: "open"}}, testAuth(t))
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/incidents/1/control-room", nil)
+	req.Header.Set("X-Operator", "admin")
 	resp := httptest.NewRecorder()
 	api.ServeHTTP(resp, req)
 	if resp.Code != http.StatusUnauthorized {
@@ -71,8 +71,8 @@ func TestControlRoomReturnsMembersAndLatestEvents(t *testing.T) {
 	api := NewControlRoomAPI(fakeControlRoomStore{
 		incident: store.Incident{ID: 8, Status: "open", Title: "cpu"},
 		events:   []store.IncidentEvent{{ID: 12, IncidentID: 8, EventType: "run.started", Phase: "diagnose", Status: "running", Summary: "started"}},
-	}, NewConsole())
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/incidents/8/control-room", nil)
+	}, testAuth(t))
+	req := withBearer(httptest.NewRequest(http.MethodGet, "/api/v1/incidents/8/control-room", nil), testViewerToken)
 	resp := httptest.NewRecorder()
 	api.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
@@ -89,15 +89,15 @@ func TestControlRoomReturnsMembersAndLatestEvents(t *testing.T) {
 	}
 }
 
-func TestControlRoomAllowsAnonymousConsole(t *testing.T) {
-	api := NewControlRoomAPI(
-		fakeControlRoomStore{incident: store.Incident{ID: 9, Status: "open"}},
-		NewConsole(),
-	)
+func TestControlRoomAllowsViewerSession(t *testing.T) {
+	auth := testAuth(t)
+	api := NewControlRoomAPI(fakeControlRoomStore{incident: store.Incident{ID: 9, Status: "open"}}, auth)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/incidents/9/control-room", nil)
+	req.AddCookie(login(t, auth, testViewerToken))
 	resp := httptest.NewRecorder()
-	api.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/api/v1/incidents/9/control-room", nil))
+	api.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
-		t.Fatalf("anonymous console = %d body=%s", resp.Code, resp.Body.String())
+		t.Fatalf("viewer session = %d body=%s", resp.Code, resp.Body.String())
 	}
 }
 
@@ -111,9 +111,9 @@ func TestControlRoomLatestActionIndependentOfPending(t *testing.T) {
 		if pending {
 			rows = append(rows, completeApproval(t))
 		}
-		api := NewControlRoomAPI(fakeControlRoomStore{incident: store.Incident{ID: 11, Status: "firing"}, approvals: rows}, NewConsole())
+		api := NewControlRoomAPI(fakeControlRoomStore{incident: store.Incident{ID: 11, Status: "firing"}, approvals: rows}, testAuth(t))
 		resp := httptest.NewRecorder()
-		api.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/api/v1/incidents/11/control-room", nil))
+		api.ServeHTTP(resp, withBearer(httptest.NewRequest(http.MethodGet, "/api/v1/incidents/11/control-room", nil), testViewerToken))
 		var body ControlRoomDTO
 		if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
 			t.Fatal(err)
@@ -128,19 +128,10 @@ func TestControlRoomLatestActionIndependentOfPending(t *testing.T) {
 }
 
 func TestControlRoomFlowUsesTerminalSnapshotWhenEventsAreAbsent(t *testing.T) {
-	for _, status := range []string{"simulated", "denied", "expired", "failed", "executed"} {
+	for _, status := range []string{"aborted", "denied", "expired", "failed", "executed"} {
 		t.Run(status, func(t *testing.T) {
 			row := completeApproval(t)
 			row.Status = status
-			if status == "simulated" {
-				snapshot, err := incident.ParseExecutionContext(row.ExecutionContext)
-				if err != nil {
-					t.Fatal(err)
-				}
-				snapshot.DryRun = true
-				row.ExecutionContext, _ = json.Marshal(snapshot)
-				row.PlanHash, _ = incident.PlanHash(row.ToolName, row.ArgsJSON, row.ExecutionContext)
-			}
 			var events []store.IncidentEvent
 			wantVerification := "not_applicable"
 			if status == "executed" {
@@ -148,9 +139,9 @@ func TestControlRoomFlowUsesTerminalSnapshotWhenEventsAreAbsent(t *testing.T) {
 				events = []store.IncidentEvent{{EventType: "verify.passed", Status: "passed"}}
 				wantVerification = "passed" // Use the task verdict, not generic event completion.
 			}
-			handler := NewControlRoomAPI(fakeControlRoomStore{incident: store.Incident{ID: 11, Status: "firing"}, approvals: []store.Approval{row}, events: events}, NewConsole())
+			handler := NewControlRoomAPI(fakeControlRoomStore{incident: store.Incident{ID: 11, Status: "firing"}, approvals: []store.Approval{row}, events: events}, testAuth(t))
 			response := httptest.NewRecorder()
-			handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/incidents/11/control-room", nil))
+			handler.ServeHTTP(response, withBearer(httptest.NewRequest(http.MethodGet, "/api/v1/incidents/11/control-room", nil), testViewerToken))
 			var body ControlRoomDTO
 			if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || response.Code != http.StatusOK {
 				t.Fatalf("response=%s err=%v", response.Body.String(), err)

@@ -9,38 +9,46 @@ import (
 	"io"
 	"log"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
+
+	"gorm.io/datatypes"
 
 	"oncall-agent/internal/incident"
+	"oncall-agent/internal/llm"
 	"oncall-agent/internal/store"
 	"oncall-agent/internal/tools"
 )
 
-// fakeExecStore controls only the external persistence seam. In particular it
-// does not pretend to prove MySQL locking, atomic side effects or scope checks.
-// Claims are deliberately permissive to exercise the executor's fail-closed guard.
+// fakeExecStore mimics the store's claim/finish contract in memory.
 type fakeExecStore struct {
-	rows          []store.Approval
-	bindings      []incident.ExecutionBinding
-	attempts      []store.ExecutionCompletion
-	committed     map[uint64]store.ExecutionCompletion
-	nextErr       error
-	claimErr      error
-	recoveryErr   error
-	recoveryCalls int
-	claim         func(*store.Approval, incident.ExecutionBinding) bool
-	finish        func(store.ExecutionCompletion, int) error
+	mu        sync.Mutex
+	rows      []store.Approval
+	policies  []store.RemediationPolicy
+	claim     func(*store.Approval) bool
+	finish    func(store.ExecutionCompletion, int) error
+	attempts  []store.ExecutionCompletion
+	committed map[uint64]store.ExecutionCompletion
+	nextErr   error
+	claimErr  error
+	listErr   error
+	leaseErr  error
 }
 
 func newFakeExecStore(rows ...store.Approval) *fakeExecStore {
-	return &fakeExecStore{rows: rows, committed: make(map[uint64]store.ExecutionCompletion)}
+	return &fakeExecStore{rows: rows, committed: map[uint64]store.ExecutionCompletion{}}
 }
+
+func (f *fakeExecStore) CheckExecutionLease(context.Context) error { return f.leaseErr }
 
 func (f *fakeExecStore) NextApprovedApproval(ctx context.Context, _ time.Time) (store.Approval, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return store.Approval{}, false, err
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.nextErr != nil {
 		return store.Approval{}, false, f.nextErr
 	}
@@ -52,37 +60,47 @@ func (f *fakeExecStore) NextApprovedApproval(ctx context.Context, _ time.Time) (
 	return store.Approval{}, false, nil
 }
 
-func (f *fakeExecStore) ClaimApprovalExecution(_ context.Context, id uint64, _ time.Time, binding incident.ExecutionBinding) (store.Approval, bool, error) {
-	f.bindings = append(f.bindings, binding)
+func (f *fakeExecStore) ClaimApprovalExecution(_ context.Context, id uint64, _ time.Time, policy store.RemediationPolicy) (store.Approval, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.policies = append(f.policies, policy)
 	if f.claimErr != nil {
 		return store.Approval{}, false, f.claimErr
 	}
 	for i := range f.rows {
-		row := &f.rows[i]
-		if row.ID != id || row.Status != "approved" {
+		if f.rows[i].ID != id {
 			continue
 		}
-		if f.claim != nil && !f.claim(row, binding) {
-			return *row, false, nil
+		row := f.rows[i]
+		if f.claim != nil && !f.claim(&row) {
+			f.rows[i].Status = "expired"
+			return f.rows[i], false, nil
 		}
-		row.Status = "executing"
-		return *row, true, nil
+		operation, now := fmt.Sprintf("op-%d", id), time.Now().UTC()
+		row.Status, row.OperationID, row.OperationStartedAt = "executing", &operation, &now
+		f.rows[i].Status = "executing"
+		return row, true, nil
 	}
 	return store.Approval{}, false, nil
 }
 
 func (f *fakeExecStore) FinishExecution(_ context.Context, completion store.ExecutionCompletion) error {
-	completion.ResultJSON = append([]byte(nil), completion.ResultJSON...)
+	f.mu.Lock()
 	f.attempts = append(f.attempts, completion)
-	if f.finish != nil {
-		if err := f.finish(completion, len(f.attempts)); err != nil {
+	attempt, finish := len(f.attempts), f.finish
+	f.mu.Unlock()
+	if finish != nil {
+		if err := finish(completion, attempt); err != nil {
 			return err
 		}
 	}
 	return f.commit(completion)
 }
 
+// commit is idempotent for an identical result, like the store.
 func (f *fakeExecStore) commit(completion store.ExecutionCompletion) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if previous, ok := f.committed[completion.ApprovalID]; ok {
 		if previous.Status != completion.Status || !bytes.Equal(previous.ResultJSON, completion.ResultJSON) {
 			return store.ErrApprovalConflict
@@ -98,319 +116,186 @@ func (f *fakeExecStore) commit(completion store.ExecutionCompletion) error {
 	return nil
 }
 
-func (f *fakeExecStore) RecoverExecutingApprovals(_ context.Context, _ time.Time) (int64, error) {
-	f.recoveryCalls++
-	if f.recoveryErr != nil {
-		return 0, f.recoveryErr
+func (f *fakeExecStore) ListExecutingApprovals(context.Context) ([]store.Approval, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
 	}
-	var recovered int64
-	for i := range f.rows {
-		if f.rows[i].Status == "executing" {
-			f.rows[i].Status = "failed"
-			recovered++
+	var rows []store.Approval
+	for _, row := range f.rows {
+		if row.Status == "executing" {
+			rows = append(rows, row)
 		}
 	}
-	return recovered, nil
+	return rows, nil
 }
 
-func executorBinding() incident.ExecutionBinding {
-	return incident.ExecutionBinding{
-		Container: "sub2api", BaseURL: "http://127.0.0.1:8080",
-		AllowedContainers: []string{"sub2api"}, SafetyLevel: "L2",
-	}
-}
-
-func executorSnapshot(dryRun bool) incident.ExecutionContext {
-	return incident.ExecutionContext{
-		SafetyLevel: "L2", DryRun: dryRun,
-		Verification: incident.VerificationSpec{
-			Kind: incident.HealthVerification, TargetName: "sub2api", BaseURL: "http://127.0.0.1:8080",
-			MemberFingerprints: []string{"fp1"}, IntervalSeconds: 10, WindowSeconds: 120, TimeoutSeconds: 5,
-		},
-	}
-}
-
-func approvedApproval(t *testing.T, id uint64, dryRun bool) store.Approval {
+// approvedRow freezes a real policy decision into an approved approval row.
+func approvedRow(t *testing.T, id uint64) store.Approval {
 	t.Helper()
-	row := store.Approval{
-		ID: id, IncidentID: id + 100, RunID: id + 200, Status: "approved", ToolName: incident.RestartAction,
-		ArgsJSON: []byte(`{"target_kind":"container","target_name":"sub2api"}`), ExpiresAt: time.Now().Add(time.Hour),
-	}
-	setExecutorSnapshot(t, &row, executorSnapshot(dryRun))
-	return row
-}
-
-func setExecutorSnapshot(t *testing.T, row *store.Approval, snapshot incident.ExecutionContext) {
-	t.Helper()
-	raw, err := json.Marshal(snapshot)
+	d := testPolicy(t, newRestartAction(), testRemediation(incident.ModeAuto), &fakeState{}).Decide(context.Background(), llm.Plan{Action: "docker_restart"}, testInput())
+	draft, err := NewService(nil).Prepare(id, id, d, "rule authorized")
 	if err != nil {
 		t.Fatal(err)
 	}
-	row.ExecutionContext = raw
-	row.PlanHash, err = incident.PlanHash(row.ToolName, row.ArgsJSON, row.ExecutionContext)
-	if err != nil {
-		t.Fatal(err)
-	}
+	draft.ID = id
+	return draft
 }
 
-func executorTestRegistry(t *testing.T, level tools.SafetyLevel, handler tools.Handler) *tools.Registry {
+func testExecutor(t *testing.T, db execStore, action *fakeAction) *Executor {
 	t.Helper()
-	registry := tools.NewRegistry()
-	if level == "" {
-		return registry
-	}
-	if err := registry.Register(tools.ToolSpec{
-		Name: incident.RestartAction, Description: "test restart spy", Level: level,
-		Timeout: time.Second, MaxOutput: 100000, Handler: handler,
-	}); err != nil {
+	registry := testRegistry(t, action)
+	if err := registry.Register(tools.ToolSpec{Name: tools.ToolPromInstantQuery, Description: "current business metrics", Timeout: time.Second, Handler: func(context.Context, json.RawMessage) (string, error) {
+		return fmt.Sprintf(`{"resultType":"vector","result":[{"value":[%d,"1"]}]}`, time.Now().Unix()), nil
+	}}); err != nil {
 		t.Fatal(err)
 	}
-	return registry
+	return NewExecutor(db, registry, testAuthority(t, registry, testRemediation(incident.ModeAuto)), log.New(io.Discard, "", 0))
 }
 
-func quietExecutor(db execStore, registry *tools.Registry, binding incident.ExecutionBinding) *Executor {
-	return NewExecutor(db, registry, binding, log.New(io.Discard, "", 0))
-}
-
-func executionResult(t *testing.T, completion store.ExecutionCompletion) map[string]any {
+func resultOf(t *testing.T, completion store.ExecutionCompletion) map[string]any {
 	t.Helper()
 	var result map[string]any
 	if err := json.Unmarshal(completion.ResultJSON, &result); err != nil {
-		t.Fatal(err)
-	}
-	if len(completion.ResultJSON) > 8192 || completion.FinishedAt.IsZero() {
-		t.Fatalf("unbounded or undated completion: %+v", completion)
+		t.Fatalf("result %s: %v", completion.ResultJSON, err)
 	}
 	return result
 }
 
-func TestExecutorRunsDistinctIncidentsWithoutWaitingForVerification(t *testing.T) {
-	calls := 0
-	db := newFakeExecStore(approvedApproval(t, 1, false), approvedApproval(t, 2, false))
-	registry := executorTestRegistry(t, tools.L2LowRisk, func(_ context.Context, args json.RawMessage) (string, error) {
-		calls++
-		if calls == 2 && db.committed[1].Status != "executed" {
-			t.Fatal("next mutation started before prior result was durable")
-		}
-		if !bytes.Equal(args, db.rows[calls-1].ArgsJSON) {
-			t.Fatalf("args = %s", args)
-		}
-		return "restarted", nil
-	})
-	executor := quietExecutor(db, registry, executorBinding())
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if err := executor.RunOnce(ctx); err != nil {
+func TestExecutorRunsClaimedSnapshotsUnderCurrentPolicy(t *testing.T) {
+	db := newFakeExecStore(approvedRow(t, 1), approvedRow(t, 2))
+	action := newRestartAction()
+	executor := testExecutor(t, db, action)
+	if err := executor.RunOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if calls != 2 || len(db.committed) != 2 {
-		t.Fatalf("calls=%d committed=%v", calls, db.committed)
+	if len(action.executed) != 2 || len(db.committed) != 2 {
+		t.Fatalf("executed=%d committed=%d", len(action.executed), len(db.committed))
 	}
-	for _, completion := range db.committed {
-		result := executionResult(t, completion)
-		if completion.Status != "executed" || result["executed"] != true || result["dry_run"] != false || result["manual_check"] == true {
-			t.Fatalf("completion=%+v result=%v", completion, result)
-		}
+	op := action.executed[0]
+	if op.ID != "op-1" || op.Target != testTarget || op.Revision != "started_at=2026-09-24T00:00:00Z" || string(op.PreState) != `{"status":"running"}` || !strings.Contains(string(op.Args), "sub2api") {
+		t.Fatalf("operation=%+v", op)
 	}
-	if err := executor.RunOnce(ctx); err != nil || calls != 2 {
-		t.Fatalf("queue replay: calls=%d err=%v", calls, err)
+	if db.policies[0].Binding.RulesVersion != executor.authority.Release() || db.policies[0].Budgets["restart"].Max != 2 {
+		t.Fatalf("claim policy=%+v", db.policies[0])
+	}
+	result := resultOf(t, db.committed[1])
+	if db.committed[1].Status != "executed" || result["written"] != true || result["outcome"] != "written" || result["operation_id"] != "op-1" || result["action"] != "docker_restart" {
+		t.Fatalf("completion=%s result=%v", db.committed[1].Status, result)
 	}
 }
 
-func TestExecutorHonorsStoredSimulation(t *testing.T) {
-	for _, globalDryRun := range []bool{false, true} {
-		t.Run(fmt.Sprint(globalDryRun), func(t *testing.T) {
-			db := newFakeExecStore(approvedApproval(t, 1, true))
-			binding := executorBinding()
-			binding.DryRun = globalDryRun
-			registry := executorTestRegistry(t, tools.L2LowRisk, func(context.Context, json.RawMessage) (string, error) {
-				t.Fatal("simulation invoked handler")
-				return "", nil
-			})
-			if err := quietExecutor(db, registry, binding).RunOnce(context.Background()); err != nil {
+func TestExecutorOutcomes(t *testing.T) {
+	for name, test := range map[string]struct {
+		receipt   tools.Receipt
+		execErr   error
+		outcome   tools.Outcome
+		reconErr  error
+		status    string
+		manual    bool
+		reconcile bool
+	}{
+		"written":                    {receipt: tools.Receipt{Written: true}, status: "executed"},
+		"refused before writing":     {receipt: tools.Receipt{Detail: "container identity changed"}, status: "aborted"},
+		"error but applied":          {execErr: errors.New("timeout"), outcome: tools.OutcomeWritten, status: "executed", reconcile: true},
+		"error and not applied":      {execErr: errors.New("connection refused"), outcome: tools.OutcomeNotWritten, status: "failed", reconcile: true},
+		"error and unknown":          {execErr: errors.New("timeout"), outcome: tools.OutcomeUnknown, status: "failed", manual: true, reconcile: true},
+		"error and unreadable state": {execErr: errors.New("timeout"), reconErr: errors.New("docker down"), status: "failed", manual: true, reconcile: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			db := newFakeExecStore(approvedRow(t, 1))
+			action := newRestartAction()
+			action.execute = func(tools.Operation) (tools.Receipt, error) { return test.receipt, test.execErr }
+			action.reconcile = func(tools.Operation) (tools.Outcome, error) { return test.outcome, test.reconErr }
+			if err := testExecutor(t, db, action).RunOnce(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			completion := db.committed[1]
-			result := executionResult(t, completion)
-			if completion.Status != "simulated" || result["dry_run"] != true || result["executed"] != false || result["manual_check"] == true {
-				t.Fatalf("completion=%+v result=%v", completion, result)
+			result := resultOf(t, completion)
+			if completion.Status != test.status || completion.ManualCheck != test.manual || (result["manual_check"] == true) != test.manual || (len(action.reconciled) == 1) != test.reconcile {
+				t.Fatalf("completion=%+v result=%v reconciled=%d", completion, result, len(action.reconciled))
+			}
+			if test.execErr != nil && !strings.Contains(result["error"].(string), test.execErr.Error()) {
+				t.Fatalf("error lost: %v", result)
+			}
+			if len(action.executed) != 1 {
+				t.Fatalf("executed %d times", len(action.executed))
 			}
 		})
 	}
 }
 
-func TestExecutorPassesRuntimeLevelAndSafetySwitchToClaim(t *testing.T) {
-	for _, test := range []struct {
-		name   string
-		level  tools.SafetyLevel
-		dryRun bool
-	}{
-		{"removed", "", false}, {"readonly", tools.L1ReadOnly, false}, {"forbidden", tools.L4Forbidden, false},
-		{"level changed", tools.L3Approval, false}, {"global dry run", tools.L2LowRisk, true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			db := newFakeExecStore(approvedApproval(t, 1, false))
-			binding := executorBinding()
-			binding.DryRun = test.dryRun
-			db.claim = func(row *store.Approval, received incident.ExecutionBinding) bool {
-				if received.SafetyLevel != string(test.level) || received.DryRun != test.dryRun {
-					t.Fatalf("claim binding = %+v", received)
-				}
-				snapshot, _ := incident.ParseExecutionContext(row.ExecutionContext)
-				if snapshot.ValidateBinding(received, true) == nil {
-					t.Fatal("unsafe binding would permit claim")
-				}
-				row.Status = "expired"
-				return false
-			}
-			registry := executorTestRegistry(t, test.level, func(context.Context, json.RawMessage) (string, error) {
-				t.Fatal("rejected claim invoked handler")
-				return "", nil
-			})
-			if err := quietExecutor(db, registry, binding).RunOnce(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			if len(db.bindings) != 1 || len(db.attempts) != 0 || db.rows[0].Status != "expired" {
-				t.Fatalf("bindings=%v attempts=%v row=%+v", db.bindings, db.attempts, db.rows[0])
-			}
-		})
+func TestExecutorRecordsDeploymentChange(t *testing.T) {
+	db := newFakeExecStore(approvedRow(t, 1))
+	action := newRestartAction()
+	action.execute = func(tools.Operation) (tools.Receipt, error) {
+		return tools.Receipt{Written: true, Change: &tools.Change{Type: "rollback", ReleaseID: "v1", Before: "repo@sha256:bad", After: "repo@sha256:good"}}, nil
+	}
+	if err := testExecutor(t, db, action).RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	change := db.committed[1].Change
+	if change == nil || change.Env != "prod" || change.Service != "sub2api" || change.ChangeType != "rollback" || *change.ReleaseID != "v1" ||
+		*change.BeforeRef != "repo@sha256:bad" || *change.ImageRef != "repo@sha256:good" || change.Actor == "" {
+		t.Fatalf("change=%+v", change)
 	}
 }
 
-func TestExecutorRejectsInvalidFreshClaim(t *testing.T) {
-	for _, test := range []struct {
-		name   string
-		level  tools.SafetyLevel
-		change func(*store.Approval, *incident.ExecutionBinding)
-	}{
-		{"bad hash", tools.L2LowRisk, func(row *store.Approval, _ *incident.ExecutionBinding) { row.PlanHash = "old-or-tampered-hash" }},
-		{"legacy context", tools.L2LowRisk, func(row *store.Approval, _ *incident.ExecutionBinding) { row.ExecutionContext = nil }},
-		{"missing dry run", tools.L2LowRisk, func(row *store.Approval, _ *incident.ExecutionBinding) {
-			row.ExecutionContext = bytes.Replace(row.ExecutionContext, []byte(`"dry_run":false,`), nil, 1)
-		}},
-		{"target mismatch", tools.L2LowRisk, func(row *store.Approval, _ *incident.ExecutionBinding) {
-			row.ArgsJSON = []byte(`{"target_kind":"container","target_name":"other"}`)
-		}},
-		{"unknown tool", "", nil}, {"L1", tools.L1ReadOnly, nil}, {"L4", tools.L4Forbidden, nil}, {"level drift", tools.L3Approval, nil},
-		{"global dry run", tools.L2LowRisk, func(_ *store.Approval, binding *incident.ExecutionBinding) { binding.DryRun = true }},
-		{"URL drift", tools.L2LowRisk, func(_ *store.Approval, binding *incident.ExecutionBinding) { binding.BaseURL = "http://127.0.0.1:9000" }},
-		{"target removed", tools.L2LowRisk, func(_ *store.Approval, binding *incident.ExecutionBinding) { binding.AllowedContainers = nil }},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			row, binding := approvedApproval(t, 1, false), executorBinding()
-			if test.change != nil {
-				test.change(&row, &binding)
-			}
-			db := newFakeExecStore(row)
-			registry := executorTestRegistry(t, test.level, func(context.Context, json.RawMessage) (string, error) {
-				t.Fatal("invalid claimed approval invoked handler")
-				return "", nil
-			})
-			if err := quietExecutor(db, registry, binding).RunOnce(context.Background()); err == nil {
-				t.Fatal("invalid claimed approval did not return an error")
-			}
-			if len(db.attempts) != 0 {
-				t.Fatal("invalid claim fabricated an external result")
-			}
-		})
-	}
-}
-
-func TestExecutorUsesFreshClaimNotPolledRow(t *testing.T) {
-	for _, dryRun := range []bool{false, true} {
-		t.Run(fmt.Sprint(dryRun), func(t *testing.T) {
-			db := newFakeExecStore(approvedApproval(t, 1, false))
-			db.claim = func(row *store.Approval, _ incident.ExecutionBinding) bool {
-				if dryRun {
-					setExecutorSnapshot(t, row, executorSnapshot(true))
-				} else {
-					row.PlanHash = "changed-after-poll"
-				}
-				return true
-			}
-			registry := executorTestRegistry(t, tools.L2LowRisk, func(context.Context, json.RawMessage) (string, error) {
-				t.Fatal("polled row used instead of fresh claim")
-				return "", nil
-			})
-			err := quietExecutor(db, registry, executorBinding()).RunOnce(context.Background())
-			if dryRun && (err != nil || db.committed[1].Status != "simulated") {
-				t.Fatalf("fresh simulation: err=%v committed=%v", err, db.committed)
-			}
-			if !dryRun && err == nil {
-				t.Fatal("fresh invalid hash was not rejected")
-			}
-		})
-	}
-}
-
-func TestExecutorScopeRejectionDoesNotBlockNextIncident(t *testing.T) {
-	db := newFakeExecStore(approvedApproval(t, 1, false), approvedApproval(t, 2, false))
-	db.claim = func(row *store.Approval, _ incident.ExecutionBinding) bool {
-		if row.ID == 1 {
-			// Store atomically rejected a recovered incident or changed member scope.
-			row.Status = "expired"
-			return false
-		}
+func TestExecutorAbortsContentChangedAfterClaim(t *testing.T) {
+	db := newFakeExecStore(approvedRow(t, 1))
+	db.claim = func(row *store.Approval) bool {
+		row.ArgsJSON = datatypes.JSON(`{"target_kind":"container","target_name":"other"}`)
 		return true
 	}
-	calls := 0
-	registry := executorTestRegistry(t, tools.L2LowRisk, func(context.Context, json.RawMessage) (string, error) {
-		calls++
-		return "ok", nil
-	})
-	if err := quietExecutor(db, registry, executorBinding()).RunOnce(context.Background()); err != nil {
+	action := newRestartAction()
+	if err := testExecutor(t, db, action).RunOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if calls != 1 || len(db.committed) != 1 || db.committed[2].Status != "executed" {
-		t.Fatalf("calls=%d committed=%v", calls, db.committed)
+	if len(action.executed) != 0 || db.committed[1].Status != "aborted" || !strings.Contains(resultOf(t, db.committed[1])["error"].(string), "plan hash") {
+		t.Fatalf("tampered content executed=%d completion=%+v", len(action.executed), db.committed[1])
 	}
 }
 
-func TestExecutorAllowsApprovedL3UsingRegistryLevel(t *testing.T) {
-	row := approvedApproval(t, 1, false)
-	snapshot := executorSnapshot(false)
-	snapshot.SafetyLevel = "L3"
-	setExecutorSnapshot(t, &row, snapshot)
-	db := newFakeExecStore(row)
-	calls := 0
-	registry := executorTestRegistry(t, tools.L3Approval, func(context.Context, json.RawMessage) (string, error) {
-		calls++
-		return "ok", nil
-	})
-	// Deliberately stale constructor level must be replaced by registry L3.
-	if err := quietExecutor(db, registry, executorBinding()).RunOnce(context.Background()); err != nil {
+func TestExecutorSkipsRefusedClaim(t *testing.T) {
+	db := newFakeExecStore(approvedRow(t, 1), approvedRow(t, 2))
+	db.claim = func(row *store.Approval) bool { return row.ID != 1 }
+	action := newRestartAction()
+	if err := testExecutor(t, db, action).RunOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if calls != 1 || db.bindings[0].SafetyLevel != "L3" || db.committed[1].Status != "executed" {
-		t.Fatalf("calls=%d bindings=%v committed=%v", calls, db.bindings, db.committed)
+	if len(action.executed) != 1 || action.executed[0].ID != "op-2" || db.rows[0].Status != "expired" || db.rows[1].Status != "executed" {
+		t.Fatalf("executed=%v rows=%+v", action.executed, db.rows)
+	}
+}
+
+func TestExecutorPollAndClaimErrorsNeverExecute(t *testing.T) {
+	for name, set := range map[string]func(*fakeExecStore){
+		"poll":  func(f *fakeExecStore) { f.nextErr = errors.New("db down") },
+		"claim": func(f *fakeExecStore) { f.claimErr = errors.New("lock wait timeout") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			db := newFakeExecStore(approvedRow(t, 1))
+			set(db)
+			action := newRestartAction()
+			if err := testExecutor(t, db, action).RunOnce(context.Background()); err == nil || len(action.executed) != 0 {
+				t.Fatalf("err=%v executed=%d", err, len(action.executed))
+			}
+		})
 	}
 }
 
 func TestExecutorRetriesOnlyResultPersistence(t *testing.T) {
-	for _, test := range []struct {
-		name      string
-		ambiguous bool
-		toolFails bool
-	}{
-		{"transient success", false, false}, {"ambiguous success", true, false},
-		{"transient failure", false, true}, {"ambiguous failure", true, true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			db := newFakeExecStore(approvedApproval(t, 1, false))
-			calls := 0
-			registry := executorTestRegistry(t, tools.L2LowRisk, func(context.Context, json.RawMessage) (string, error) {
-				calls++
-				if test.toolFails {
-					return "", errors.New("restart response lost; outcome unknown")
-				}
-				return "restarted", nil
-			})
+	for _, ambiguous := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ambiguous=%v", ambiguous), func(t *testing.T) {
+			db := newFakeExecStore(approvedRow(t, 1))
+			action := newRestartAction()
 			db.finish = func(completion store.ExecutionCompletion, attempt int) error {
-				if calls != 1 {
-					t.Fatalf("persistence retry re-executed tool: calls=%d", calls)
+				if len(action.executed) != 1 {
+					t.Fatalf("persistence retry re-executed the action: %d", len(action.executed))
 				}
 				if attempt == 1 {
-					if test.ambiguous {
+					if ambiguous {
 						if err := db.commit(completion); err != nil {
 							t.Fatal(err)
 						}
@@ -421,32 +306,15 @@ func TestExecutorRetriesOnlyResultPersistence(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			executor := quietExecutor(db, registry, executorBinding())
+			executor := testExecutor(t, db, action)
 			if err := executor.RunOnce(ctx); err != nil {
 				t.Fatal(err)
 			}
-			if calls != 1 || len(db.attempts) != 2 || len(db.committed) != 1 {
-				t.Fatalf("calls=%d attempts=%d committed=%v", calls, len(db.attempts), db.committed)
+			if len(action.executed) != 1 || len(db.attempts) != 2 || !bytes.Equal(db.attempts[0].ResultJSON, db.attempts[1].ResultJSON) {
+				t.Fatalf("executed=%d attempts=%d", len(action.executed), len(db.attempts))
 			}
-			if !bytes.Equal(db.attempts[0].ResultJSON, db.attempts[1].ResultJSON) {
-				t.Fatal("result payload changed across persistence retries")
-			}
-			if !test.ambiguous && !db.attempts[1].FinishedAt.After(db.attempts[0].FinishedAt) {
-				t.Fatal("uncommitted result retained stale verification window start")
-			}
-			if test.ambiguous && !db.committed[1].FinishedAt.Equal(db.attempts[0].FinishedAt) {
-				t.Fatal("ambiguous commit changed already-durable time")
-			}
-			result := executionResult(t, db.committed[1])
-			if test.toolFails {
-				if db.committed[1].Status != "failed" || result["manual_check"] != true || result["executed"] != false || !strings.Contains(result["error"].(string), "outcome unknown") {
-					t.Fatalf("missing manual failure semantics: %v", result)
-				}
-			} else if db.committed[1].Status != "executed" || result["executed"] != true {
-				t.Fatalf("successful external result lost: %v", result)
-			}
-			if err := executor.RunOnce(ctx); err != nil || calls != 1 {
-				t.Fatalf("terminal replay: calls=%d err=%v", calls, err)
+			if err := executor.RunOnce(ctx); err != nil || len(action.executed) != 1 {
+				t.Fatalf("terminal replay: executed=%d err=%v", len(action.executed), err)
 			}
 		})
 	}
@@ -457,173 +325,94 @@ func TestExecutorPersistenceStopsOnCancellationOrConflict(t *testing.T) {
 		t.Run(terminal.Error(), func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			db := newFakeExecStore(approvedApproval(t, 1, false))
-			calls := 0
-			registry := executorTestRegistry(t, tools.L2LowRisk, func(context.Context, json.RawMessage) (string, error) {
-				calls++
-				return "restarted", nil
-			})
+			db := newFakeExecStore(approvedRow(t, 1))
 			db.finish = func(store.ExecutionCompletion, int) error {
 				if terminal == context.Canceled {
 					cancel()
 					return errors.New("database unavailable")
 				}
-				return fmt.Errorf("finish: %w", terminal)
+				return terminal
 			}
-			executor := quietExecutor(db, registry, executorBinding())
-			if err := executor.RunOnce(ctx); !errors.Is(err, terminal) {
-				t.Fatalf("error=%v want %v", err, terminal)
-			}
-			if calls != 1 || len(db.attempts) != 1 || len(db.committed) != 0 {
-				t.Fatalf("calls=%d attempts=%d committed=%v", calls, len(db.attempts), db.committed)
-			}
-			if err := executor.RunOnce(context.Background()); err != nil || calls != 1 {
-				t.Fatalf("unknown result re-executed: calls=%d err=%v", calls, err)
+			action := newRestartAction()
+			if err := testExecutor(t, db, action).RunOnce(ctx); !errors.Is(err, terminal) || len(action.executed) != 1 || len(db.attempts) != 1 {
+				t.Fatalf("err=%v executed=%d attempts=%d", err, len(action.executed), len(db.attempts))
 			}
 		})
 	}
 }
 
 func TestExecutorBoundsEscapedAndUnicodeResults(t *testing.T) {
-	for _, toolFails := range []bool{false, true} {
-		t.Run(fmt.Sprint(toolFails), func(t *testing.T) {
-			db := newFakeExecStore(approvedApproval(t, 1, false))
-			text := strings.Repeat("\x00\"\\<&界😀", 10000)
-			registry := executorTestRegistry(t, tools.L2LowRisk, func(context.Context, json.RawMessage) (string, error) {
-				if toolFails {
-					return "", errors.New(text)
-				}
-				return text, nil
-			})
-			if err := quietExecutor(db, registry, executorBinding()).RunOnce(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			result := executionResult(t, db.committed[1])
-			field := "output"
-			if toolFails {
-				field = "error"
-			}
-			if !strings.Contains(result[field].(string), "[truncated]") {
-				t.Fatal("omitted truncation indication")
-			}
-		})
+	db := newFakeExecStore(approvedRow(t, 1))
+	action := newRestartAction()
+	action.execute = func(tools.Operation) (tools.Receipt, error) {
+		return tools.Receipt{Written: true, Detail: strings.Repeat("<\"界\">", 5000)}, nil
+	}
+	if err := testExecutor(t, db, action).RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	raw := db.committed[1].ResultJSON
+	if len(raw) > 8192 || !json.Valid(raw) || !utf8.Valid(raw) {
+		t.Fatalf("result bytes=%d valid=%v", len(raw), json.Valid(raw))
 	}
 }
 
-func TestExecutorPollAndClaimErrorsNeverInvokeHandler(t *testing.T) {
-	for _, phase := range []string{"poll", "claim", "canceled after claim"} {
-		t.Run(phase, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			db := newFakeExecStore(approvedApproval(t, 1, false))
-			failure := errors.New("database unavailable")
-			switch phase {
-			case "poll":
-				db.nextErr = failure
-			case "claim":
-				db.claimErr = failure
-			default:
-				failure = context.Canceled
-				db.claim = func(*store.Approval, incident.ExecutionBinding) bool { cancel(); return true }
-			}
-			registry := executorTestRegistry(t, tools.L2LowRisk, func(context.Context, json.RawMessage) (string, error) {
-				t.Fatal("failed claim invoked handler")
-				return "", nil
-			})
-			if err := quietExecutor(db, registry, executorBinding()).RunOnce(ctx); !errors.Is(err, failure) {
-				t.Fatalf("err=%v want %v", err, failure)
-			}
-			if len(db.attempts) != 0 {
-				t.Fatal("no invocation must not fabricate a failure result")
-			}
-		})
+// Start reconciles interrupted executions against the target; nothing is replayed.
+func TestExecutorStartReconcilesInterruptedExecutions(t *testing.T) {
+	outcomes := map[string]tools.Outcome{"op-1": tools.OutcomeWritten, "op-2": tools.OutcomeNotWritten, "op-3": tools.OutcomeUnknown}
+	var rows []store.Approval
+	for id := uint64(1); id <= 3; id++ {
+		row := approvedRow(t, id)
+		operation := fmt.Sprintf("op-%d", id)
+		row.Status, row.OperationID = "executing", &operation
+		rows = append(rows, row)
+	}
+	db := newFakeExecStore(rows...)
+	action := newRestartAction()
+	action.reconcile = func(op tools.Operation) (tools.Outcome, error) { return outcomes[op.ID], nil }
+	ctx, cancel := context.WithCancel(context.Background())
+	executor := testExecutor(t, db, action)
+	if err := executor.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	waitExecutor(t, executor)
+	if len(action.executed) != 0 || len(action.reconciled) != 3 {
+		t.Fatalf("executed=%d reconciled=%d", len(action.executed), len(action.reconciled))
+	}
+	for id, want := range map[uint64]struct {
+		status string
+		manual bool
+	}{1: {"executed", false}, 2: {"aborted", false}, 3: {"failed", true}} {
+		if got := db.committed[id]; got.Status != want.status || got.ManualCheck != want.manual {
+			t.Fatalf("approval %d: %+v; want %+v", id, got, want)
+		}
 	}
 }
 
 func waitExecutor(t *testing.T, executor *Executor) {
 	t.Helper()
-	returned := make(chan struct{})
-	go func() { executor.Wait(); close(returned) }()
+	done := make(chan struct{})
+	go func() { executor.Wait(); close(done) }()
 	select {
-	case <-returned:
-	case <-time.After(time.Second):
-		t.Fatal("Wait blocked after shutdown or failed Start")
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("executor Wait hung")
 	}
 }
 
-func TestExecutorStartPreflightAndRecoveryFailureDoNotHangWait(t *testing.T) {
-	for _, phase := range []string{"poll", "recover"} {
-		t.Run(phase, func(t *testing.T) {
-			db := newFakeExecStore(approvedApproval(t, 1, false))
-			failure := errors.New("database unavailable")
-			if phase == "poll" {
-				db.nextErr = failure
-			} else {
-				db.recoveryErr = failure
-			}
-			registry := executorTestRegistry(t, tools.L2LowRisk, func(context.Context, json.RawMessage) (string, error) {
-				t.Fatal("failed startup invoked handler")
-				return "", nil
-			})
-			executor := quietExecutor(db, registry, executorBinding())
-			if err := executor.Start(context.Background()); !errors.Is(err, failure) {
-				t.Fatalf("Start error=%v want %v", err, failure)
+func TestExecutorStartFailureDoesNotHangWait(t *testing.T) {
+	for name, set := range map[string]func(*fakeExecStore){
+		"preflight": func(f *fakeExecStore) { f.nextErr = errors.New("schema missing") },
+		"list":      func(f *fakeExecStore) { f.listErr = errors.New("db down") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			db := newFakeExecStore()
+			set(db)
+			executor := testExecutor(t, db, newRestartAction())
+			if err := executor.Start(context.Background()); err == nil {
+				t.Fatal("start succeeded")
 			}
 			waitExecutor(t, executor)
 		})
-	}
-}
-
-func TestExecutorStartRecoversUnknownResultsWithoutReplay(t *testing.T) {
-	row := approvedApproval(t, 1, false)
-	row.Status = "executing"
-	db := newFakeExecStore(row)
-	registry := executorTestRegistry(t, tools.L2LowRisk, func(context.Context, json.RawMessage) (string, error) {
-		t.Fatal("unknown external result was replayed")
-		return "", nil
-	})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	executor := quietExecutor(db, registry, executorBinding())
-	if err := executor.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-	cancel()
-	waitExecutor(t, executor)
-	if db.recoveryCalls != 1 || db.rows[0].Status != "failed" || len(db.attempts) != 0 {
-		t.Fatalf("recoveryCalls=%d row=%+v attempts=%v", db.recoveryCalls, db.rows[0], db.attempts)
-	}
-}
-
-func TestExecutorShutdownCancelsPersistenceRetry(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	db := newFakeExecStore(approvedApproval(t, 1, false))
-	calls := 0
-	registry := executorTestRegistry(t, tools.L2LowRisk, func(context.Context, json.RawMessage) (string, error) {
-		calls++
-		return "restarted", nil
-	})
-	attempted := make(chan struct{}, 1)
-	db.finish = func(store.ExecutionCompletion, int) error {
-		select {
-		case attempted <- struct{}{}:
-		default:
-		}
-		return errors.New("database unavailable")
-	}
-	executor := quietExecutor(db, registry, executorBinding())
-	if err := executor.Start(ctx); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-attempted:
-	case <-time.After(time.Second):
-		t.Fatal("worker did not attempt persistence")
-	}
-	cancel()
-	waitExecutor(t, executor)
-	if calls != 1 || len(db.committed) != 0 {
-		t.Fatalf("calls=%d committed=%v", calls, db.committed)
 	}
 }

@@ -95,7 +95,14 @@ func TestApprovalButtonValueParsesInCallback(t *testing.T) {
 
 func completeCardApproval(t *testing.T) store.Approval {
 	t.Helper()
-	row := store.Approval{ID: 7, IncidentID: 11, RunID: 9, ToolName: "docker_restart", Status: "pending", Reason: "manual approval required", ExpiresAt: time.Now().UTC().Add(time.Hour), ArgsJSON: datatypes.JSON(`{"target_kind":"container","target_name":"sub2api"}`), ExecutionContext: datatypes.JSON(`{"safety_level":"L2","dry_run":false,"verification":{"kind":"sub2api_http_health","target_name":"sub2api","base_url":"http://private-target.invalid:8080","member_fingerprints":["private-member"],"interval_seconds":10,"window_seconds":120,"timeout_seconds":5}}`)}
+	expires := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	snapshot, _ := json.Marshal(incident.ExecutionContext{Version: incident.ExecutionContextVersion, Kind: incident.KindPrimary, Service: "sub2api",
+		Rule:          incident.RuleRef{ID: "restart", Version: "r1@000000000000", Mode: incident.ModeManual, Alerts: []string{"Sub2APIDown"}},
+		ActionVersion: 2, Target: incident.Object{Kind: "container", Name: "sub2api", ID: "c0ffee"}, Revision: "started_at=x", PreState: json.RawMessage(`{}`),
+		Members: []string{"private-member"}, FaultAlert: "Sub2APIDown", ExpiresAt: expires,
+		Verification: incident.VerificationSpec{Checks: []incident.Check{{Kind: incident.CheckHealth, Params: json.RawMessage(`{"base_url":"http://private-target.invalid:8080"}`)}},
+			IntervalSeconds: 10, WindowSeconds: 120, TimeoutSeconds: 5, RequiredPasses: 1}})
+	row := store.Approval{ID: 7, IncidentID: 11, RunID: 9, ToolName: "docker_restart", Status: "pending", Reason: "manual approval required", ExpiresAt: expires, ArgsJSON: datatypes.JSON(`{"target_kind":"container","target_name":"sub2api"}`), ExecutionContext: snapshot}
 	var err error
 	row.PlanHash, err = incident.PlanHash(row.ToolName, row.ArgsJSON, row.ExecutionContext)
 	if err != nil {
@@ -106,43 +113,42 @@ func completeCardApproval(t *testing.T) store.Approval {
 
 func completeCardPayload(t *testing.T) map[string]any {
 	row := completeCardApproval(t)
-	return map[string]any{"plan_hash": row.PlanHash, "action": row.ToolName, "target": "container/sub2api", "scope": "single_container", "safety_level": "L2", "dry_run": false, "reason": row.Reason, "expires_at": row.ExpiresAt.Format(time.RFC3339), "web_url": "https://console.example.invalid/incidents/11"}
+	return map[string]any{"plan_hash": row.PlanHash, "action": row.ToolName, "target": "container/sub2api", "target_id": "c0ffee", "rule_id": "restart", "rule_mode": "manual", "reason": row.Reason, "expires_at": row.ExpiresAt.Format(time.RFC3339), "web_url": "https://console.example.invalid/incidents/11"}
 }
 
 func TestApprovalCardSnapshotAndImmutableReferences(t *testing.T) {
-	for _, dryRun := range []bool{false, true} {
-		payload := completeCardPayload(t)
-		payload["dry_run"] = dryRun
-		payload["risk"] = "invented-model-risk"
-		payload["execution_context"] = completeCardApproval(t).ExecutionContext
-		payload["args_json"] = completeCardApproval(t).ArgsJSON
-		payload["verification"] = map[string]any{"base_url": "http://private-target.invalid:8080"}
-		id := uint64(7)
-		card := BuildCard(notify.Notification{Kind: notify.NotificationApprovalRequired, IncidentID: 11, ApprovalID: &id, Payload: payload})
-		encoded, err := MarshalCard(card)
-		if err != nil {
-			t.Fatal(err)
+	payload := completeCardPayload(t)
+	payload["risk"] = "invented-model-risk"
+	payload["execution_context"] = completeCardApproval(t).ExecutionContext
+	payload["args_json"] = completeCardApproval(t).ArgsJSON
+	payload["verification"] = map[string]any{"base_url": "http://private-target.invalid:8080"}
+	id := uint64(7)
+	card := BuildCard(notify.Notification{Kind: notify.NotificationApprovalRequired, IncidentID: 11, ApprovalID: &id, Payload: payload})
+	encoded, err := MarshalCard(card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(encoded)
+	for _, expected := range []string{"container/sub2api", "**Target ID:** c0ffee", "**Rule:** restart", "**Mode:** manual"} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("missing %q: %s", expected, body)
 		}
-		body := string(encoded)
-		for _, expected := range []string{"container/sub2api", "single_container", "L2", "**Dry run:** " + map[bool]string{true: "true", false: "false"}[dryRun]} {
-			if !strings.Contains(body, expected) {
-				t.Fatalf("missing %q: %s", expected, body)
-			}
+	}
+	for _, forbidden := range []string{"invented-model-risk", "private-target.invalid", "private-member", "args_json", "target_kind", "execution_context"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("leaked %q: %s", forbidden, body)
 		}
-		for _, forbidden := range []string{"invented-model-risk", "private-target.invalid", "private-member", "args_json", "target_kind", "execution_context"} {
-			if strings.Contains(body, forbidden) {
-				t.Fatalf("leaked %q: %s", forbidden, body)
-			}
-		}
-		value := firstCallbackValue(t, card)
-		if len(value) != 3 || value["action"] != "approve" || value["approval_id"] != id || value["plan_hash"] != payload["plan_hash"] {
-			t.Fatalf("callback must contain only immutable references: %#v", value)
-		}
+	}
+	value := firstCallbackValue(t, card)
+	if len(value) != 3 || value["action"] != "approve" || value["approval_id"] != id || value["plan_hash"] != payload["plan_hash"] {
+		t.Fatalf("callback must contain only immutable references: %#v", value)
 	}
 }
 
+// Only a complete manual snapshot can be approved from a card; an automatic
+// rule's snapshot needs no person.
 func TestApprovalCardIncompleteSnapshotHasNoApprove(t *testing.T) {
-	for _, key := range []string{"plan_hash", "action", "target", "scope", "safety_level", "dry_run", "reason", "expires_at"} {
+	for _, key := range []string{"plan_hash", "action", "target", "target_id", "rule_id", "rule_mode", "reason", "expires_at"} {
 		t.Run(key, func(t *testing.T) {
 			payload := completeCardPayload(t)
 			delete(payload, key)
@@ -154,26 +160,16 @@ func TestApprovalCardIncompleteSnapshotHasNoApprove(t *testing.T) {
 			if strings.Contains(string(encoded), `"action":"approve"`) {
 				t.Fatalf("incomplete %s still approves: %s", key, encoded)
 			}
-			if key == "dry_run" && (!strings.Contains(string(encoded), "**Dry run:** unknown") || strings.Contains(string(encoded), "**Dry run:** false")) {
-				t.Fatalf("missing dry-run misrepresented: %s", encoded)
-			}
 		})
 	}
-	for _, invalid := range []any{"false", nil, 0} {
+	for _, mode := range []any{"auto", "observe", true, nil} {
 		payload := completeCardPayload(t)
-		payload["dry_run"] = invalid
+		payload["rule_mode"] = mode
 		id := uint64(7)
-		encoded, _ := RenderCard(notify.Notification{ApprovalID: &id, Payload: payload})
-		if strings.Contains(string(encoded), `"action":"approve"`) || !strings.Contains(string(encoded), "**Dry run:** unknown") {
-			t.Fatalf("invalid dry-run accepted: %s", encoded)
+		encoded, _ := json.Marshal(BuildCard(notify.Notification{ApprovalID: &id, Payload: payload}))
+		if strings.Contains(string(encoded), `"action":"approve"`) {
+			t.Fatalf("mode %v accepted: %s", mode, encoded)
 		}
-	}
-	payload := completeCardPayload(t)
-	payload["safety_level"] = "model-low"
-	id := uint64(7)
-	encoded, _ := json.Marshal(BuildCard(notify.Notification{ApprovalID: &id, Payload: payload}))
-	if strings.Contains(string(encoded), `"action":"approve"`) {
-		t.Fatalf("invalid level accepted: %s", encoded)
 	}
 }
 

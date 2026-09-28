@@ -77,7 +77,6 @@ func (c *PrometheusClient) RegisterTools(registry *Registry) error {
 		{
 			Name:        ToolPromInstantQuery,
 			Description: "Run a PromQL instant query. Returns the Prometheus result JSON.",
-			Level:       L1ReadOnly,
 			Timeout:     promToolTimeout,
 			MaxOutput:   defaultMaxOutput,
 			Params: []ParamSpec{
@@ -89,7 +88,6 @@ func (c *PrometheusClient) RegisterTools(registry *Registry) error {
 		{
 			Name:        ToolPromRangeQuery,
 			Description: "Run a PromQL range query. Range is capped and step adapts to max_points.",
-			Level:       L1ReadOnly,
 			Timeout:     promToolTimeout,
 			MaxOutput:   defaultMaxOutput,
 			Params: []ParamSpec{
@@ -102,7 +100,6 @@ func (c *PrometheusClient) RegisterTools(registry *Registry) error {
 		{
 			Name:        ToolPromSeriesMeta,
 			Description: "List series metadata. Use this before writing PromQL against unknown labels.",
-			Level:       L1ReadOnly,
 			Timeout:     promToolTimeout,
 			MaxOutput:   defaultMaxOutput,
 			Params: []ParamSpec{

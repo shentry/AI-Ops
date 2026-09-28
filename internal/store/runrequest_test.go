@@ -98,7 +98,7 @@ func TestAdmissionExcludesApprovalAndVerification(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	approval, binding := executionFixture(t, db, now, false, "pending")
+	approval, policy := executionFixture(t, db, now, "pending")
 	request := RunRequest{IncidentID: approval.IncidentID, Mode: "full", Trigger: RunTriggerManual, RequestedAt: now.Add(time.Minute)}
 	assertBlocked := func() {
 		t.Helper()
@@ -113,7 +113,7 @@ func TestAdmissionExcludesApprovalAndVerification(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertBlocked()
-	if _, claimed, err := db.ClaimApprovalExecution(ctx, approval.ID, now, binding); err != nil || !claimed {
+	if _, claimed, err := db.ClaimApprovalExecution(ctx, approval.ID, now, policy); err != nil || !claimed {
 		t.Fatalf("claim=%v %v", claimed, err)
 	}
 	assertBlocked()
@@ -126,7 +126,7 @@ func TestAdmissionExcludesApprovalAndVerification(t *testing.T) {
 		t.Fatalf("verify claim=%v %v", claimed, err)
 	}
 	assertBlocked()
-	if _, err := db.FinalizeVerification(ctx, VerificationCompletion{ApprovalID: approval.ID, ClaimedAt: *task.ClaimedAt, CheckedAt: now.Add(time.Second), Status: "passed", Observation: "healthy", Binding: binding}); err != nil {
+	if _, err := db.FinalizeVerification(ctx, VerificationCompletion{ApprovalID: approval.ID, ClaimedAt: *task.ClaimedAt, CheckedAt: now.Add(time.Second), Status: "passed", Observation: "healthy"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, created, err := db.RequestRun(ctx, request); err != nil || !created {

@@ -4,6 +4,8 @@
 > 范围假设：承接本轮架构分析，本文设计下一阶段的执行闭环改造，不重复编写系统现状总览。
 > 代码基线：`2323cdd` + 当前工作区，包含 `internal/incident` 纯规则提取等未提交改动。
 > D1–D6 已按本文实施，T1–T17 的逐项证据见 [实施与验收记录](execution-trust-verification.md)；本文保留原方案及实施前历史问题，不把历史代码位置当作现状。
+>
+> **后续演进（2026-09-25）**：[生产自动处置实施方案](production-auto-remediation-plan.md)取代了本文的部分决定——`dry_run` 与 L1–L4 等级被处置规则的 `observe / manual / auto` 取代，匿名控制台被个人令牌与角色取代，Docker allowlist 并入唯一的 `service` 配置，单一重启动作扩展为动作契约，执行快照升级到版本 3。本文描述的审批 Hash、持久验证队列、准入与中断恢复原则仍然有效；现状以源码和[当前架构](current-architecture.md)为准。
 
 ## 1. 范围与前提
 

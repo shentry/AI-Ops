@@ -27,7 +27,7 @@ func (f flowFactsStore) ListIncidentRunSteps(context.Context, uint64, uint64, ui
 func readFlowFacts(t *testing.T, db flowFactsStore) ControlRoomDTO {
 	t.Helper()
 	response := httptest.NewRecorder()
-	NewControlRoomAPI(db, NewConsole()).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/incidents/11/control-room", nil))
+	NewControlRoomAPI(db, testAuth(t)).ServeHTTP(response, withBearer(httptest.NewRequest(http.MethodGet, "/api/v1/incidents/11/control-room", nil), testViewerToken))
 	var body ControlRoomDTO
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil || response.Code != 200 {
 		t.Fatalf("response=%s err=%v", response.Body.String(), err)

@@ -199,10 +199,9 @@ func TestRegisterToolsRegistersThreeL1Tools(t *testing.T) {
 	if len(exposed) != 3 {
 		t.Fatalf("ForLLM() = %d tools, want 3", len(exposed))
 	}
-	for _, name := range []string{ToolPromInstantQuery, ToolPromRangeQuery, ToolPromSeriesMeta} {
-		spec, ok := registry.Get(name)
-		if !ok || spec.Level != L1ReadOnly {
-			t.Fatalf("Get(%s) = %+v, %v", name, spec, ok)
+	for i, name := range []string{ToolPromInstantQuery, ToolPromRangeQuery, ToolPromSeriesMeta} {
+		if exposed[i].Name != name {
+			t.Fatalf("ForLLM()[%d] = %s, want %s", i, exposed[i].Name, name)
 		}
 	}
 }

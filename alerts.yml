@@ -1,5 +1,15 @@
+# The only alert rule file, shared by the dev and production Prometheus.
+# Rules whose data source is not scraped in an environment simply never fire.
+#
+# layer labels follow the three monitoring layers:
+#   service    - what users see: health, business success rate, latency
+#   locate     - where a fault is: containers, host, database, Redis, upstreams
+#   monitoring - whether we can see at all. These mean "observation unavailable";
+#                they never mean sub2api has failed or recovered.
+#
+# Thresholds are initial values to be calibrated against the production baseline.
 groups:
-  - name: sub2api
+  - name: sub2api-service
     interval: 10s
     rules:
       - alert: Sub2APIDown
@@ -9,6 +19,7 @@ groups:
           severity: critical
           service: sub2api
           container: sub2api
+          layer: service
         annotations:
           summary: Sub2API health probe failed
           description: GET {{ $labels.instance }} did not return a healthy status.
@@ -20,28 +31,269 @@ groups:
           severity: warning
           service: sub2api
           container: sub2api
+          layer: service
         annotations:
           summary: Sub2API health probe is slow
           description: Probe duration is {{ $value }}s (threshold 2s).
 
+      # /health always answers ok; this is the signal that real traffic fails.
+      - alert: Sub2APIBusinessErrors
+        expr: |
+          sub2api_errors_5m{class="sla"} / sub2api_requests_5m{class="sla"} > 0.2
+          and sub2api_requests_5m{class="sla"} >= 20
+        for: 2m
+        labels:
+          severity: critical
+          service: sub2api
+          layer: service
+        annotations:
+          summary: Sub2API business error rate is high
+          description: "{{ $value | humanizePercentage }} of SLA requests failed in the last 5 minutes (at least 20 requests)."
+
+      - alert: Sub2APIRequestLatencyHigh
+        expr: |
+          sub2api_request_duration_p95_seconds_5m > 60
+          and on() sub2api_requests_5m{class="all"} >= 20
+        for: 10m
+        labels:
+          severity: warning
+          service: sub2api
+          layer: service
+        annotations:
+          summary: Sub2API p95 request latency is high
+          description: p95 duration is {{ $value }}s over the last 5 minutes.
+
+      # Two consecutive failed probes; the probe runs every few minutes.
+      - alert: Sub2APIBusinessProbeFailed
+        expr: sub2api_probe_success == 0
+        for: 10m
+        labels:
+          severity: critical
+          service: sub2api
+          layer: service
+        annotations:
+          summary: Sub2API business probe failed
+          description: The dedicated low-cost probe request did not get HTTP 200.
+
+  - name: sub2api-locate
+    interval: 15s
+    rules:
+      - alert: Sub2APIContainerRestarting
+        expr: changes(container_start_time_seconds{name="sub2api"}[15m]) >= 3
+        labels:
+          severity: critical
+          service: sub2api
+          container: sub2api
+          layer: locate
+        annotations:
+          summary: Sub2API container restarted repeatedly
+          description: The container started {{ $value }} times in 15 minutes.
+
+      - alert: Sub2APIContainerOOM
+        expr: increase(container_oom_events_total{name="sub2api"}[10m]) > 0
+        labels:
+          severity: warning
+          service: sub2api
+          container: sub2api
+          layer: locate
+        annotations:
+          summary: Sub2API container hit an OOM kill
+          description: cAdvisor recorded an OOM event for the sub2api container.
+
+      # Errors concentrated on one upstream account: the quarantine candidate.
+      - alert: Sub2APIUpstreamAccountErrors
+        expr: sub2api_account_upstream_errors_5m >= 10
+        for: 2m
+        labels:
+          severity: warning
+          service: sub2api
+          layer: locate
+        annotations:
+          summary: Upstream account {{ $labels.account_id }} returns errors
+          description: "{{ $value }} upstream errors in 5 minutes from account {{ $labels.account_id }} (group {{ $labels.group_id }})."
+
+      - alert: Sub2APIGroupNoAvailableAccount
+        expr: |
+          sub2api_group_accounts{state="available"} == 0
+          and on(group_id) sub2api_group_accounts{state="total"} > 0
+        for: 2m
+        labels:
+          severity: critical
+          service: sub2api
+          layer: locate
+        annotations:
+          summary: Group {{ $labels.group_name }} has no schedulable upstream account
+          description: Every account of group {{ $labels.group_id }} is unavailable.
+
       - alert: Sub2APIPostgresUnreachable
-        expr: probe_success{job="sub2api-deps",component="postgres"} == 0
+        expr: probe_success{job="sub2api-deps",component="postgres"} == 0 or pg_up == 0
         for: 1m
         labels:
           severity: warning
           service: sub2api
           component: postgres
+          layer: locate
         annotations:
-          summary: Sub2API Postgres probe failed
-          description: TCP probe of {{ $labels.instance }} failed (SSH tunnel or database).
+          summary: Sub2API Postgres is unreachable
+          description: The Postgres probe or exporter reports the database down.
+
+      - alert: Sub2APIPostgresConnectionsHigh
+        expr: sum(pg_stat_activity_count) / max(pg_settings_max_connections) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+          service: sub2api
+          component: postgres
+          layer: locate
+        annotations:
+          summary: Sub2API Postgres connections near the limit
+          description: "{{ $value | humanizePercentage }} of max_connections in use."
 
       - alert: Sub2APIRedisUnreachable
-        expr: probe_success{job="sub2api-deps",component="redis"} == 0
+        expr: probe_success{job="sub2api-deps",component="redis"} == 0 or redis_up == 0
         for: 1m
         labels:
           severity: warning
           service: sub2api
           component: redis
+          layer: locate
         annotations:
-          summary: Sub2API Redis probe failed
-          description: TCP probe of {{ $labels.instance }} failed (SSH tunnel or redis).
+          summary: Sub2API Redis is unreachable
+          description: The Redis probe or exporter reports Redis down.
+
+      - alert: Sub2APIRedisMemoryHigh
+        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.9 and redis_memory_max_bytes > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: sub2api
+          component: redis
+          layer: locate
+        annotations:
+          summary: Sub2API Redis memory near maxmemory
+          description: "{{ $value | humanizePercentage }} of maxmemory used."
+
+      - alert: HostDiskAlmostFull
+        expr: node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"} / node_filesystem_size_bytes < 0.1
+        for: 10m
+        labels:
+          severity: warning
+          layer: locate
+        annotations:
+          summary: Host filesystem {{ $labels.mountpoint }} is almost full
+          description: "{{ $value | humanizePercentage }} free."
+
+      - alert: HostMemoryLow
+        expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.1
+        for: 10m
+        labels:
+          severity: warning
+          layer: locate
+        annotations:
+          summary: Host available memory is low
+          description: "{{ $value | humanizePercentage }} of memory available."
+
+      - alert: HostCPUSaturated
+        expr: 1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) > 0.9
+        for: 15m
+        labels:
+          severity: warning
+          layer: locate
+        annotations:
+          summary: Host CPU is saturated
+          description: "{{ $value | humanizePercentage }} CPU busy for 15 minutes."
+
+  - name: monitoring
+    interval: 30s
+    rules:
+      - alert: MonitoringTargetDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: warning
+          layer: monitoring
+          observation: unavailable
+        annotations:
+          summary: Scrape target {{ $labels.job }} is down
+          description: "{{ $labels.instance }} cannot be scraped; its signals are unavailable, not healthy."
+
+      - alert: Sub2APIOpsReadFailed
+        expr: sub2api_ops_up == 0
+        for: 5m
+        labels:
+          severity: warning
+          layer: monitoring
+          observation: unavailable
+        annotations:
+          summary: sub2api ops endpoint {{ $labels.endpoint }} cannot be read
+          description: Business signals from this endpoint are unavailable, not zero.
+
+      - alert: Sub2APIRealtimeMonitoringDisabled
+        expr: sub2api_ops_realtime_enabled == 0
+        for: 10m
+        labels:
+          severity: warning
+          layer: monitoring
+          observation: unavailable
+        annotations:
+          summary: sub2api realtime account monitoring is disabled
+          description: Account availability is not reported; enable ops realtime monitoring in sub2api.
+
+      - alert: OncallAgentQueueLag
+        expr: ai_opus_pending_raw_events > 50 or ai_opus_pending_agent_runs > 5 or ai_opus_oldest_raw_event_seconds > 60 or ai_opus_oldest_diagnosis_seconds > 300 or ai_opus_oldest_verification_seconds > 20 or ai_opus_oldest_notification_seconds > 60
+        for: 1m
+        labels:
+          severity: warning
+          layer: monitoring
+        annotations:
+          summary: oncall-agent queue is not draining
+          description: Queue size or oldest pending work exceeded its processing budget for one minute.
+
+      - alert: OncallAgentStateStoreUnavailable
+        expr: ai_opus_pending_raw_events < 0 or ai_opus_oldest_notification_seconds < 0
+        for: 30s
+        labels:
+          severity: critical
+          layer: monitoring
+        annotations:
+          summary: oncall-agent state store is unavailable
+          description: Queue state cannot be read; diagnosis and recovery writes must remain stopped.
+
+      - alert: OncallAgentNotificationFailures
+        expr: increase(ai_opus_notification_failed[15m]) > 0
+        labels:
+          severity: warning
+          layer: monitoring
+        annotations:
+          summary: oncall-agent failed to deliver notifications
+          description: "{{ $value }} notifications failed in 15 minutes."
+
+      - alert: AlertmanagerNotificationsFailing
+        expr: increase(alertmanager_notifications_failed_total[15m]) > 0
+        labels:
+          severity: warning
+          layer: monitoring
+        annotations:
+          summary: Alertmanager failed to deliver notifications
+          description: Integration {{ $labels.integration }} failed {{ $value }} times in 15 minutes.
+
+      - alert: PrometheusRuleEvaluationFailures
+        expr: increase(prometheus_rule_evaluation_failures_total[15m]) > 0
+        labels:
+          severity: warning
+          layer: monitoring
+        annotations:
+          summary: Prometheus rule evaluation is failing
+          description: Alert rules may silently stop firing.
+
+      # Always firing. Alertmanager forwards it to an external dead man's switch
+      # that pages when it stops arriving: the host, Prometheus or Alertmanager
+      # itself cannot report its own death.
+      - alert: Watchdog
+        expr: vector(1)
+        labels:
+          severity: none
+          layer: monitoring
+        annotations:
+          summary: Monitoring pipeline heartbeat
+          description: This alert is always firing; its absence is the alarm.

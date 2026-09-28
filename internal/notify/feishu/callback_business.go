@@ -402,15 +402,12 @@ func (b *CallbackBusiness) patchDecisionAsync(approvalRow store.Approval, messag
 		summary = "审批已批准"
 	}
 	incidentID, runID := approvalRow.IncidentID, approvalRow.RunID
-	payload := map[string]any{"approval_status": status, "action": approvalRow.ToolName, "reason": approvalRow.Reason, "dry_run": nil}
+	payload := map[string]any{"approval_status": status, "action": approvalRow.ToolName, "reason": approvalRow.Reason}
 	snapshot, contextErr := incident.ParseExecutionContext(approvalRow.ExecutionContext)
 	hash, hashErr := incident.PlanHash(approvalRow.ToolName, approvalRow.ArgsJSON, approvalRow.ExecutionContext)
 	if contextErr == nil && hashErr == nil && hash == approvalRow.PlanHash {
-		target, _ := snapshot.Target(approvalRow.ToolName, approvalRow.ArgsJSON)
-		payload["target"] = target.Kind + "/" + target.Name
-		payload["scope"] = "single_container"
-		payload["safety_level"] = snapshot.SafetyLevel
-		payload["dry_run"] = snapshot.DryRun
+		payload["target"], payload["target_id"] = snapshot.Target.Kind+"/"+snapshot.Target.Name, snapshot.Target.ID
+		payload["rule_id"], payload["rule_mode"] = snapshot.Rule.ID, snapshot.Rule.Mode
 	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

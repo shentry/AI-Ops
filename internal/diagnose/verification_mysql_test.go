@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"oncall-agent/internal/incident"
 	"oncall-agent/internal/store"
 )
 
@@ -212,31 +211,26 @@ func TestVerificationMySQLInconclusivePreservesObservationAndMemory(t *testing.T
 }
 
 func TestVerificationMySQLScopeRecheckedBeforeHTTP(t *testing.T) {
-	for _, name := range []string{"address_drift", "allowlist_removed", "new_slow", "new_postgres", "new_supported_member"} {
+	for _, name := range []string{"new_slow", "new_other_service", "new_supported_member"} {
 		t.Run(name, func(t *testing.T) {
-			var oldCalls, newCalls atomic.Int64
-			oldServer := diagnoseMySQLHealthServer(t, func(http.ResponseWriter, *http.Request) { oldCalls.Add(1) })
-			newServer := diagnoseMySQLHealthServer(t, func(http.ResponseWriter, *http.Request) { newCalls.Add(1) })
-			f := newDiagnoseMySQLFixture(t, oldServer.URL, true)
+			var calls atomic.Int64
+			server := diagnoseMySQLHealthServer(t, func(http.ResponseWriter, *http.Request) { calls.Add(1) })
+			f := newDiagnoseMySQLFixture(t, server.URL, true)
 			f.diagnose(t)
 			worker := f.execute(t)
 			initial, beforeMemory := f.task(t), f.memory(t)
 			switch name {
-			case "address_drift":
-				worker.verifier.binding.BaseURL = newServer.URL
-			case "allowlist_removed":
-				worker.verifier.binding.AllowedContainers = nil
 			case "new_slow":
-				f.addMember(t, "Sub2APISlow", "sub2api", "sub2api")
-			case "new_postgres":
-				f.addMember(t, "PostgresDown", "postgres", "postgres")
+				f.addMember(t, "Sub2APISlow", f.service)
+			case "new_other_service":
+				f.addMember(t, diagnoseAlert, "postgres")
 			case "new_supported_member":
-				f.addMember(t, incident.SupportedAlert, "sub2api", "sub2api")
+				f.addMember(t, diagnoseAlert, f.service)
 			}
 			diagnoseMySQLRunOnce(t, worker)
 			f.assertTerminal(t, "inconclusive", initial.DeadlineAt, 0)
-			if oldCalls.Load() != 0 || newCalls.Load() != 0 || !reflect.DeepEqual(beforeMemory, f.memory(t)) {
-				t.Fatalf("scope/drift bypass: old=%d new=%d", oldCalls.Load(), newCalls.Load())
+			if calls.Load() != 0 || !reflect.DeepEqual(beforeMemory, f.memory(t)) {
+				t.Fatalf("scope bypass: probes=%d", calls.Load())
 			}
 		})
 	}
@@ -270,7 +264,7 @@ func TestVerificationMySQLScopeRecheckedAfterHTTPInTransaction(t *testing.T) {
 	}
 	// Scope was valid when HTTP started; the MySQL finalization must not trust
 	// that earlier read. This member commits before HTTP completes.
-	f.addMember(t, "Sub2APISlow", "sub2api", "sub2api")
+	f.addMember(t, "Sub2APISlow", f.service)
 	close(release)
 	released = true
 	if err := <-done; err != nil {

@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"crypto/subtle"
 	"errors"
 	"net/http"
 	"strings"
@@ -20,13 +19,14 @@ type evidenceBuilder interface {
 
 // EvidenceDebugAPI 暴露 D07 的临时调试端点 GET /debug/evidence/{id}：
 // 直接在响应里看渲染后的证据文本，验证采集链路，不进 prompt。
+// Live evidence collection is a sensitive read: admins and automation only.
 type EvidenceDebugAPI struct {
-	builder   evidenceBuilder
-	authToken string
+	builder evidenceBuilder
+	auth    *Auth
 }
 
-func NewEvidenceDebugAPI(builder evidenceBuilder, authToken string) *EvidenceDebugAPI {
-	return &EvidenceDebugAPI{builder: builder, authToken: authToken}
+func NewEvidenceDebugAPI(builder evidenceBuilder, auth *Auth) *EvidenceDebugAPI {
+	return &EvidenceDebugAPI{builder: builder, auth: auth}
 }
 
 func (h *EvidenceDebugAPI) Handle(r *ghttp.Request) {
@@ -38,8 +38,7 @@ func (h *EvidenceDebugAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+h.authToken)) != 1 {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
+	if _, ok := h.auth.Require(w, r, RoleAdmin, true); !ok {
 		return
 	}
 	id, err := parseIncidentID(strings.TrimPrefix(r.URL.Path, "/debug/evidence/"))

@@ -41,7 +41,7 @@ type scopeRaceContextKey struct{}
 // finish until commit. Callbacks alone would prove query ordering, not that the
 // locking SELECT actually reached MySQL; PROCESSLIST supplies that last proof.
 // It only inspects this app user's own connection, requiring no PROCESS grant.
-func commitScopeChangeWhileWaiting(t *testing.T, db *DB, incidentID uint64, identityTable string, operation func(context.Context) error) error {
+func commitScopeChangeWhileWaiting(t *testing.T, db *DB, incidentID uint64, service, identityTable string, operation func(context.Context) error) error {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.WithValue(context.Background(), scopeRaceContextKey{}, t.Name()), 20*time.Second)
 	defer cancel()
@@ -170,7 +170,7 @@ func commitScopeChangeWhileWaiting(t *testing.T, db *DB, incidentID uint64, iden
 
 	at := time.Now().UTC().Truncate(time.Millisecond)
 	fp := sha256Hex(parent.GroupKey + "/Sub2APISlow")
-	alert := Alert{Fingerprint: fp, AlertHash: md5Hex(fp), Source: "alertmanager", Name: "Sub2APISlow", Severity: 5, Status: "firing", Labels: datatypes.JSON(`{"service":"sub2api","container":"sub2api"}`), Annotations: datatypes.JSON(`{}`), StartsAt: at, ReceivedAt: at}
+	alert := Alert{Fingerprint: fp, AlertHash: md5Hex(fp), Source: "alertmanager", Name: "Sub2APISlow", Severity: 5, Status: "firing", Labels: datatypes.JSON(`{"service":"` + service + `","container":"sub2api"}`), Annotations: datatypes.JSON(`{}`), StartsAt: at, ReceivedAt: at}
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cleanupCancel()
@@ -207,8 +207,8 @@ func commitScopeChangeWhileWaiting(t *testing.T, db *DB, incidentID uint64, iden
 	if err != nil || len(members) != 2 {
 		t.Fatalf("committed scope=%+v err=%v; want original Down plus new Slow", members, err)
 	}
-	if _, err := incident.FiringFingerprints(members, "sub2api"); err == nil {
-		t.Fatal("committed scope must be unsupported by the approved verification")
+	if _, err := incident.FiringFingerprints(members, service, []string{testAlert}); err == nil {
+		t.Fatal("committed scope must be outside the approved rule")
 	}
 	return operationErr
 }
@@ -216,12 +216,12 @@ func commitScopeChangeWhileWaiting(t *testing.T, db *DB, incidentID uint64, iden
 func TestClaimApprovalExecutionScopeRace(t *testing.T) {
 	db := openScopeRaceDB(t)
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	approval, binding := executionFixture(t, db, now, false, "approved")
+	approval, policy := executionFixture(t, db, now, "approved")
 	var row Approval
 	var claimed bool
-	err := commitScopeChangeWhileWaiting(t, db, approval.IncidentID, "approval", func(ctx context.Context) error {
+	err := commitScopeChangeWhileWaiting(t, db, approval.IncidentID, *approval.Service, "approval", func(ctx context.Context) error {
 		var err error
-		row, claimed, err = db.ClaimApprovalExecution(ctx, approval.ID, now, binding)
+		row, claimed, err = db.ClaimApprovalExecution(ctx, approval.ID, now, policy)
 		return err
 	})
 	if err != nil {
@@ -244,7 +244,7 @@ func TestFinalizeVerificationScopeRace(t *testing.T) {
 			db := openScopeRaceDB(t)
 			ctx := context.Background()
 			now := time.Now().UTC().Truncate(time.Millisecond)
-			approval, binding, _ := verificationFixture(t, db, now)
+			approval, _, _ := verificationFixture(t, db, now)
 			parent, err := db.GetIncident(ctx, approval.IncidentID)
 			if err != nil {
 				t.Fatal(err)
@@ -253,23 +253,23 @@ func TestFinalizeVerificationScopeRace(t *testing.T) {
 			if err != nil || run.PlanJSON == nil {
 				t.Fatalf("run=%+v err=%v", run, err)
 			}
-			memory := FaultMemory{Fingerprint: incident.FaultFingerprint(parent.GroupKey, incident.SupportedAlert), GroupKey: parent.GroupKey, AlertName: incident.SupportedAlert, PlanJSON: *run.PlanJSON, Confidence: "high", FirstSeen: now, LastSuccess: now, TTLSeconds: 3600}
+			memory := FaultMemory{Fingerprint: incident.FaultFingerprint(parent.GroupKey, testAlert), GroupKey: parent.GroupKey, AlertName: testAlert, PlanJSON: *run.PlanJSON, Confidence: "high", FirstSeen: now, LastSuccess: now, TTLSeconds: 3600}
 			var completion VerificationCompletion
 			if outcome == "passed" {
 				task, claimed, err := db.ClaimVerificationTask(ctx, approval.ID, now)
 				if err != nil || !claimed || task.ClaimedAt == nil {
 					t.Fatalf("verification claim=%v task=%+v err=%v", claimed, task, err)
 				}
-				completion = VerificationCompletion{ApprovalID: approval.ID, ClaimedAt: *task.ClaimedAt, CheckedAt: now.Add(time.Second), Status: "passed", Observation: "healthy", Detail: "HTTP 200", Binding: binding, Memory: &memory}
+				completion = VerificationCompletion{ApprovalID: approval.ID, ClaimedAt: *task.ClaimedAt, CheckedAt: now.Add(time.Second), Status: "passed", Observation: "healthy", Detail: "HTTP 200", Memory: &memory}
 			} else {
 				if err := db.UpsertFaultMemory(ctx, memory); err != nil {
 					t.Fatal(err)
 				}
-				completion = failedVerificationCompletion(t, db, approval.ID, binding)
+				completion = failedVerificationCompletion(t, db, approval.ID)
 				completion.DemoteFingerprint = memory.Fingerprint
 			}
 			var final VerificationFinalization
-			err = commitScopeChangeWhileWaiting(t, db, approval.IncidentID, "approval", func(ctx context.Context) error {
+			err = commitScopeChangeWhileWaiting(t, db, approval.IncidentID, *approval.Service, "approval", func(ctx context.Context) error {
 				var err error
 				final, err = db.FinalizeVerification(ctx, completion)
 				return err
@@ -307,7 +307,7 @@ func TestCompleteRunScopeRace(t *testing.T) {
 	db := openScopeRaceDB(t)
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	previous, _ := executionFixture(t, db, now, false, "pending")
+	previous, _ := executionFixture(t, db, now, "pending")
 	// Reuse the real fixture's scope/snapshot, then start a legitimate new run
 	// after denying its old plan rather than rewinding a completed run in SQL.
 	if _, err := db.DecideApproval(ctx, previous.ID, "denied", previous.PlanHash, "ops", "new diagnosis", "web", now); err != nil {
@@ -317,9 +317,9 @@ func TestCompleteRunScopeRace(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("new run=%+v created=%v err=%v", run, created, err)
 	}
-	draft := Approval{IncidentID: run.IncidentID, RunID: run.ID, ToolName: previous.ToolName, ArgsJSON: previous.ArgsJSON, ExecutionContext: previous.ExecutionContext, PlanHash: previous.PlanHash, Reason: "scope race publication", Status: "pending", CreatedAt: now, ExpiresAt: now.Add(time.Hour)}
+	draft := Approval{IncidentID: run.IncidentID, RunID: run.ID, Service: previous.Service, RuleID: previous.RuleID, ToolName: previous.ToolName, ArgsJSON: previous.ArgsJSON, ExecutionContext: previous.ExecutionContext, PlanHash: previous.PlanHash, Reason: "scope race publication", Status: "pending", CreatedAt: now, ExpiresAt: previous.ExpiresAt}
 	completion := RunCompletion{RunID: run.ID, Status: "succeeded", RCA: "old supported scope", PlanJSON: []byte(`{"action":"docker_restart","confidence":"high"}`), FinishedAt: now.Add(2 * time.Second), Approval: &draft, Steps: []AgentRunStep{{Seq: 4, Kind: "guard", Name: "rules", StartedAt: now}}}
-	err = commitScopeChangeWhileWaiting(t, db, run.IncidentID, "agent_run", func(ctx context.Context) error {
+	err = commitScopeChangeWhileWaiting(t, db, run.IncidentID, *previous.Service, "agent_run", func(ctx context.Context) error {
 		return db.CompleteRun(ctx, completion)
 	})
 	if err == nil {

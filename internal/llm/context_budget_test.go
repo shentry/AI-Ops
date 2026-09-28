@@ -124,26 +124,9 @@ func TestToolDigestPreservesErrorsAndUnknownData(t *testing.T) {
 	if compactToolResult("unknown", content) != content {
 		t.Fatal("unknown tool rewritten")
 	}
-	logs := strings.Repeat("healthy payments node-0\n", 50) + "ERROR target=payments at=2026-09-22T00:00:00Z connection refused"
-	got := compactToolResult(tools.ToolDockerLogs, logs)
-	var summary struct {
-		Compacted bool `json:"compacted"`
-		Runs      []struct {
-			Line  string `json:"line"`
-			Count int    `json:"count"`
-		} `json:"ordered_line_runs"`
-	}
-	if json.Unmarshal([]byte(got), &summary) != nil || !summary.Compacted {
-		t.Fatalf("not a log digest: %s", got)
-	}
-	var expanded []string
-	for _, run := range summary.Runs {
-		for i := 0; i < run.Count; i++ {
-			expanded = append(expanded, run.Line)
-		}
-	}
-	if strings.Join(expanded, "\n") != logs {
-		t.Fatal("log content/order lost")
+	logs := "lines=2 patterns=1 (most recent first)\ncount=2 first=unknown last=unknown | healthy\n"
+	if compactToolResult(tools.ToolDockerLogs, logs) != logs {
+		t.Fatal("already aggregated docker logs rewritten")
 	}
 }
 
@@ -168,14 +151,14 @@ func TestReasonerCompactsOldToolAndContinues(t *testing.T) {
 		}
 	})
 	registry := stubLLMRegistry(t)
-	if err := registry.Register(tools.ToolSpec{Name: tools.ToolPromRangeQuery, Description: "range", Level: tools.L1ReadOnly, Timeout: time.Second, MaxOutput: 20000,
+	if err := registry.Register(tools.ToolSpec{Name: tools.ToolPromRangeQuery, Description: "range", Timeout: time.Second, MaxOutput: 20000,
 		Params: []tools.ParamSpec{{Name: "query", Required: true}}, Handler: func(context.Context, json.RawMessage) (string, error) { return rangeFixture(180), nil }}); err != nil {
 		t.Fatal(err)
 	}
 	r := testReasoner(t, fake.server.URL, registry)
 	r.budget.LightSteps = 16
 	r.factory.contextWindowTokens = 5500
-	result, err := r.Diagnose(context.Background(), "incident=10 target=payments", "light")
+	result, err := r.Diagnose(context.Background(), "incident=10 target=payments", "light", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +174,7 @@ func TestReasonerRefusesOversizedEvidenceBeforeCallingModel(t *testing.T) {
 	fake := newFakeOpenAIServer(t, func(int, map[string]any) map[string]any { return chatResponse(validPlanJSON, 10, 5) })
 	r := testReasoner(t, fake.server.URL, stubLLMRegistry(t))
 	r.factory.contextWindowTokens = 4000
-	_, err := r.Diagnose(context.Background(), strings.Repeat("critical target evidence", 1000), "light")
+	_, err := r.Diagnose(context.Background(), strings.Repeat("critical target evidence", 1000), "light", nil)
 	if !errors.Is(err, ErrContextBudget) || fake.requests.Load() != 0 {
 		t.Fatalf("error=%v calls=%d", err, fake.requests.Load())
 	}

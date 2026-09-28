@@ -1,4 +1,4 @@
-# Frontend execution-trust tests
+# Frontend tests
 
 ```sh
 cd web
@@ -15,9 +15,12 @@ The default test server is a new Vite process on `127.0.0.1:15173`, with `--stri
 
 ## Contracts exercised
 
-- Approval fields: `tool_name`, `target`, `scope=single_container`, `safety_level=L2|L3`, boolean `dry_run`, `reason`, `plan_hash`, `expires_at`; no `risk` alias. Missing/invalid required facts visibly block approval. Legacy/invalid `dry_run` remains unknown, never `false`.
+- Approval fields: `tool_name`, `kind`, `target`, `target_id`, `rule_id`, `rule_version`, `mode`, `revision`, `checks`, `compensation`, `reason`, `plan_hash`, `expires_at`; no `risk` alias. Only a complete `mode=manual` snapshot can be approved; missing target identity, rule, checks or hash visibly blocks approval.
 - Both decision endpoints receive `{ plan_hash, reason }`. Hash comes from the clicked snapshot. Blank approval remarks remain allowed; denial requires a remark. Concurrent clicks do not issue duplicate requests. Expired snapshots cannot be submitted; HTTP 409 is shown and triggers an authoritative refresh.
-- `pending_approval` is independent of `latest_action`. Latest action includes `verification: { status, last_checked_at?, deadline_at?, detail? }`. For trusted modern snapshots without a task, the server supplies `not_started` while pending/approved/executing and `not_applicable` after simulated/denied/expired/failed. A successful execution missing its required task, legacy records, and unverifiable snapshots remain `unknown`. Failed actions still require manual target checking; “not applicable” is not a recovery claim. The frontend does not derive these states or infer recovery from run success.
-- Named SSE: `execution.simulated`, `verify.queued`, `verify.started`, `verify.checked`, `verify.passed`, `verify.failed`, `verify.inconclusive` refresh the aggregate, including when `pending_approval` is null.
+- `pending_approval` is independent of `latest_action`. Latest action shows the receipt (`written`/`not_written`/`unknown`), the compensation, and `verification: { status, phase, last_checked_at?, deadline_at?, detail? }` with the watch phase (`stable`/`recurred`) as its own fact. Legacy records and unverifiable snapshots remain `unknown`; the frontend does not derive these states or infer recovery from run success.
+- Named SSE events (execution, compensation, `verify.*` including `verify.stable`/`verify.recurred`, `review.recorded`) refresh the aggregate, including when `pending_approval` is null.
+- `/remediation`: rules with mode, budget use and block reason; emergency stop/resume and rule reset only for admins and only with a reason. `/report`: rates always shown with raw counts ("样本不足" on an empty denominator) and the review queue. `/changes`: an operator marks a release healthy; a viewer cannot.
+- Console shell (`console.spec.ts`): model-written Markdown keeps formatting but renders no raw HTML, images or `javascript:` links; a flow node opens the diagnosis trace with that step expanded and sensitive keys redacted; the overview lists firing incidents and pending decisions, and one failed section does not hide the others; the incident list filters by server status and locally by text; `⌘K` jumps to an incident. The shell polls `/api/v1/control-room/incidents`, so fixtures answer it.
+- Incident reviews: an operator records the verdict, root cause, fix and manual minutes; the page never sends a reviewer; viewers see reviews without the form.
 
 These tests do not validate backend authorization, transactions, execution, probe scheduling, or real MySQL behavior.

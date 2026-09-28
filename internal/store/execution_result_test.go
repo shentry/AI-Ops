@@ -15,8 +15,8 @@ func TestBoundedExecutionResultPreservesReplayIdentity(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	approval, binding := executionFixture(t, db, now, false, "approved")
-	if _, claimed, err := db.ClaimApprovalExecution(ctx, approval.ID, now, binding); err != nil || !claimed {
+	approval, policy := executionFixture(t, db, now, "approved")
+	if _, claimed, err := db.ClaimApprovalExecution(ctx, approval.ID, now, policy); err != nil || !claimed {
 		t.Fatalf("claim=%v %v", claimed, err)
 	}
 	result, _ := json.Marshal(map[string]string{"output": strings.Repeat("x", maxExecutionResultBytes), "detail": "first"})

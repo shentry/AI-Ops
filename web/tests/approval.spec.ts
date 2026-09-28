@@ -1,12 +1,11 @@
 import { expect, test } from "@playwright/test";
 import { approval, controlRoom, openRoom } from "./fixtures";
 
-const requiredFields = ["tool_name", "target", "scope", "safety_level", "dry_run", "reason", "plan_hash", "expires_at"];
+const requiredFields = ["tool_name", "target", "target_id", "rule_id", "mode", "checks", "reason", "plan_hash", "expires_at"];
 for (const field of requiredFields) {
   test(`missing ${field} visibly blocks approval`, async ({ page }) => {
     const incomplete: Record<string, unknown> = approval();
     delete incomplete[field];
-    if (field === "safety_level") incomplete.risk = "L2"; // Not an authority or a supported alias.
     const state = await openRoom(page, controlRoom(incomplete));
     await expect(page.getByRole("alert")).toContainText("审批信息不完整");
     await expect(page.getByRole("button", { name: "批准执行" })).toBeDisabled();
@@ -14,17 +13,16 @@ for (const field of requiredFields) {
   });
 }
 
-for (const value of [null, "false", 0]) {
-  test(`dry_run ${JSON.stringify(value)} is unknown, never real-execution consent`, async ({ page }) => {
-    await openRoom(page, controlRoom(approval({ dry_run: value })));
-    const panel = page.getByRole("region", { name: "等待你审批" });
-    await expect(panel).toContainText("未知");
-    await expect(panel).not.toContainText("否（会真的执行）");
+// Only a manual rule's snapshot waits for a person; anything else is never consent.
+for (const mode of ["auto", "observe", "", 1]) {
+  test(`mode ${JSON.stringify(mode)} cannot be approved by a person`, async ({ page }) => {
+    await openRoom(page, controlRoom(approval({ mode })));
+    await expect(page.getByRole("alert")).toContainText("人工审批模式");
     await expect(page.getByRole("button", { name: "批准执行" })).toBeDisabled();
   });
 }
 
-for (const [field, value] of [["expires_at", "not-a-date"], ["safety_level", "L1"], ["scope", "all_containers"], ["target", "   "]]) {
+for (const [field, value] of [["expires_at", "not-a-date"], ["checks", []], ["target", "   "], ["target_id", " "]]) {
   test(`invalid ${field} visibly blocks approval`, async ({ page }) => {
     await openRoom(page, controlRoom(approval({ [field]: value })));
     await expect(page.getByRole("alert")).toContainText("审批信息不完整或无效");
@@ -32,18 +30,14 @@ for (const [field, value] of [["expires_at", "not-a-date"], ["safety_level", "L1
   });
 }
 
-for (const dryRun of [false, true]) {
-  test(`explicit dry_run=${dryRun} shows all decision facts`, async ({ page }) => {
-    await openRoom(page, controlRoom(approval({ dry_run: dryRun })));
-    const panel = page.getByRole("region", { name: "等待你审批" });
-    await expect(panel).toContainText("container/sub2api");
-    await expect(panel).toContainText("单个容器");
-    await expect(panel).toContainText("工具安全等级");
-    await expect(panel).toContainText("L2");
-    await expect(panel).toContainText(dryRun ? "是（不会真的执行）" : "否（会真的执行）");
-    await expect(panel.getByRole("button", { name: dryRun ? "批准演练" : "批准执行" })).toBeEnabled();
-  });
-}
+test("a complete manual snapshot shows every decision fact", async ({ page }) => {
+  await openRoom(page, controlRoom(approval({ compensation: "upstream_restore" })));
+  const panel = page.getByRole("region", { name: "等待你审批" });
+  for (const text of ["container/sub2api", "c0ffee", "restart-stopped-process", "人工批准后执行", "容器实例、服务健康", "upstream_restore"]) {
+    await expect(panel).toContainText(text);
+  }
+  await expect(panel.getByRole("button", { name: "批准执行" })).toBeEnabled();
+});
 
 for (const decision of ["approve", "deny"] as const) {
   test(`${decision} submits clicked hash and reason once despite refresh and double click`, async ({ page }) => {
@@ -82,7 +76,7 @@ test("hash conflict requires a new decision on the refreshed snapshot", async ({
   const state = await openRoom(page);
   const newHash = "b".repeat(64);
   state.decide = async (route) => {
-    state.room = controlRoom(approval({ plan_hash: newHash, safety_level: "L3" }));
+    state.room = controlRoom(approval({ plan_hash: newHash, target_id: "d00d" }));
     await route.fulfill({ status: 409, json: { error: "plan_hash mismatch" } });
   };
   await page.getByRole("button", { name: "批准执行" }).click();

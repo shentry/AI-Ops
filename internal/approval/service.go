@@ -19,22 +19,22 @@ type approvalStore interface {
 }
 
 type Service struct {
-	db         approvalStore
-	ttlMinutes int
+	db approvalStore
 }
 
-func NewService(db approvalStore, ttlMinutes int) *Service {
-	return &Service{db: db, ttlMinutes: ttlMinutes}
+func NewService(db approvalStore) *Service {
+	return &Service{db: db}
 }
 
 // Prepare validates an immutable draft without writing it. CompleteRun publishes
 // this draft atomically with the diagnosis, terminal run state and audit events.
+// An auto decision is approved by its rule; a manual one waits for a person.
 // The caller must sanitize reason before handing it to this service.
 func (s *Service) Prepare(incidentID, runID uint64, decision Decision, reason string) (store.Approval, error) {
-	if incidentID == 0 || runID == 0 || s.ttlMinutes <= 0 || strings.TrimSpace(reason) == "" {
-		return store.Approval{}, fmt.Errorf("approval: incident, run, positive TTL and reason are required")
+	if incidentID == 0 || runID == 0 || strings.TrimSpace(reason) == "" {
+		return store.Approval{}, fmt.Errorf("approval: incident, run and reason are required")
 	}
-	if decision.Kind != DecisionApproval && decision.Kind != DecisionAutoL2 {
+	if decision.Kind != DecisionApproval && decision.Kind != DecisionAuto {
 		return store.Approval{}, fmt.Errorf("approval: decision %q cannot create an approval", decision.Kind)
 	}
 	snapshot, err := incident.ParseExecutionContext(decision.ExecutionContext)
@@ -42,25 +42,22 @@ func (s *Service) Prepare(incidentID, runID uint64, decision Decision, reason st
 		return store.Approval{}, err
 	}
 	hash, err := incident.PlanHash(decision.ToolName, decision.Args, decision.ExecutionContext)
-	if err != nil {
-		return store.Approval{}, err
-	}
-	if hash != decision.PlanHash {
+	if err != nil || hash != decision.PlanHash {
 		return store.Approval{}, fmt.Errorf("approval: plan hash does not match execution content")
 	}
-	if decision.Kind == DecisionAutoL2 && (snapshot.SafetyLevel != "L2" || snapshot.DryRun) {
-		return store.Approval{}, fmt.Errorf("approval: automatic approval requires a real L2 action")
+	if (decision.Kind == DecisionAuto) != (snapshot.Rule.Mode == incident.ModeAuto) {
+		return store.Approval{}, fmt.Errorf("approval: decision %q contradicts rule mode %q", decision.Kind, snapshot.Rule.Mode)
 	}
-	now := time.Now().UTC()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	service, rule := snapshot.Service, snapshot.Rule.ID
 	draft := store.Approval{
-		IncidentID: incidentID, RunID: runID, ToolName: decision.ToolName,
+		IncidentID: incidentID, RunID: runID, Service: &service, RuleID: &rule, ToolName: decision.ToolName,
 		ArgsJSON:         datatypes.JSON(append([]byte(nil), decision.Args...)),
 		ExecutionContext: datatypes.JSON(append([]byte(nil), decision.ExecutionContext...)),
-		PlanHash:         hash, Reason: reason, Status: "pending",
-		ExpiresAt: now.Add(time.Duration(s.ttlMinutes) * time.Minute), CreatedAt: now,
+		PlanHash:         hash, Reason: reason, Status: "pending", ExpiresAt: snapshot.ExpiresAt, CreatedAt: now,
 	}
-	if decision.Kind == DecisionAutoL2 {
-		actor, source := "system:auto_l2", "system"
+	if decision.Kind == DecisionAuto {
+		actor, source := "system:rule:"+rule, "rule"
 		draft.Status, draft.DecidedBy, draft.DecisionSource = "approved", &actor, &source
 		draft.DecidedAt, draft.DecisionReason = &now, &reason
 	}

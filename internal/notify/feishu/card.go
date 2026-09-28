@@ -10,8 +10,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"oncall-agent/internal/diagnose"
 	"oncall-agent/internal/notify"
+	"oncall-agent/internal/tools"
 )
 
 // MaxCardBytes is Feishu's maximum serialized size for an interactive card.
@@ -71,8 +71,9 @@ func BuildCard(n notify.Notification) map[string]any {
 	}{
 		{label: "Action", keys: []string{"action", "plan_action"}},
 		{label: "Target", keys: []string{"target"}},
-		{label: "Scope", keys: []string{"scope"}},
-		{label: "Tool safety level", keys: []string{"safety_level"}},
+		{label: "Target ID", keys: []string{"target_id"}},
+		{label: "Rule", keys: []string{"rule_id"}},
+		{label: "Mode", keys: []string{"rule_mode"}},
 		{label: "Reason", keys: []string{"reason", "plan_reason"}},
 		{label: "Expires at", keys: []string{"expires_at"}},
 		{label: "RCA", keys: []string{"rca"}},
@@ -87,13 +88,6 @@ func BuildCard(n notify.Notification) map[string]any {
 	}
 
 	approvalID, hasApproval := notificationApprovalID(n)
-	if _, hasMode := n.Payload["dry_run"]; hasMode || hasApproval {
-		mode := "unknown (execution context incomplete)"
-		if dryRun, ok := n.Payload["dry_run"].(bool); ok {
-			mode = strconv.FormatBool(dryRun)
-		}
-		lines = append(lines, "**Dry run:** "+mode)
-	}
 	decisionReady := approvalCardReady(n.Payload)
 	if hasApproval && !decisionReady {
 		lines = append(lines, "执行上下文不完整，无法批准；请在 Web 控制室查看并重新诊断。")
@@ -213,19 +207,18 @@ func ApprovalButton(action, label string, approvalID uint64, planHash, buttonTyp
 	}
 }
 
-// A bool assertion is intentional: missing/null/string false is not approval
-// for a real change. Display-only payloads cannot recreate a legacy snapshot.
+// A person may approve only a complete manual snapshot: its action, target
+// identity, rule, reason, hash and expiry are all shown. Display-only payloads
+// cannot recreate a legacy snapshot.
 func approvalCardReady(payload map[string]any) bool {
-	action, _ := payload["action"].(string)
-	target, _ := payload["target"].(string)
-	scope, _ := payload["scope"].(string)
-	level, _ := payload["safety_level"].(string)
-	_, hasMode := payload["dry_run"].(bool)
-	hash, _ := payload["plan_hash"].(string)
-	reason, _ := payload["reason"].(string)
-	expires, _ := payload["expires_at"].(string)
-	expiresAt, err := time.Parse(time.RFC3339, expires)
-	return action == "docker_restart" && strings.HasPrefix(target, "container/") && strings.TrimPrefix(target, "container/") != "" && scope == "single_container" && (level == "L2" || level == "L3") && hasMode && strings.TrimSpace(hash) != "" && strings.TrimSpace(reason) != "" && err == nil && !expiresAt.IsZero()
+	text := func(key string) string {
+		value, _ := payload[key].(string)
+		return strings.TrimSpace(value)
+	}
+	kind, name, found := strings.Cut(text("target"), "/")
+	expiresAt, err := time.Parse(time.RFC3339, text("expires_at"))
+	return text("action") != "" && found && kind != "" && name != "" && text("target_id") != "" && text("rule_id") != "" && text("rule_mode") == "manual" &&
+		text("plan_hash") != "" && text("reason") != "" && err == nil && !expiresAt.IsZero()
 }
 
 func notificationApprovalID(n notify.Notification) (uint64, bool) {
@@ -315,7 +308,7 @@ func payloadText(payload map[string]any, key string) string {
 }
 
 func cardText(value string, maxRunes int) string {
-	return truncate(strings.TrimSpace(diagnose.Sanitize(diagnose.ToSafeText(value))), maxRunes)
+	return truncate(strings.TrimSpace(tools.Sanitize(tools.ToSafeText(value))), maxRunes)
 }
 
 func safeCardURL(raw string, incidentID uint64) string {

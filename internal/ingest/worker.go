@@ -2,17 +2,19 @@ package ingest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"oncall-agent/internal/config"
-	"oncall-agent/internal/diagnose"
 	"oncall-agent/internal/eventlog"
 	"oncall-agent/internal/incident"
 	"oncall-agent/internal/metrics"
 	"oncall-agent/internal/store"
+	"oncall-agent/internal/tools"
 )
 
 // 兜底轮询间隔。wake 信号错过了（进程刚重启、Notify 发生在 consume 启动前）
@@ -143,14 +145,6 @@ func (w *Worker) process(ctx context.Context, event store.RawEvent) error {
 	inputs := make([]store.AlertInput, 0, len(alerts))
 	for index := range alerts {
 		alert := &alerts[index] // 取指针，下面要就地改写身份字段
-		// ParseWebhook 允许 alertname 缺失（它只做格式校验），但落库必须有名字。
-		if strings.TrimSpace(alert.Name) == "" {
-			return w.reject(ctx, event.ID, fmt.Errorf("ingest: alerts[%d].labels.alertname is required", index))
-		}
-		// alert.starts_at 是 NOT NULL，且 D04 的时间窗要靠它，零值不能入库。
-		if alert.StartsAt.IsZero() {
-			return w.reject(ctx, event.ID, fmt.Errorf("ingest: alerts[%d].startsAt is required", index))
-		}
 		// 配置了指纹字段却一个都没命中：此时指纹会退化成空串的哈希，
 		// 所有这类告警会被并成同一个对象。宁可拒收，也不让无关告警互相污染。
 		if len(w.cfg.FingerprintFields) > 0 && len(fingerprintKeys(alert.Labels, w.cfg.FingerprintFields)) == 0 {
@@ -162,12 +156,20 @@ func (w *Worker) process(ctx context.Context, event store.RawEvent) error {
 		alert.Fingerprint = Fingerprint(alert.Labels, w.cfg.FingerprintFields)
 		alert.Severity = Severity(alert.Labels, w.cfg.SeverityLabel)
 		alert.AlertHash = FullHash(*alert)
-		inputs = append(inputs, store.AlertInput{
+		input := store.AlertInput{
 			Fingerprint: alert.Fingerprint, AlertHash: alert.AlertHash, Source: alert.Source,
 			Name: alert.Name, Severity: alert.Severity, Status: alert.Status,
 			Labels: alert.Labels, Annotations: alert.Annotations, GeneratorURL: alert.GeneratorURL,
 			StartsAt: alert.StartsAt, ReceivedAt: alert.ReceivedAt,
-		})
+		}
+		if err := store.ValidateAlertInput(input); err != nil {
+			return w.reject(ctx, event.ID, fmt.Errorf("ingest: alerts[%d]: %w", index, err))
+		}
+		// Resolved alerts only update existing membership; they never create a group.
+		if alert.Status == "firing" && utf8.RuneCountInString(GroupKey(CorrelationInput{Name: alert.Name, Labels: alert.Labels}, w.correlator.cfg)) > 255 {
+			return w.reject(ctx, event.ID, fmt.Errorf("ingest: alerts[%d] group key exceeds 255 characters", index))
+		}
+		inputs = append(inputs, input)
 	}
 	// hook 在 store 的事务里跑，所以只能往闭包里攒结果，日志留到提交之后再打 ——
 	// 事务里打了日志又回滚，就会出现"已升级"的假记录。
@@ -271,6 +273,9 @@ func (w *Worker) process(ctx context.Context, event store.RawEvent) error {
 	// processed_at 用当前时间：它记录的是"什么时候处理完"，和 received_at 是两件事。
 	results, err := w.db.ApplyRawEvent(ctx, event.ID, inputs, time.Now().UTC(), hook)
 	if err != nil {
+		if errors.Is(err, store.ErrInvalidAlertInput) {
+			return w.reject(ctx, event.ID, err)
+		}
 		return err
 	}
 	// 事务已提交，下面的日志才代表真实发生过的事。
@@ -334,7 +339,7 @@ func incidentEvent(incidentID uint64, eventType eventlog.EventType, phase, statu
 }
 
 func safeIncidentSummary(summary string) string {
-	clean := diagnose.Sanitize(diagnose.ToSafeText(summary))
+	clean := tools.Sanitize(tools.ToSafeText(summary))
 	if clean == "" {
 		return "ingest event"
 	}

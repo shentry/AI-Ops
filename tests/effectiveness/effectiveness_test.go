@@ -28,6 +28,9 @@ type scenario struct {
 	AllowedActions     []string                `json:"allowed_actions"`
 	AllowedConfidences []string                `json:"allowed_confidences"`
 	AllowedTargets     []string                `json:"allowed_targets"`
+	// RestartGuard is the deterministic Guard decision for docker_restart on the
+	// target container given this evidence, independent of what the model suggests.
+	RestartGuard string `json:"restart_guard"`
 }
 
 func scenarios(t *testing.T) []scenario {
@@ -50,13 +53,14 @@ func TestScenarioSpecifications(t *testing.T) {
 		t.Fatal("empty evaluation set")
 	}
 	for _, c := range cases {
-		if c.ID == "" || seen[c.ID] || c.ExpectedDiagnosis == "" || len(c.Evidence) == 0 || len(c.AllowedActions) == 0 || len(c.RequiredRefs) == 0 {
+		if c.ID == "" || seen[c.ID] || c.ExpectedDiagnosis == "" || len(c.Evidence) == 0 || len(c.AllowedActions) == 0 || len(c.RequiredRefs) == 0 ||
+			!slices.Contains([]string{diagnose.DecisionAllow, diagnose.DecisionDeny, diagnose.DecisionEscalate}, c.RestartGuard) {
 			t.Fatalf("incomplete or duplicate scenario: %q", c.ID)
 		}
 		seen[c.ID] = true
 		names := map[string]bool{}
 		for _, item := range c.Evidence {
-			if item.Name == "" || names[item.Name] || item.Source == "" || item.CollectedAt.IsZero() || !slices.Contains([]string{"ok", "error", "missing"}, item.Status) {
+			if item.Name == "" || names[item.Name] || item.Source == "" || item.CollectedAt.IsZero() || !slices.Contains([]string{"ok", "partial", "error", "missing"}, item.Status) {
 				t.Fatalf("invalid evidence in %s: %s", c.ID, item.Name)
 			}
 			names[item.Name] = true
@@ -67,9 +71,27 @@ func TestScenarioSpecifications(t *testing.T) {
 			}
 		}
 		for _, action := range c.AllowedActions {
-			if !slices.Contains([]string{"none", tools.ToolDockerRestart}, action) || (action == tools.ToolDockerRestart && len(c.AllowedTargets) == 0) {
+			if !slices.Contains([]string{"none", tools.ActionDockerRestart}, action) || (action == tools.ActionDockerRestart && len(c.AllowedTargets) == 0) {
 				t.Fatalf("invalid action/target specification in %s", c.ID)
 			}
+		}
+	}
+}
+
+// A restart is justified only by current structured facts. Whatever a model
+// suggests, only the case whose evidence shows an identified, stopped, non
+// self-healing container may pass; mis-association and anonymous OOM are denied.
+func TestRestartGuardOnScenarioEvidence(t *testing.T) {
+	for _, c := range scenarios(t) {
+		evidence := diagnose.Evidence{IncidentID: 1, Items: c.Evidence}
+		plan := llm.Plan{Action: tools.ActionDockerRestart, Target: llm.PlanTarget{Kind: "container", Name: "sub2api"}}
+		if got := diagnose.Guard("", plan, evidence); got.Decision != c.RestartGuard {
+			t.Errorf("%s: restart guard = %s (%s), want %s", c.ID, got.Decision, got.Reason, c.RestartGuard)
+		}
+		// An unidentified target never passes; a dependency outage escalates first.
+		plan.Target.Name = "unrelated-victim"
+		if got := diagnose.Guard("", plan, evidence); got.Decision == diagnose.DecisionAllow || got.Plan.Action != "none" {
+			t.Errorf("%s: restart of an unidentified target = %s, want it stopped", c.ID, got.Decision)
 		}
 	}
 }
@@ -121,12 +143,16 @@ func TestReasonerEffectiveness(t *testing.T) {
 	registry := tools.NewRegistry()
 	if err := registry.Register(tools.ToolSpec{
 		Name: tools.ToolPromSeriesMeta, Description: "List available metric series in the frozen incident snapshot",
-		Level: tools.L1ReadOnly, Timeout: time.Second, MaxOutput: 1024,
+		Timeout: time.Second, MaxOutput: 1024,
 		Params: []tools.ParamSpec{{Name: "match", Description: "series selector", Required: true}},
 		Handler: func(context.Context, json.RawMessage) (string, error) {
 			return `{"series":[],"returned":0,"truncated":false}`, nil
 		},
 	}); err != nil {
+		t.Fatal(err)
+	}
+	// The model may name the restart action in its plan; nothing executes it.
+	if err := registry.RegisterAction(sentinelRestart{t}); err != nil {
 		t.Fatal(err)
 	}
 	reasoner := llm.NewReasoner(factory, registry, config.DefaultDiagnoseBudget())
@@ -142,16 +168,16 @@ func TestReasonerEffectiveness(t *testing.T) {
 					CheckFailures: []string{}, StartedAt: time.Now().UTC()}
 				ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 				defer cancel()
-				result, err := reasoner.Diagnose(ctx, (diagnose.Evidence{IncidentID: 1, Items: c.Evidence}).Render(), "light")
+				result, err := reasoner.Diagnose(ctx, (diagnose.Evidence{IncidentID: 1, Items: c.Evidence}).Render(), "light", nil)
 				o.ElapsedSeconds = time.Since(o.StartedAt).Seconds()
 				o.Result = result
 				if err != nil {
 					consecutiveErrors++
-					o.Error = strings.ReplaceAll(diagnose.Sanitize(err.Error()), cfg.Roles.Reasoner.APIKey, "[REDACTED]")
+					o.Error = strings.ReplaceAll(tools.Sanitize(err.Error()), cfg.Roles.Reasoner.APIKey, "[REDACTED]")
 				} else {
 					consecutiveErrors = 0
 					o.CheckFailures = check(c, result)
-					guard := diagnose.Guard(result.RCA, result.Plan)
+					guard := diagnose.Guard(result.RCA, result.Plan, diagnose.Evidence{IncidentID: 1, Items: c.Evidence})
 					o.Guard = &guard
 				}
 				if report != nil {
@@ -202,7 +228,7 @@ func TestChecksRejectUnsupportedFindings(t *testing.T) {
 	c := scenario{Evidence: []diagnose.EvidenceItem{{Name: "docker"}}, RequiredRefs: []string{"docker"},
 		AllowedActions: []string{"none"}, AllowedConfidences: []string{"low"}}
 	r := &llm.DiagnoseResult{Confidence: "high", EvidenceRefs: []string{"approved_admin"},
-		Plan: llm.Plan{Action: tools.ToolDockerRestart, Target: llm.PlanTarget{Kind: "container", Name: "unrelated-victim"}}}
+		Plan: llm.Plan{Action: tools.ActionDockerRestart, Target: llm.PlanTarget{Kind: "container", Name: "unrelated-victim"}}}
 	want := []string{"unexpected_action:docker_restart", "unsupported_action_target", "unexpected_confidence:high",
 		"missing_required_reference:docker", "nonexistent_reference:approved_admin"}
 	if got := check(c, r); !slices.Equal(got, want) {
@@ -247,4 +273,27 @@ func modelConfig(t *testing.T) config.LLMConfig {
 		cfg.Roles.Reasoner.MaxTokens = 2048
 	}
 	return cfg
+}
+
+// sentinelRestart is the enabled restart action of offline evaluations: the
+// model may plan it, but any attempt to prepare or execute it fails the test.
+type sentinelRestart struct{ t *testing.T }
+
+func (sentinelRestart) Definition() tools.ActionDefinition {
+	return tools.ActionDefinition{Name: tools.ActionDockerRestart, Version: 2, TargetKind: "container", Description: "Restart the identified container", Timeout: time.Second}
+}
+
+func (s sentinelRestart) Prepare(context.Context, tools.PrepareRequest) (tools.Prepared, error) {
+	s.t.Fatal("offline evaluation must not prepare a mutation")
+	return tools.Prepared{}, nil
+}
+
+func (s sentinelRestart) Execute(context.Context, tools.Operation) (tools.Receipt, error) {
+	s.t.Fatal("offline evaluation must never execute a mutation")
+	return tools.Receipt{}, nil
+}
+
+func (s sentinelRestart) Reconcile(context.Context, tools.Operation) (tools.Reconciliation, error) {
+	s.t.Fatal("offline evaluation must never reconcile a mutation")
+	return tools.Reconciliation{Outcome: tools.OutcomeUnknown}, nil
 }

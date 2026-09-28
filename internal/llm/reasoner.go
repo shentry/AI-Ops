@@ -2,6 +2,8 @@ package llm
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,14 +27,17 @@ type PlanTarget struct {
 	Name string `json:"name"`
 }
 
-// Plan 是结构化修复计划。action=none 表示"不建议自动动作"。
+// Plan is the model's suggestion only; action none means no action. Params hold the action's declared,
+// model-suggested parameters; trusted values are added by the action itself.
 type Plan struct {
-	Action     string     `json:"action"`
-	Target     PlanTarget `json:"target"`
-	Reason     string     `json:"reason"`
-	Confidence string     `json:"confidence"`
-	Risk       string     `json:"risk"`
-	Expected   string     `json:"expected"`
+	Action       string          `json:"action"`
+	Target       PlanTarget      `json:"target"`
+	Params       json.RawMessage `json:"params,omitempty"`
+	EvidenceRefs []string        `json:"evidence_refs,omitempty"`
+	Reason       string          `json:"reason"`
+	Confidence   string          `json:"confidence"`
+	Risk         string          `json:"risk"`
+	Expected     string          `json:"expected"`
 }
 
 // DiagnoseResult 是一次推理的完整产出，含 token 用量和工具步日志。
@@ -60,6 +65,26 @@ type StepLog struct {
 	FinishedAt time.Time
 }
 
+// DiagnosisInput is what a diagnosis sends to the model besides the messages the
+// ReAct loop builds from it. It is handed to the caller's recorder before the
+// first model call, so the replay record never lags behind what the model saw.
+type DiagnosisInput struct {
+	Model        string
+	PromptSHA256 string
+	Tools        []ToolDefinition
+	// Actions are the plannable action definitions the prompt was built from;
+	// a frozen replay rebuilds the same prompt from them.
+	Actions  []tools.ActionDefinition
+	Evidence string
+}
+
+// ToolDefinition is the read-only tool contract exposed to the model.
+type ToolDefinition struct {
+	Name        string
+	Description string
+	Params      []tools.ParamSpec
+}
+
 // diagnoseContract 是 LLM 输出 JSON 的解析目标。
 type diagnoseContract struct {
 	RCA          string   `json:"rca"`
@@ -74,10 +99,24 @@ type Reasoner struct {
 	factory  *Factory
 	registry *tools.Registry
 	budget   config.DiagnoseBudget
+	// prompt and its digest are built once from the enabled actions; the
+	// digest identifies the prompt version in replay records.
+	prompt       string
+	promptSHA256 string
+	plannable    []tools.ActionDefinition
+	actions      map[string]tools.ActionDefinition
 }
 
+// NewReasoner must be called after every tool and action is registered.
 func NewReasoner(factory *Factory, registry *tools.Registry, budget config.DiagnoseBudget) *Reasoner {
-	return &Reasoner{factory: factory, registry: registry, budget: budget}
+	plannable := registry.PlannableActions()
+	actions := make(map[string]tools.ActionDefinition, len(plannable))
+	for _, def := range plannable {
+		actions[def.Name] = def
+	}
+	prompt := buildSystemPrompt(plannable)
+	sum := sha256.Sum256([]byte(prompt))
+	return &Reasoner{factory: factory, registry: registry, budget: budget, prompt: prompt, promptSHA256: hex.EncodeToString(sum[:]), plannable: plannable, actions: actions}
 }
 
 // maxSteps 把 mode 翻译成 ReAct 步数上限。未知 mode 按 light 收紧，
@@ -92,8 +131,9 @@ func (r *Reasoner) maxSteps(mode string) int {
 // Diagnose 执行一次推理。输出不是合法 JSON 时重试一次，仍失败返回错误；
 // 任何失败都不会产生 Plan 副作用 —— Plan 只是数据，执行决策在 D09+。
 // 失败时返回的 *DiagnoseResult 可能非空（只带 Steps/token，供审计），
-// 调用方必须先判 error 再看内容。
-func (r *Reasoner) Diagnose(ctx context.Context, evidence string, mode string) (result *DiagnoseResult, err error) {
+// 调用方必须先判 error 再看内容。record 非空时在首次调用模型前收到完整输入；
+// 它返回错误则不调用模型。
+func (r *Reasoner) Diagnose(ctx context.Context, evidence string, mode string, record func(DiagnosisInput) error) (result *DiagnoseResult, err error) {
 	// Context compaction permits longer investigations; keep the entire run,
 	// including contract retry, below the worker's five-minute stale threshold.
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
@@ -107,16 +147,14 @@ func (r *Reasoner) Diagnose(ctx context.Context, evidence string, mode string) (
 	if strings.TrimSpace(evidence) == "" {
 		return nil, errors.New("llm: evidence is empty")
 	}
-	chatModel, inputLimit, err := r.factory.buildForDiagnosis()
+	chatModel, modelID, inputLimit, err := r.factory.buildForDiagnosis()
 	if err != nil {
 		return nil, err
 	}
 	recorder := &stepRecorder{}
 	counter := &usageCounter{}
-	agentTools, err := r.agentTools(recorder)
-	if err != nil {
-		return nil, err
-	}
+	specs := r.registry.ForLLM()
+	agentTools := r.agentTools(specs, recorder)
 	agent, err := react.NewAgent(ctx, &react.AgentConfig{
 		ToolCallingModel: &diagnosisModel{ToolCallingChatModel: wrapUsageModel(chatModel, counter), maxSteps: r.maxSteps(mode),
 			context: contextBudget{inputLimit: inputLimit, stats: stats, estimator: &tokenEstimator{}}},
@@ -127,8 +165,17 @@ func (r *Reasoner) Diagnose(ctx context.Context, evidence string, mode string) (
 		return nil, fmt.Errorf("llm: build react agent: %w", err)
 	}
 
+	if record != nil {
+		definitions := make([]ToolDefinition, 0, len(specs))
+		for _, spec := range specs {
+			definitions = append(definitions, ToolDefinition{Name: spec.Name, Description: spec.Description, Params: spec.Params})
+		}
+		if err := record(DiagnosisInput{Model: modelID, PromptSHA256: r.promptSHA256, Tools: definitions, Actions: r.plannable, Evidence: evidence}); err != nil {
+			return nil, fmt.Errorf("llm: record diagnosis input: %w", err)
+		}
+	}
 	messages := []*schema.Message{
-		schema.SystemMessage(systemPrompt),
+		schema.SystemMessage(r.prompt),
 		schema.UserMessage(evidence),
 	}
 	result, err = r.runOnce(ctx, agent, messages, recorder)
@@ -173,7 +220,7 @@ func (r *Reasoner) runOnce(ctx context.Context, agent *react.Agent, messages []*
 	if final == nil || strings.TrimSpace(final.Content) == "" {
 		return nil, errors.New("llm: empty model output")
 	}
-	contract, err := parseContract(final.Content)
+	contract, err := parseContract(final.Content, r.actions)
 	if err != nil {
 		return nil, err
 	}
@@ -201,8 +248,9 @@ func (e *contractError) Error() string { return e.err.Error() }
 func (e *contractError) Unwrap() error { return ErrContractParse }
 
 // parseContract 剥离 markdown 围栏后按契约解析。字段校验：
-// rca 非空；confidence 限定三档，非法值视为解析失败（宁可重试）。
-func parseContract(raw string) (*diagnoseContract, error) {
+// rca 非空；confidence 限定三档；plan.action 只能是 none 或已启用的动作，
+// params 只能含该动作声明的参数。非法值视为解析失败（宁可重试）。
+func parseContract(raw string, actions map[string]tools.ActionDefinition) (*diagnoseContract, error) {
 	cleaned := stripJSONFence(raw)
 	var contract diagnoseContract
 	if err := json.Unmarshal([]byte(cleaned), &contract); err != nil {
@@ -216,10 +264,29 @@ func parseContract(raw string) (*diagnoseContract, error) {
 	default:
 		return nil, &contractError{raw: raw, err: fmt.Errorf("llm: invalid confidence %q", contract.Confidence)}
 	}
-	// These are the currently supported remediation suggestions. Policy still
-	// validates registration, target, scope and approval before any execution.
-	if contract.Plan.Action != "none" && contract.Plan.Action != tools.ToolDockerRestart {
-		return nil, &contractError{raw: raw, err: errors.New("llm: plan.action must be none or docker_restart")}
+	// The same enabled definitions built the prompt. Policy still validates
+	// the rule, facts, scope and budget before any execution.
+	if contract.Plan.Action == "none" {
+		return &contract, nil
+	}
+	def, ok := actions[contract.Plan.Action]
+	if !ok {
+		return nil, &contractError{raw: raw, err: fmt.Errorf("llm: plan.action %q is not none or an enabled action", contract.Plan.Action)}
+	}
+	if len(contract.Plan.Params) > 0 && string(contract.Plan.Params) != "null" {
+		var params map[string]json.RawMessage
+		if err := json.Unmarshal(contract.Plan.Params, &params); err != nil {
+			return nil, &contractError{raw: raw, err: errors.New("llm: plan.params must be a JSON object")}
+		}
+		declared := make(map[string]bool, len(def.Params))
+		for _, p := range def.Params {
+			declared[p.Name] = true
+		}
+		for name := range params {
+			if !declared[name] {
+				return nil, &contractError{raw: raw, err: fmt.Errorf("llm: plan.params.%s is not a parameter of %s", name, def.Name)}
+			}
+		}
 	}
 	return &contract, nil
 }
@@ -255,10 +322,9 @@ func (r *stepRecorder) record(step StepLog) {
 	r.steps = append(r.steps, step)
 }
 
-// agentTools 把 Registry.ForLLM() 的 L1 工具适配成 Eino InvokableTool。
-// 只有 L1 能进这个列表 —— 这是 LLM 权限面的第二道闸（第一道是 ForLLM 本身）。
-func (r *Reasoner) agentTools(recorder *stepRecorder) ([]tool.BaseTool, error) {
-	specs := r.registry.ForLLM()
+// agentTools 把 Registry.ForLLM() 的只读工具适配成 Eino InvokableTool。
+// 写动作不是工具，永远不会出现在这个列表里。
+func (r *Reasoner) agentTools(specs []tools.ToolSpec, recorder *stepRecorder) []tool.BaseTool {
 	agentTools := make([]tool.BaseTool, 0, len(specs))
 	for _, spec := range specs {
 		params := make(map[string]*schema.ParameterInfo, len(spec.Params))
@@ -271,7 +337,7 @@ func (r *Reasoner) agentTools(recorder *stepRecorder) ([]tool.BaseTool, error) {
 		}
 		agentTools = append(agentTools, &registryTool{registry: r.registry, spec: spec, params: params, recorder: recorder})
 	}
-	return agentTools, nil
+	return agentTools
 }
 
 // registryTool 把 tools.ToolSpec 适配成 Eino InvokableTool：
@@ -299,9 +365,9 @@ func (t *registryTool) InvokableRun(ctx context.Context, argumentsInJSON string,
 		// 工具失败以观测文本喂回模型，而不是炸掉整个 ReAct 循环：
 		// Prometheus 抖一下不该让这次诊断归零，模型看到失败后
 		// 可以基于其余证据出低置信结论。StepLog 里仍记 Err 供审计。
-		entry.Err = err.Error()
+		entry.Err = tools.Sanitize(err.Error())
 		t.recorder.record(entry)
-		return "tool error: " + err.Error(), nil
+		return "tool error: " + entry.Err, nil
 	}
 	entry.Output = output
 	t.recorder.record(entry)

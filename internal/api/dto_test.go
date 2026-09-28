@@ -11,9 +11,22 @@ import (
 	"oncall-agent/internal/store"
 )
 
+// v3Snapshot is a complete restart snapshot whose private fields (check URL,
+// member fingerprints) must never reach an API response.
+func v3Snapshot(mode string, compensation *incident.Compensation) datatypes.JSON {
+	raw, _ := json.Marshal(incident.ExecutionContext{Version: incident.ExecutionContextVersion, Kind: incident.KindPrimary, Service: "sub2api",
+		Rule:          incident.RuleRef{ID: "restart", Version: "r1@000000000000", Mode: mode, Alerts: []string{"Sub2APIDown"}},
+		ActionVersion: 2, Target: incident.Object{Kind: "container", Name: "sub2api", ID: "c0ffee"}, Revision: "started_at=2026-09-24T00:00:00Z",
+		PreState: json.RawMessage(`{"status":"exited"}`), Members: []string{"private-member"}, FaultAlert: "Sub2APIDown",
+		ExpiresAt: time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC), Compensation: compensation,
+		Verification: incident.VerificationSpec{Checks: []incident.Check{{Kind: incident.CheckHealth, Params: json.RawMessage(`{"base_url":"http://private-target.invalid:8080"}`)}},
+			IntervalSeconds: 10, WindowSeconds: 120, TimeoutSeconds: 5, RequiredPasses: 1}})
+	return raw
+}
+
 func completeApproval(t *testing.T) store.Approval {
 	t.Helper()
-	row := store.Approval{ID: 7, IncidentID: 11, RunID: 9, ToolName: "docker_restart", Status: "pending", Reason: "manual approval required", ExpiresAt: time.Now().UTC().Add(time.Hour), ArgsJSON: datatypes.JSON(`{"target_kind":"container","target_name":"sub2api"}`), ExecutionContext: datatypes.JSON(`{"safety_level":"L2","dry_run":false,"verification":{"kind":"sub2api_http_health","target_name":"sub2api","base_url":"http://private-target.invalid:8080","member_fingerprints":["private-member"],"interval_seconds":10,"window_seconds":120,"timeout_seconds":5}}`)}
+	row := store.Approval{ID: 7, IncidentID: 11, RunID: 9, ToolName: "docker_restart", Status: "pending", Reason: "manual approval required", ExpiresAt: time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC), ArgsJSON: datatypes.JSON(`{"target_kind":"container","target_name":"sub2api"}`), ExecutionContext: v3Snapshot(incident.ModeManual, nil)}
 	var err error
 	row.PlanHash, err = incident.PlanHash(row.ToolName, row.ArgsJSON, row.ExecutionContext)
 	if err != nil {
@@ -41,15 +54,19 @@ func approvalJSON(t *testing.T, row store.Approval) map[string]any {
 }
 
 func TestApprovalDTOExecutionSnapshot(t *testing.T) {
-	for _, dryRun := range []bool{false, true} {
+	for _, mode := range []string{incident.ModeManual, incident.ModeAuto} {
 		row := completeApproval(t)
-		if dryRun {
-			row.ExecutionContext = datatypes.JSON(strings.Replace(string(row.ExecutionContext), `"dry_run":false`, `"dry_run":true`, 1))
-			row.PlanHash, _ = incident.PlanHash(row.ToolName, row.ArgsJSON, row.ExecutionContext)
-		}
+		compensation := &incident.Compensation{Action: "upstream_restore", ActionVersion: 1, Args: json.RawMessage(`{"account_id":7}`), Revision: "r",
+			Checks: []incident.Check{{Kind: incident.CheckAccount, Params: json.RawMessage(`{"account_id":7,"schedulable":true}`)}}}
+		row.ExecutionContext = v3Snapshot(mode, compensation)
+		row.PlanHash, _ = incident.PlanHash(row.ToolName, row.ArgsJSON, row.ExecutionContext)
 		result := approvalJSON(t, row)
-		if result["target"] != "container/sub2api" || result["scope"] != "single_container" || result["safety_level"] != "L2" || result["dry_run"] != dryRun {
+		if result["target"] != "container/sub2api" || result["target_id"] != "c0ffee" || result["rule_id"] != "restart" || result["rule_version"] != "r1@000000000000" ||
+			result["mode"] != mode || result["kind"] != "primary" || result["compensation"] != "upstream_restore" || result["revision"] != "started_at=2026-09-24T00:00:00Z" {
 			t.Fatalf("snapshot projection = %#v", result)
+		}
+		if checks := result["checks"].([]any); len(checks) != 1 || checks[0] != "health" {
+			t.Fatalf("checks = %#v", result["checks"])
 		}
 		if result["verification"].(map[string]any)["status"] != "not_started" {
 			t.Fatalf("verification = %#v", result)
@@ -58,23 +75,23 @@ func TestApprovalDTOExecutionSnapshot(t *testing.T) {
 }
 
 func TestApprovalDTOIncompleteSnapshotIsUnknown(t *testing.T) {
-	for _, name := range []string{"legacy", "malformed", "missing_bool", "wrong_hash", "wrong_target"} {
+	for _, name := range []string{"legacy", "malformed", "older_version", "wrong_hash", "wrong_target"} {
 		t.Run(name, func(t *testing.T) {
 			row := completeApproval(t)
 			switch name {
 			case "legacy":
 				row.ExecutionContext = nil
 			case "malformed":
-				row.ExecutionContext = datatypes.JSON(`{"dry_run":false}`)
-			case "missing_bool":
-				row.ExecutionContext = datatypes.JSON(strings.Replace(string(row.ExecutionContext), `"dry_run":false,`, "", 1))
+				row.ExecutionContext = datatypes.JSON(`{"version":3}`)
+			case "older_version":
+				row.ExecutionContext = datatypes.JSON(`{"version":2,"safety_level":"L2","dry_run":false}`)
 			case "wrong_hash":
 				row.PlanHash = "outdated"
 			case "wrong_target":
 				row.ArgsJSON = datatypes.JSON(`{"target_kind":"container","target_name":"other"}`)
 			}
 			result := approvalJSON(t, row)
-			for _, key := range []string{"target", "scope", "safety_level", "dry_run"} {
+			for _, key := range []string{"target", "target_id", "rule_id", "mode", "checks"} {
 				if v := result[key]; v != nil && v != "" {
 					t.Fatalf("incomplete snapshot inferred %s=%v", key, v)
 				}
@@ -83,6 +100,24 @@ func TestApprovalDTOIncompleteSnapshotIsUnknown(t *testing.T) {
 				t.Fatalf("verification = %#v", result)
 			}
 		})
+	}
+}
+
+// The structured receipt is shown; the verification phase distinguishes
+// deciding recovery from watching for a recurrence.
+func TestApprovalDTOReceiptAndPhase(t *testing.T) {
+	row := completeApproval(t)
+	row.Status = "executed"
+	result := datatypes.JSON(`{"action":"docker_restart","operation_id":"op-7","written":true,"outcome":"written","before":"started_at=a","after":"started_at=b","detail":"restarted"}`)
+	row.ResultJSON = &result
+	row.Verification = &store.VerifyTask{ApprovalID: 7, Status: "pending", Phase: "watch", DeadlineAt: time.Date(2030, 1, 1, 0, 30, 0, 0, time.UTC)}
+	got := approvalJSON(t, row)
+	receipt := got["result"].(map[string]any)
+	if receipt["written"] != true || receipt["outcome"] != "written" || receipt["before"] != "started_at=a" || receipt["after"] != "started_at=b" {
+		t.Fatalf("receipt = %#v", receipt)
+	}
+	if got["verification"].(map[string]any)["phase"] != "watch" {
+		t.Fatalf("verification = %#v", got["verification"])
 	}
 }
 
@@ -108,14 +143,14 @@ func TestApprovalDTOVerification(t *testing.T) {
 			}
 		})
 	}
-	for _, status := range []string{"pending", "approved", "executing", "executed", "failed", "denied", "expired", "simulated"} {
+	for _, status := range []string{"pending", "approved", "executing", "executed", "failed", "aborted", "denied", "expired"} {
 		row := completeApproval(t)
 		row.Status = status
 		expected := "unknown"
 		switch status {
 		case "pending", "approved", "executing":
 			expected = "not_started"
-		case "simulated", "denied", "expired", "failed":
+		case "aborted", "denied", "expired", "failed":
 			expected = "not_applicable"
 		}
 		result := approvalJSON(t, row)

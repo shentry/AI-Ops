@@ -38,15 +38,15 @@ func (s *fakeModelSwitchService) Select(_ context.Context, model string) (llm.Mo
 	return s.selection, nil
 }
 
-func TestModelAPIPublicStatusAndBearerMutation(t *testing.T) {
+func TestModelAPIViewerStatusAndAdminMutation(t *testing.T) {
 	svc := &fakeModelSwitchService{
 		selection: llm.ModelSelection{Model: "glm-5", UpdatedAt: time.Date(2026, 8, 22, 21, 0, 0, 0, time.UTC)},
 		options:   []llm.ModelOption{{ID: "glm-5"}, {ID: "deepseek-v4-pro", ThinkingEnabled: true}},
 	}
-	api := NewModelAPI(svc, "secret", NewConsole())
+	api := NewModelAPI(svc, testAuth(t))
 
 	public := httptest.NewRecorder()
-	api.ServeHTTP(public, httptest.NewRequest(http.MethodGet, "/api/v1/control-room/model", nil))
+	api.ServeHTTP(public, withBearer(httptest.NewRequest(http.MethodGet, "/api/v1/control-room/model", nil), testViewerToken))
 	if public.Code != http.StatusOK {
 		t.Fatalf("public status = %d body=%s", public.Code, public.Body.String())
 	}
@@ -63,9 +63,17 @@ func TestModelAPIPublicStatusAndBearerMutation(t *testing.T) {
 	if unauthorized.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthorized mutation = %d", unauthorized.Code)
 	}
+	// The shared automation token and non-admin operators cannot switch the model.
+	for _, token := range []string{testMachineToken, testOperatorToken} {
+		forbidden := httptest.NewRecorder()
+		api.ServeHTTP(forbidden, withBearer(httptest.NewRequest(http.MethodPut, "/api/v1/admin/model", strings.NewReader(`{"model":"deepseek-v4-pro"}`)), token))
+		if forbidden.Code != http.StatusForbidden || svc.selected != "" {
+			t.Fatalf("token %.8s mutation = %d", token, forbidden.Code)
+		}
+	}
 
 	change := httptest.NewRequest(http.MethodPut, "/api/v1/admin/model", strings.NewReader(`{"model":"deepseek-v4-pro"}`))
-	change.Header.Set("Authorization", "Bearer secret")
+	change.Header.Set("Authorization", "Bearer "+testAdminToken)
 	change.Header.Set("Content-Type", "application/json")
 	changed := httptest.NewRecorder()
 	api.ServeHTTP(changed, change)
@@ -76,9 +84,9 @@ func TestModelAPIPublicStatusAndBearerMutation(t *testing.T) {
 
 func TestModelAPIRejectsUnallowedModelBeforeSuccess(t *testing.T) {
 	svc := &fakeModelSwitchService{selection: llm.ModelSelection{Model: "glm-5"}, selectErr: llm.ErrModelNotAllowed}
-	api := NewModelAPI(svc, "secret", nil)
+	api := NewModelAPI(svc, testAuth(t))
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/admin/model", strings.NewReader(`{"model":"blocked"}`))
-	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Authorization", "Bearer "+testAdminToken)
 	req.Header.Set("Content-Type", "application/json")
 	resp := httptest.NewRecorder()
 	api.ServeHTTP(resp, req)
@@ -88,7 +96,7 @@ func TestModelAPIRejectsUnallowedModelBeforeSuccess(t *testing.T) {
 
 	svc.selectErr = errors.New("mysql unavailable")
 	req = httptest.NewRequest(http.MethodPut, "/api/v1/admin/model", strings.NewReader(`{"model":"blocked"}`))
-	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Authorization", "Bearer "+testAdminToken)
 	req.Header.Set("Content-Type", "application/json")
 	resp = httptest.NewRecorder()
 	api.ServeHTTP(resp, req)

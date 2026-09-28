@@ -62,6 +62,14 @@ func validateApprovalCreate(approval Approval) error {
 	if err != nil || hash != approval.PlanHash {
 		return errors.New("store: approval execution snapshot is invalid")
 	}
+	snapshot, _ := incident.ParseExecutionContext(approval.ExecutionContext)
+	// The indexed columns mirror the hashed snapshot; they are never a second source.
+	if approval.Service == nil || *approval.Service != snapshot.Service || approval.RuleID == nil || *approval.RuleID != snapshot.Rule.ID || !approval.ExpiresAt.Equal(snapshot.ExpiresAt) {
+		return errors.New("store: approval service, rule and expiry must match its snapshot")
+	}
+	if (snapshot.Kind == incident.KindCompensation) != (approval.ParentApprovalID != nil) {
+		return errors.New("store: only a compensation has a parent approval")
+	}
 	return nil
 }
 
@@ -307,8 +315,17 @@ func insertApproval(ctx context.Context, tx *gorm.DB, row Approval) (Approval, e
 	if row.Status != "pending" && row.Status != "approved" {
 		return Approval{}, errors.New("store: invalid prepared approval status")
 	}
-	if row.Status == "approved" && (row.DecidedBy == nil || *row.DecidedBy != "system:auto_l2" || row.DecisionSource == nil || *row.DecisionSource != "system" || row.DecidedAt == nil) {
-		return Approval{}, errors.New("store: automatic approval requires system decision metadata")
+	if row.Status == "approved" {
+		snapshot, _ := incident.ParseExecutionContext(row.ExecutionContext)
+		want := "system:rule:" + snapshot.Rule.ID
+		if snapshot.Kind == incident.KindCompensation {
+			want = "system:compensation"
+		} else if snapshot.Rule.Mode != incident.ModeAuto {
+			return Approval{}, errors.New("store: only an auto rule approves a primary action without a person")
+		}
+		if row.DecidedBy == nil || *row.DecidedBy != want || row.DecisionSource == nil || *row.DecisionSource != "rule" || row.DecidedAt == nil {
+			return Approval{}, errors.New("store: automatic approval requires rule decision metadata")
+		}
 	}
 	if row.Status == "pending" && (row.DecidedBy != nil || row.DecidedAt != nil || row.DecisionSource != nil) {
 		return Approval{}, errors.New("store: pending approval cannot have a decision")
@@ -321,7 +338,7 @@ func insertApproval(ctx context.Context, tx *gorm.DB, row Approval) (Approval, e
 		return Approval{}, err
 	}
 	if row.Status == "approved" {
-		if err := appendApprovalEvent(ctx, tx, row, eventlog.EventApprovalApproved, "approved", "approval approved by system", *row.DecidedAt); err != nil {
+		if err := appendApprovalEvent(ctx, tx, row, eventlog.EventApprovalApproved, "approved", "approval approved by "+*row.DecidedBy, *row.DecidedAt); err != nil {
 			return Approval{}, err
 		}
 	}

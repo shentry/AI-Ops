@@ -67,7 +67,7 @@ func incidentRequest(t *testing.T, api *IncidentAPI, method, path, token string)
 }
 
 func TestIncidentAPIRequiresAuth(t *testing.T) {
-	api := NewIncidentAPI(&fakeIncidentStore{}, "secret", nil)
+	api := NewIncidentAPI(&fakeIncidentStore{}, testAuth(t), nil)
 	for _, path := range []string{"/api/v1/incidents", "/api/v1/incidents/1", "/api/v1/incidents/1/diagnose"} {
 		response := incidentRequest(t, api, http.MethodGet, path, "Bearer wrong")
 		if response.Code != http.StatusUnauthorized {
@@ -78,7 +78,7 @@ func TestIncidentAPIRequiresAuth(t *testing.T) {
 
 func TestIncidentAPIListFiltersByStatus(t *testing.T) {
 	fake := &fakeIncidentStore{incidents: []store.Incident{{ID: 2, Status: "firing"}, {ID: 1, Status: "firing"}}}
-	api := NewIncidentAPI(fake, "secret", nil)
+	api := NewIncidentAPI(fake, testAuth(t), nil)
 	response := incidentRequest(t, api, http.MethodGet, "/api/v1/incidents?status=firing", "Bearer secret")
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", response.Code)
@@ -102,7 +102,7 @@ func TestIncidentAPIGetReturnsMembers(t *testing.T) {
 		incident: store.Incident{ID: 7, Status: "firing", Severity: 5},
 		members:  []store.IncidentMember{{Fingerprint: "fp", Name: "HighCPU", Status: "firing", Severity: 5}},
 	}
-	api := NewIncidentAPI(fake, "secret", nil)
+	api := NewIncidentAPI(fake, testAuth(t), nil)
 	response := incidentRequest(t, api, http.MethodGet, "/api/v1/incidents/7", "Bearer secret")
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", response.Code)
@@ -120,7 +120,7 @@ func TestIncidentAPIGetReturnsMembers(t *testing.T) {
 }
 
 func TestIncidentAPIGetMissingReturns404(t *testing.T) {
-	api := NewIncidentAPI(&fakeIncidentStore{}, "secret", nil)
+	api := NewIncidentAPI(&fakeIncidentStore{}, testAuth(t), nil)
 	response := incidentRequest(t, api, http.MethodGet, "/api/v1/incidents/404", "Bearer secret")
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", response.Code)
@@ -133,7 +133,7 @@ func TestIncidentAPIGetMissingReturns404(t *testing.T) {
 func TestIncidentAPIDiagnoseCreatesPendingRun(t *testing.T) {
 	route := map[string]string{"critical": "full", "info": "skip"}
 	fake := &fakeIncidentStore{incident: store.Incident{ID: 7, Status: "firing", Severity: 5}}
-	api := NewIncidentAPI(fake, "secret", route)
+	api := NewIncidentAPI(fake, testAuth(t), route)
 	response := incidentRequest(t, api, http.MethodPost, "/api/v1/incidents/7/diagnose", "Bearer secret")
 	if response.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201", response.Code)
@@ -148,26 +148,26 @@ func TestIncidentAPIDiagnoseCreatesPendingRun(t *testing.T) {
 
 	// 手动重诊覆盖 skip：人显式要求诊断时降级为 light，不落 skip。
 	fakeSkip := &fakeIncidentStore{incident: store.Incident{ID: 8, Status: "firing", Severity: 2}}
-	apiSkip := NewIncidentAPI(fakeSkip, "secret", route)
+	apiSkip := NewIncidentAPI(fakeSkip, testAuth(t), route)
 	response = incidentRequest(t, apiSkip, http.MethodPost, "/api/v1/incidents/8/diagnose", "Bearer secret")
 	if response.Code != http.StatusCreated || fakeSkip.createdRun.Mode != "light" || fakeSkip.createdRun.Status != "pending" {
 		t.Fatalf("skip override status = %d, run = %#v", response.Code, fakeSkip.createdRun)
 	}
 
-	missing := NewIncidentAPI(&fakeIncidentStore{}, "secret", route)
+	missing := NewIncidentAPI(&fakeIncidentStore{}, testAuth(t), route)
 	if response := incidentRequest(t, missing, http.MethodPost, "/api/v1/incidents/9/diagnose", "Bearer secret"); response.Code != http.StatusNotFound {
 		t.Fatalf("diagnose missing status = %d, want 404", response.Code)
 	}
 }
 
 func TestIncidentAPIRejectsWrongMethod(t *testing.T) {
-	api := NewIncidentAPI(&fakeIncidentStore{}, "secret", nil)
+	api := NewIncidentAPI(&fakeIncidentStore{}, testAuth(t), nil)
 	if response := incidentRequest(t, api, http.MethodDelete, "/api/v1/incidents/1", "Bearer secret"); response.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405", response.Code)
 	}
 	// 查询 API 只读：GET 列表不能落 run。
 	fake := &fakeIncidentStore{}
-	api = NewIncidentAPI(fake, "secret", nil)
+	api = NewIncidentAPI(fake, testAuth(t), nil)
 	incidentRequest(t, api, http.MethodGet, "/api/v1/incidents", "Bearer secret")
 	if fake.createCalls != 0 {
 		t.Fatalf("read-only list created %d runs", fake.createCalls)

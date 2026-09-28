@@ -16,48 +16,57 @@ import (
 
 // execStore owns locked revalidation and atomic execution/task/event/history writes.
 type execStore interface {
+	CheckExecutionLease(context.Context) error
 	NextApprovedApproval(context.Context, time.Time) (store.Approval, bool, error)
-	ClaimApprovalExecution(context.Context, uint64, time.Time, incident.ExecutionBinding) (store.Approval, bool, error)
+	ClaimApprovalExecution(context.Context, uint64, time.Time, store.RemediationPolicy) (store.Approval, bool, error)
 	FinishExecution(context.Context, store.ExecutionCompletion) error
-	RecoverExecutingApprovals(context.Context, time.Time) (int64, error)
+	ListExecutingApprovals(context.Context) ([]store.Approval, error)
 }
 
-// Executor claims approved mutations and persists their results. Recovery
-// verification is independent: this worker never waits for a health observation.
+// Executor claims approved snapshots and runs their actions. Recovery
+// verification is independent: this worker never waits for an observation.
+// Exactly one executor may be active (the host holds the store's executor lock).
 type Executor struct {
-	db       execStore
-	registry *tools.Registry
-	binding  incident.ExecutionBinding
-	logger   *log.Logger
-	done     chan struct{}
+	db        execStore
+	registry  *tools.Registry
+	authority *Authority
+	logger    *log.Logger
+	done      chan struct{}
 }
 
-func NewExecutor(db execStore, registry *tools.Registry, binding incident.ExecutionBinding, logger *log.Logger) *Executor {
+func NewExecutor(db execStore, registry *tools.Registry, authority *Authority, logger *log.Logger) *Executor {
 	if logger == nil {
 		logger = log.Default()
 	}
-	return &Executor{db: db, registry: registry, binding: binding, logger: logger, done: make(chan struct{})}
+	return &Executor{db: db, registry: registry, authority: authority, logger: logger, done: make(chan struct{})}
 }
 
-// Start is called once, before accepting requests. Interrupted external actions
-// are recovered conservatively by the store, never replayed. Wait also returns
-// after failed startup; the host must not start overlapping executor instances.
+// Start is called once, before accepting requests. Executions interrupted by
+// a previous process are reconciled against the actual target state, never
+// replayed. Wait also returns after failed startup.
 func (e *Executor) Start(ctx context.Context) error {
-	if e.db == nil || e.registry == nil {
+	if e.db == nil || e.registry == nil || e.authority == nil {
 		close(e.done)
-		return errors.New("executor: store and registry are required")
+		return errors.New("executor: store, registry and authority are required")
+	}
+	if err := e.db.CheckExecutionLease(ctx); err != nil {
+		close(e.done)
+		return err
 	}
 	if _, _, err := e.db.NextApprovedApproval(ctx, time.Now().UTC()); err != nil {
 		close(e.done)
 		return fmt.Errorf("executor: preflight approved queue: %w", err)
 	}
-	recovered, err := e.db.RecoverExecutingApprovals(ctx, time.Now().UTC())
+	interrupted, err := e.db.ListExecutingApprovals(ctx)
 	if err != nil {
 		close(e.done)
-		return fmt.Errorf("executor: recover interrupted executions: %w", err)
+		return fmt.Errorf("executor: list interrupted executions: %w", err)
 	}
-	if recovered > 0 {
-		e.logger.Printf("executor: recovered %d interrupted approvals; manual check required", recovered)
+	for _, row := range interrupted {
+		if err := e.persist(ctx, e.recover(ctx, row)); err != nil {
+			close(e.done)
+			return fmt.Errorf("executor: recover approval %d: %w", row.ID, err)
+		}
 	}
 	go e.loop(ctx)
 	return nil
@@ -82,14 +91,14 @@ func (e *Executor) loop(ctx context.Context) {
 }
 
 // RunOnce drains currently approved work without waiting for verification. It
-// may also be called by a host-owned polling loop, but not concurrently with Start
-// or another RunOnce. A persistence retry holds the result, not the action.
+// must not run concurrently with Start or another RunOnce. A persistence retry
+// holds the result, never the action.
 func (e *Executor) RunOnce(ctx context.Context) error {
-	if e.db == nil || e.registry == nil {
-		return errors.New("executor: store and registry are required")
-	}
 	for {
 		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := e.db.CheckExecutionLease(ctx); err != nil {
 			return err
 		}
 		candidate, found, err := e.db.NextApprovedApproval(ctx, time.Now().UTC())
@@ -99,89 +108,157 @@ func (e *Executor) RunOnce(ctx context.Context) error {
 		if !found {
 			return nil
 		}
-		// An absent or newly forbidden tool must invalidate the stored approval
-		// under the store's locks, not inherit a stale constructor safety level.
-		row, claimed, err := e.db.ClaimApprovalExecution(ctx, candidate.ID, time.Now().UTC(), e.currentBinding(candidate.ToolName))
+		now := time.Now().UTC()
+		row, claimed, err := e.db.ClaimApprovalExecution(ctx, candidate.ID, now, e.authority.Policy(now))
 		if err != nil {
 			return fmt.Errorf("executor: claim approval %d: %w", candidate.ID, err)
 		}
 		if !claimed {
 			continue
 		}
-		// TTL belongs to the committed claim. Rechecking a later clock here can
-		// abandon executing work solely because the claim response crossed expiry.
-		if row.ID == 0 || row.ID != candidate.ID || row.IncidentID == 0 || row.RunID == 0 || row.Status != "executing" {
+		if row.ID != candidate.ID || row.Status != "executing" || row.OperationID == nil {
 			return fmt.Errorf("executor: invalid claimed approval %d", candidate.ID)
 		}
-		if err := e.execute(ctx, row); err != nil {
+		if err := e.persist(ctx, e.execute(ctx, row)); err != nil {
 			return fmt.Errorf("executor: approval %d: %w", row.ID, err)
 		}
 	}
 }
 
-func (e *Executor) currentBinding(tool string) incident.ExecutionBinding {
-	binding := e.binding
-	// Get returns a zero ToolSpec for an unregistered tool, clearing the level.
-	spec, _ := e.registry.Get(tool)
-	binding.SafetyLevel = string(spec.Level)
-	return binding
+// executionResult is the structured, persisted receipt of one attempt.
+type executionResult struct {
+	Action      string `json:"action"`
+	OperationID string `json:"operation_id"`
+	Written     bool   `json:"written"`
+	Outcome     string `json:"outcome"`
+	Before      string `json:"before,omitempty"`
+	After       string `json:"after,omitempty"`
+	Detail      string `json:"detail,omitempty"`
+	Error       string `json:"error,omitempty"`
+	ManualCheck bool   `json:"manual_check,omitempty"`
 }
 
-func (e *Executor) execute(ctx context.Context, row store.Approval) error {
-	// Use only the fresh claimed row. These checks fail closed even if a broken
-	// store hands us invalid content; current incident/member scope is checked
-	// atomically by ClaimApprovalExecution, not with a second unlocked read here.
+func (e *Executor) operation(row store.Approval) (tools.Action, tools.Operation, error) {
 	snapshot, err := incident.ParseExecutionContext(row.ExecutionContext)
 	if err != nil {
-		return err
+		return nil, tools.Operation{}, err
 	}
 	hash, err := incident.PlanHash(row.ToolName, row.ArgsJSON, row.ExecutionContext)
 	if err != nil || hash != row.PlanHash {
-		return errors.New("approved execution content does not match plan hash")
+		return nil, tools.Operation{}, errors.New("execution content does not match the approved plan hash")
 	}
-	binding := e.currentBinding(row.ToolName)
-	if binding.SafetyLevel != string(tools.L2LowRisk) && binding.SafetyLevel != string(tools.L3Approval) {
-		return errors.New("approved mutation tool is unregistered or forbidden")
+	if err := snapshot.ValidateBinding(row.ToolName, e.authority.Binding()); err != nil {
+		return nil, tools.Operation{}, err
 	}
-	if err := snapshot.ValidateBinding(binding, true); err != nil {
-		return err
+	action, ok := e.registry.Action(row.ToolName)
+	if !ok {
+		return nil, tools.Operation{}, fmt.Errorf("action %s is not enabled", row.ToolName)
 	}
-	if err := ctx.Err(); err != nil {
-		return err
+	operation := ""
+	if row.OperationID != nil {
+		operation = *row.OperationID
 	}
+	return action, tools.Operation{ID: operation, Target: snapshot.Target, Args: json.RawMessage(row.ArgsJSON), Revision: snapshot.Revision, PreState: snapshot.PreState}, nil
+}
 
-	status, output, message := "simulated", "", ""
-	if !snapshot.DryRun {
-		status = "executed"
-		output, err = e.registry.Execute(ctx, row.ToolName, json.RawMessage(row.ArgsJSON))
-		if err != nil {
-			status, message = "failed", err.Error()
+func (e *Executor) execute(ctx context.Context, row store.Approval) store.ExecutionCompletion {
+	action, op, err := e.operation(row)
+	if err != nil {
+		// Claim validated the same content under locks; reaching here means the
+		// row changed underneath us. Nothing was written.
+		return e.completion(row, "aborted", executionResult{Action: row.ToolName, OperationID: op.ID, Outcome: string(tools.OutcomeNotWritten), Error: err.Error()}, nil)
+	}
+	snapshot, _ := incident.ParseExecutionContext(row.ExecutionContext)
+	if snapshot.Kind == incident.KindPrimary && snapshot.Rule.Mode == incident.ModeAuto {
+		if _, err := tools.ReadBusinessTraffic(ctx, e.registry); err != nil {
+			return e.completion(row, "aborted", executionResult{Action: row.ToolName, OperationID: op.ID, Outcome: string(tools.OutcomeNotWritten), Error: "automatic execution requires current business metrics: " + err.Error()}, nil)
 		}
 	}
-	// At most 1280 runes of arbitrary text: even JSON's six-byte escaping,
-	// truncation markers and fixed fields remain below the store's 8 KiB cap.
-	// No timestamp goes in JSON: ambiguous commits must retry identical content.
-	result, _ := json.Marshal(struct {
-		Tool        string `json:"tool"`
-		Output      string `json:"output"`
-		Error       string `json:"error,omitempty"`
-		DryRun      bool   `json:"dry_run"`
-		Executed    bool   `json:"executed"`
-		ManualCheck bool   `json:"manual_check,omitempty"`
-	}{
-		Tool: row.ToolName, Output: tools.Truncate(output, 1024), Error: tools.Truncate(message, 256),
-		DryRun: snapshot.DryRun, Executed: status == "executed", ManualCheck: status == "failed",
-	})
-	if err := e.persist(ctx, store.ExecutionCompletion{ApprovalID: row.ID, Status: status, ResultJSON: result}); err != nil {
-		return err
+	if err := e.db.CheckExecutionLease(ctx); err != nil {
+		return e.completion(row, "aborted", executionResult{Action: row.ToolName, OperationID: op.ID, Outcome: string(tools.OutcomeNotWritten), Error: err.Error()}, nil)
 	}
-	switch status {
-	case "executed":
+	runCtx, cancel := context.WithTimeout(ctx, action.Definition().Timeout)
+	defer cancel()
+	receipt, execErr := action.Execute(runCtx, op)
+	result := executionResult{Action: row.ToolName, OperationID: op.ID, Written: receipt.Written, Before: receipt.Before, After: receipt.After, Detail: receipt.Detail}
+	if execErr == nil {
+		result.Outcome = string(tools.OutcomeNotWritten)
+		if receipt.Written {
+			result.Outcome = string(tools.OutcomeWritten)
+			metrics.Inc(metrics.ApprovalExecuted)
+			return e.completion(row, "executed", result, receipt.Change)
+		}
+		return e.completion(row, "aborted", result, nil)
+	}
+	// The write errored: read the target before deciding anything.
+	result.Error = execErr.Error()
+	reconcileCtx, cancelReconcile := context.WithTimeout(context.Background(), action.Definition().Timeout)
+	defer cancelReconcile()
+	return e.reconciled(row, action, op, result, reconcileCtx)
+}
+
+// recover finishes an execution interrupted by a previous process by reading
+// the actual target state: applied writes enter verification, unapplied ones
+// end without retry (a new decision is required), unknown ones need a person.
+func (e *Executor) recover(ctx context.Context, row store.Approval) store.ExecutionCompletion {
+	action, op, err := e.operation(row)
+	result := executionResult{Action: row.ToolName, OperationID: op.ID, Detail: "execution interrupted by a process restart"}
+	if err != nil {
+		result.Outcome, result.Error, result.ManualCheck = string(tools.OutcomeUnknown), err.Error(), true
+		return e.completion(row, "failed", result, nil)
+	}
+	reconcileCtx, cancel := context.WithTimeout(ctx, action.Definition().Timeout)
+	defer cancel()
+	return e.reconciled(row, action, op, result, reconcileCtx)
+}
+
+func (e *Executor) reconciled(row store.Approval, action tools.Action, op tools.Operation, result executionResult, ctx context.Context) store.ExecutionCompletion {
+	reconciled, err := action.Reconcile(ctx, op)
+	outcome := reconciled.Outcome
+	if err != nil {
+		outcome = tools.OutcomeUnknown
+		result.Error = joinText(result.Error, "reconcile: "+err.Error())
+	}
+	result.Outcome = string(outcome)
+	switch outcome {
+	case tools.OutcomeWritten:
+		result.Written = true
+		result.Detail = joinText(result.Detail, "the target shows the write applied")
 		metrics.Inc(metrics.ApprovalExecuted)
-	case "failed":
+		return e.completion(row, "executed", result, reconciled.Change)
+	case tools.OutcomeNotWritten:
+		result.Detail = joinText(result.Detail, "the target shows no write; nothing is retried without a new decision")
+		if result.Error == "" {
+			return e.completion(row, "aborted", result, nil)
+		}
 		metrics.Inc(metrics.ApprovalFailedExec)
+		return e.completion(row, "failed", result, nil)
 	}
-	return nil
+	result.ManualCheck = true
+	metrics.Inc(metrics.ApprovalFailedExec)
+	return e.completion(row, "failed", result, nil)
+}
+
+func joinText(a, b string) string {
+	if a == "" {
+		return b
+	}
+	return a + "; " + b
+}
+
+func (e *Executor) completion(row store.Approval, status string, result executionResult, change *tools.Change) store.ExecutionCompletion {
+	// Bounded text keeps the result below the store's 8 KiB cap even after
+	// JSON escaping; the structured fields are never truncated.
+	result.Detail, result.Error = tools.Truncate(tools.Sanitize(result.Detail), 1024), tools.Truncate(tools.Sanitize(result.Error), 512)
+	raw, _ := json.Marshal(result)
+	completion := store.ExecutionCompletion{ApprovalID: row.ID, Status: status, ResultJSON: raw, ManualCheck: result.ManualCheck}
+	if change != nil {
+		snapshot, _ := incident.ParseExecutionContext(row.ExecutionContext)
+		releaseID, before, after := change.ReleaseID, change.Before, change.After
+		completion.Change = &store.ChangeEvent{Env: e.authority.env, Service: snapshot.Service, ChangeType: change.Type, ReleaseID: &releaseID,
+			BeforeRef: &before, ImageRef: &after, DBMigration: "unknown", Actor: "system:approval"}
+	}
+	return completion
 }
 
 func (e *Executor) persist(ctx context.Context, completion store.ExecutionCompletion) error {

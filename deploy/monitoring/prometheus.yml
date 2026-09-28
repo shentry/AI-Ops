@@ -1,0 +1,68 @@
+# Production scrape configuration. Rules come from the repository alerts.yml.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    env: prod
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["alertmanager:9093"]
+
+  - job_name: node-exporter
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor:8080"]
+
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+
+  - job_name: redis
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+
+  # Business signals from sub2api's read-only ops API.
+  - job_name: sub2api-ops
+    scrape_interval: 30s
+    scrape_timeout: 25s
+    static_configs:
+      - targets: ["sub2api-exporter:9122"]
+
+  # oncall-agent runs on the host (systemd); its /metrics has no secrets.
+  - job_name: oncall-agent
+    static_configs:
+      - targets: ["host.docker.internal:18080"]
+
+  - job_name: sub2api-health
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+          - http://sub2api:8080/health
+        labels:
+          service: sub2api
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115

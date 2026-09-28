@@ -85,16 +85,19 @@ func TestFactorySnapshotsModelAndWindow(t *testing.T) {
 	})
 	profiles := []config.ModelProfile{{ID: "small", ContextWindowTokens: 16384}, {ID: "deepseek-v4-flash", ContextWindowTokens: 1000000}}
 	f := NewFactory(config.LLMConfig{Roles: config.LLMRoles{Reasoner: config.RoleConfig{BaseURL: fake.server.URL, APIKey: "fake", Model: "small", MaxTokens: 1024}}, Models: profiles})
-	first, firstLimit, err := f.buildForDiagnosis()
+	first, firstModel, firstLimit, err := f.buildForDiagnosis()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := f.SelectModel(profiles[1]); err != nil {
 		t.Fatal(err)
 	}
-	second, secondLimit, err := f.buildForDiagnosis()
+	second, secondModel, secondLimit, err := f.buildForDiagnosis()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if firstModel != "small" || secondModel != "deepseek-v4-flash" {
+		t.Fatalf("models=%s/%s", firstModel, secondModel)
 	}
 	if firstLimit != 16384-1024-512 || secondLimit != 1000000-1024-512 {
 		t.Fatalf("limits=%d/%d", firstLimit, secondLimit)

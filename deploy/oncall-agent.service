@@ -1,0 +1,34 @@
+# oncall-agent on the sub2api host (plan §9). One active instance only:
+# startup recovery reconciles interrupted executions and supports no replica.
+#
+#   install -m 0644 deploy/oncall-agent.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now oncall-agent
+[Unit]
+Description=oncall-agent: sub2api monitoring and remediation
+Wants=network-online.target
+# Ordered after Docker but not bound to it: with Docker down the Agent still
+# records, diagnoses and notifies.
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+User=oncall
+Group=oncall
+# The Docker socket is root-equivalent; only the action implementations use it.
+SupplementaryGroups=docker
+Environment=CONFIG_FILE=/etc/oncall-agent/config.yaml
+# Secrets referenced as ${VAR} in config.yaml; root-owned, mode 0600.
+EnvironmentFile=/etc/oncall-agent/env
+ExecStart=/opt/oncall-agent/oncall-agent
+Restart=on-failure
+RestartSec=5
+# SIGTERM stops the workers; an execution cut off here is reconciled against
+# the target on the next start, never replayed.
+TimeoutStopSec=60
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

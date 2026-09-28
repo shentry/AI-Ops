@@ -14,7 +14,7 @@ func TestUpdatingLinkedAlertSerializesWithExistingIncident(t *testing.T) {
 	db := openIntegrationDB(t)
 	t.Cleanup(func() { db.Close() })
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	approval, _ := executionFixture(t, db, now, false, "approved")
+	approval, _ := executionFixture(t, db, now, "approved")
 	alerts, err := db.ListIncidentAlerts(context.Background(), approval.IncidentID)
 	if err != nil || len(alerts) != 1 {
 		t.Fatalf("alerts=%v err=%v", alerts, err)

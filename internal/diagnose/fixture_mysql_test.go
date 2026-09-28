@@ -27,7 +27,7 @@ import (
 )
 
 // These tests deliberately never use TEST_MYSQL_DSN: the worker consumes a
-// schema-wide FIFO. Apply migrations 001–011 to a dedicated oncall_diagnose*
+// schema-wide FIFO. Apply every migration to a dedicated oncall_diagnose*
 // database. Missing env is the only skip path; configured DB failures must fail.
 func openDiagnoseMySQL(t *testing.T) *store.DB {
 	t.Helper()
@@ -62,21 +62,60 @@ type diagnoseMySQLClock struct{ millis atomic.Int64 }
 func (c *diagnoseMySQLClock) set(at time.Time) { c.millis.Store(at.UnixMilli()) }
 func (c *diagnoseMySQLClock) now() time.Time   { return time.UnixMilli(c.millis.Load()).UTC() }
 
+const diagnoseAlert = "Sub2APIDown"
+
+// diagnoseMySQLCollector is the external evidence boundary: it reports an
+// exited container, identified by Docker, that nothing restarts on its own.
 type diagnoseMySQLCollector struct{ calls int }
 
-func (*diagnoseMySQLCollector) Name() string { return "fixture_external_evidence" }
+func (*diagnoseMySQLCollector) Name() string { return "docker_inspect" }
 func (c *diagnoseMySQLCollector) Collect(_ context.Context, target Target) EvidenceItem {
 	c.calls++
-	return EvidenceItem{Name: c.Name(), Source: "test-only-external-boundary", Status: ItemOK,
-		Body: fmt.Sprintf("incident %d: sub2api process exited", target.Incident.ID), CollectedAt: time.Now().UTC()}
+	return EvidenceItem{Name: c.Name(), Source: "docker:inspect", Status: ItemOK, CollectedAt: time.Now().UTC(),
+		Body:      fmt.Sprintf("incident %d: sub2api process exited", target.Incident.ID),
+		Object:    &ObjectRef{Kind: "container", Name: "sub2api", ID: "c0ffee"},
+		Container: &ContainerFacts{Status: "exited", ExitCode: 1, RestartPolicy: "no"}}
+}
+
+type fixtureBusinessMetrics struct{}
+
+func (fixtureBusinessMetrics) Name() string { return "sub2api_metrics" }
+func (fixtureBusinessMetrics) Collect(context.Context, Target) EvidenceItem {
+	return EvidenceItem{Name: "sub2api_metrics", Source: "prometheus:query", Status: ItemOK,
+		Business: &tools.BusinessTraffic{Requests: 100, Errors: 20, SampledAt: time.Now()}}
+}
+
+// fixtureRestart is the registered restart action: Prepare freezes the
+// evidence-proven container and a health check; nothing ever executes it.
+type fixtureRestart struct{ baseURL string }
+
+func (fixtureRestart) Definition() tools.ActionDefinition {
+	return tools.ActionDefinition{Name: tools.ActionDockerRestart, Version: 2, TargetKind: "container", Description: "fixture restart", Timeout: time.Second}
+}
+
+func (a fixtureRestart) Prepare(_ context.Context, req tools.PrepareRequest) (tools.Prepared, error) {
+	check, _ := json.Marshal(tools.HealthCheck{BaseURL: a.baseURL})
+	return tools.Prepared{Target: req.Target, Args: json.RawMessage(`{"target_kind":"container","target_name":"sub2api"}`),
+		Revision: "started_at=fixture", PreState: json.RawMessage(`{"status":"exited"}`),
+		Checks: []incident.Check{{Kind: incident.CheckHealth, Params: check}}}, nil
+}
+
+func (fixtureRestart) Execute(context.Context, tools.Operation) (tools.Receipt, error) {
+	return tools.Receipt{}, fmt.Errorf("test must not invoke a mutation")
+}
+
+func (fixtureRestart) Reconcile(context.Context, tools.Operation) (tools.Reconciliation, error) {
+	return tools.Reconciliation{Outcome: tools.OutcomeUnknown}, fmt.Errorf("test must not reconcile a mutation")
 }
 
 type diagnoseMySQLFixture struct {
 	db           *store.DB
+	service      string
 	parent       store.Incident
 	run          store.AgentRun
 	approval     store.Approval
-	binding      incident.ExecutionBinding
+	authority    *approval.Authority
+	registry     *tools.Registry
 	pipeline     *Pipeline
 	collector    *diagnoseMySQLCollector
 	reasoner     *fakeReasoner // deterministic LLM boundary only; never a SQL/policy mock
@@ -85,13 +124,15 @@ type diagnoseMySQLFixture struct {
 	clock        diagnoseMySQLClock
 }
 
+// newDiagnoseMySQLFixture runs under its own service and auto rule, so the
+// service mutex, budgets and rule blocks of one fixture never affect another.
 func newDiagnoseMySQLFixture(t *testing.T, baseURL string, memoryHit bool) *diagnoseMySQLFixture {
 	t.Helper()
 	db := openDiagnoseMySQL(t)
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	f := &diagnoseMySQLFixture{db: db, binding: incident.ExecutionBinding{Container: "sub2api", BaseURL: baseURL,
-		AllowedContainers: []string{"sub2api"}, SafetyLevel: "L2"}}
-	f.parent = store.Incident{GroupKey: fmt.Sprintf("diagnose-mysql-%d", time.Now().UnixNano()),
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	f := &diagnoseMySQLFixture{db: db, service: "sub2api-" + suffix}
+	f.parent = store.Incident{GroupKey: "diagnose-mysql-" + suffix,
 		Status: "firing", Severity: 5, AlertsCount: 1, Title: "isolated diagnosis integration",
 		StartedAt: now, LastSeenAt: now}
 	if err := db.Create(&f.parent).Error; err != nil {
@@ -115,6 +156,7 @@ func newDiagnoseMySQLFixture(t *testing.T, baseURL string, memoryHit bool) *diag
 			{"DELETE FROM fault_memory WHERE fingerprint = ?", f.memoryFingerprint()},
 			{"DELETE FROM last_alert WHERE fingerprint IN ?", f.fingerprints},
 			{"DELETE FROM alert WHERE fingerprint IN ?", f.fingerprints},
+			{"DELETE FROM service_lock WHERE service = ?", f.service},
 			{"DELETE FROM incident WHERE id = ?", f.parent.ID},
 		} {
 			if err := db.Exec(deletion.query, deletion.arg).Error; err != nil {
@@ -122,7 +164,7 @@ func newDiagnoseMySQLFixture(t *testing.T, baseURL string, memoryHit bool) *diag
 			}
 		}
 	})
-	f.addMember(t, incident.SupportedAlert, "sub2api", "sub2api")
+	f.addMember(t, diagnoseAlert, f.service)
 	var created bool
 	var err error
 	f.run, created, err = db.RequestRun(context.Background(), store.RunRequest{IncidentID: f.parent.ID,
@@ -134,33 +176,33 @@ func newDiagnoseMySQLFixture(t *testing.T, baseURL string, memoryHit bool) *diag
 		t.Fatalf("ClaimAgentRun claimed=%v err=%v", claimed, err)
 	}
 	f.run = f.loadRun(t)
-	plan := llm.Plan{Action: incident.RestartAction, Target: llm.PlanTarget{Kind: "container", Name: "sub2api"},
+	plan := llm.Plan{Action: tools.ActionDockerRestart, Target: llm.PlanTarget{Kind: "container", Name: "sub2api"},
 		Confidence: "high", Reason: "restart exited process", Expected: "health recovers"}
 	if memoryHit {
 		entry := store.FaultMemory{Fingerprint: f.memoryFingerprint(), GroupKey: f.parent.GroupKey,
-			AlertName: incident.SupportedAlert, RCAText: "sub2api process exited", PlanJSON: diagnoseMySQLJSON(t, plan),
+			AlertName: diagnoseAlert, RCAText: "sub2api process exited", PlanJSON: diagnoseMySQLJSON(t, plan),
 			Confidence: "high", FirstSeen: now, LastSuccess: now, TTLSeconds: 3600}
 		if err := db.UpsertFaultMemory(context.Background(), entry); err != nil {
 			t.Fatal(err)
 		}
 	}
-	registry := tools.NewRegistry()
-	if err := registry.Register(tools.ToolSpec{Name: incident.RestartAction, Description: "fixture contract only",
-		Level: tools.L2LowRisk, Timeout: time.Second, Handler: func(context.Context, json.RawMessage) (string, error) {
-			return "", fmt.Errorf("test must not invoke a mutation tool")
-		}}); err != nil {
+	f.registry = tools.NewRegistry()
+	if err := f.registry.RegisterAction(fixtureRestart{baseURL: baseURL}); err != nil {
 		t.Fatal(err)
 	}
-	policy := approval.NewPolicy(registry, approval.PolicyConfig{AutoExecuteL2: true, Container: "sub2api",
-		AllowedTargets: []string{"sub2api"}, HealthBaseURL: baseURL,
-		Verification: config.VerificationConfig{IntervalSeconds: 10, WindowSeconds: 120, TimeoutSeconds: 5},
-		RateWindow:   time.Hour, MaxPerWindow: 100}, db)
+	f.authority, err = approval.NewAuthority(config.ServiceConfig{Name: f.service, Env: "test", Container: "sub2api", BaseURL: baseURL},
+		config.RemediationConfig{RulesVersion: "fixture", Rules: []config.RuleConfig{{ID: "restart-" + suffix, Action: tools.ActionDockerRestart,
+			Mode: incident.ModeAuto, Alerts: []string{diagnoseAlert}, MaxExecutions: 100, WindowMinutes: 60}},
+			Verification: config.VerificationConfig{IntervalSeconds: 10, WindowSeconds: 120, TimeoutSeconds: 5, RequiredPasses: 1}}, f.registry)
+	if err != nil {
+		t.Fatal(err)
+	}
 	f.collector = &diagnoseMySQLCollector{}
 	f.reasoner = &fakeReasoner{result: &llm.DiagnoseResult{RCA: "sub2api process exited", Confidence: "high", Plan: plan,
 		TokensIn: 21, TokensOut: 13, Steps: []llm.StepLog{{Name: "docker_logs", Input: `{"target_name":"sub2api"}`, Output: "process exited"}}}}
 	f.reporter = &fakeReporter{}
-	f.pipeline = NewPipeline(db, NewEvidenceBuilder(db, []Collector{f.collector}), f.reasoner, policy,
-		approval.NewService(db, 30), f.reporter, memory.NewStore(db, 3600, true), 0)
+	f.pipeline = NewPipeline(db, NewEvidenceBuilder(db, []Collector{f.collector, fixtureBusinessMetrics{}}), f.reasoner, approval.NewPolicy(f.authority, f.registry, 30*time.Minute, db),
+		approval.NewService(db), f.reporter, memory.NewStore(db, 3600, true), 0)
 	return f
 }
 
@@ -174,16 +216,16 @@ func diagnoseMySQLJSON(t *testing.T, value any) datatypes.JSON {
 }
 
 func (f *diagnoseMySQLFixture) memoryFingerprint() string {
-	return incident.FaultFingerprint(f.parent.GroupKey, incident.SupportedAlert)
+	return incident.FaultFingerprint(f.parent.GroupKey, diagnoseAlert)
 }
 
-func (f *diagnoseMySQLFixture) addMember(t *testing.T, name, container, service string) {
+func (f *diagnoseMySQLFixture) addMember(t *testing.T, name, service string) {
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	fp := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%s-%d", f.parent.GroupKey, len(f.fingerprints)))))
 	f.fingerprints = append(f.fingerprints, fp)
 	alert := store.Alert{Fingerprint: fp, AlertHash: fp[:32], Source: "alertmanager", Name: name, Status: "firing", Severity: 5,
-		Labels: diagnoseMySQLJSON(t, map[string]string{"service": service, "container": container}), Annotations: datatypes.JSON(`{}`),
+		Labels: diagnoseMySQLJSON(t, map[string]string{"service": service}), Annotations: datatypes.JSON(`{}`),
 		StartsAt: now, ReceivedAt: now}
 	if err := f.db.Create(&alert).Error; err != nil {
 		t.Fatal(err)
@@ -233,17 +275,17 @@ func (f *diagnoseMySQLFixture) diagnose(t *testing.T) {
 func (f *diagnoseMySQLFixture) execute(t *testing.T) *VerificationWorker {
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	if _, claimed, err := f.db.ClaimApprovalExecution(context.Background(), f.approval.ID, now, f.binding); err != nil || !claimed {
+	if _, claimed, err := f.db.ClaimApprovalExecution(context.Background(), f.approval.ID, now, f.authority.Policy(now)); err != nil || !claimed {
 		t.Fatalf("ClaimApprovalExecution claimed=%v err=%v", claimed, err)
 	}
 	// Deliberately synthetic action result: tests cover diagnosis/verification,
 	// not the parent's physical restart acceptance. No Executor/tool is invoked.
 	if err := f.db.FinishExecution(context.Background(), store.ExecutionCompletion{ApprovalID: f.approval.ID,
-		Status: "executed", ResultJSON: []byte(`{"output":"test-only external action completed"}`), FinishedAt: now}); err != nil {
+		Status: "executed", ResultJSON: []byte(`{"written":true,"detail":"test-only external action completed"}`), FinishedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	f.clock.set(now)
-	worker := NewVerificationWorker(f.db, NewVerifier(f.binding), 3600, nil, log.New(io.Discard, "", 0))
+	worker := NewVerificationWorker(f.db, NewVerifier(f.registry, nil, nil), 3600, nil, log.New(io.Discard, "", 0), f.authority.Binding())
 	worker.now = f.clock.now
 	return worker
 }

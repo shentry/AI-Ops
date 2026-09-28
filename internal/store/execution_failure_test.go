@@ -33,8 +33,8 @@ func TestExecutionResultAndVerifyTaskRollbackTogether(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	approval, binding := executionFixture(t, db, now, false, "approved")
-	if _, claimed, err := db.ClaimApprovalExecution(ctx, approval.ID, now, binding); err != nil || !claimed {
+	approval, policy := executionFixture(t, db, now, "approved")
+	if _, claimed, err := db.ClaimApprovalExecution(ctx, approval.ID, now, policy); err != nil || !claimed {
 		t.Fatalf("claim=%v %v", claimed, err)
 	}
 	before, err := db.ListIncidentEvents(ctx, approval.IncidentID, 0, 100)
@@ -64,20 +64,20 @@ func TestExecutionResultAndVerifyTaskRollbackTogether(t *testing.T) {
 	}
 }
 
-func verificationFixture(t *testing.T, db *DB, now time.Time) (Approval, incident.ExecutionBinding, VerifyTask) {
+func verificationFixture(t *testing.T, db *DB, now time.Time) (Approval, RemediationPolicy, VerifyTask) {
 	t.Helper()
-	approval, binding := executionFixture(t, db, now, false, "approved")
-	if _, claimed, err := db.ClaimApprovalExecution(context.Background(), approval.ID, now, binding); err != nil || !claimed {
+	approval, policy := executionFixture(t, db, now, "approved")
+	if _, claimed, err := db.ClaimApprovalExecution(context.Background(), approval.ID, now, policy); err != nil || !claimed {
 		t.Fatalf("claim=%v %v", claimed, err)
 	}
-	if err := db.FinishExecution(context.Background(), ExecutionCompletion{ApprovalID: approval.ID, Status: "executed", ResultJSON: []byte(`{"output":"restart returned success"}`), FinishedAt: now}); err != nil {
+	if err := db.FinishExecution(context.Background(), ExecutionCompletion{ApprovalID: approval.ID, Status: "executed", ResultJSON: []byte(`{"written":true,"detail":"restart returned success"}`), FinishedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	approval, err := db.GetApproval(context.Background(), approval.ID)
 	if err != nil || approval.Verification == nil {
 		t.Fatalf("approval=%+v %v", approval, err)
 	}
-	return approval, binding, *approval.Verification
+	return approval, policy, *approval.Verification
 }
 
 func TestVerificationStaleClaimCannotCompleteNewClaim(t *testing.T) {
@@ -85,7 +85,7 @@ func TestVerificationStaleClaimCannotCompleteNewClaim(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	approval, binding, original := verificationFixture(t, db, now)
+	approval, _, original := verificationFixture(t, db, now)
 	first, claimed, err := db.ClaimVerificationTask(ctx, approval.ID, now)
 	if err != nil || !claimed {
 		t.Fatalf("first=%v %v", claimed, err)
@@ -97,7 +97,7 @@ func TestVerificationStaleClaimCannotCompleteNewClaim(t *testing.T) {
 	if err != nil || !claimed || second.ClaimedAt.Equal(*first.ClaimedAt) || !second.DeadlineAt.Equal(original.DeadlineAt) {
 		t.Fatalf("second=%+v %v", second, err)
 	}
-	completion := VerificationCompletion{ApprovalID: approval.ID, ClaimedAt: *first.ClaimedAt, CheckedAt: now.Add(32 * time.Second), Status: "passed", Observation: "healthy", Detail: "HTTP 200", Binding: binding}
+	completion := VerificationCompletion{ApprovalID: approval.ID, ClaimedAt: *first.ClaimedAt, CheckedAt: now.Add(32 * time.Second), Status: "passed", Observation: "healthy", Detail: "HTTP 200"}
 	if result, err := db.FinalizeVerification(ctx, completion); err != nil || result.Applied {
 		t.Fatalf("stale completion=%+v %v", result, err)
 	}
@@ -116,7 +116,7 @@ func TestVerificationMemoryAndAuditRollbackTogether(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	approval, binding, _ := verificationFixture(t, db, now)
+	approval, _, _ := verificationFixture(t, db, now)
 	task, claimed, err := db.ClaimVerificationTask(ctx, approval.ID, now)
 	if err != nil || !claimed {
 		t.Fatalf("claim=%v %v", claimed, err)
@@ -129,9 +129,9 @@ func TestVerificationMemoryAndAuditRollbackTogether(t *testing.T) {
 	if err != nil || run.PlanJSON == nil {
 		t.Fatalf("run=%+v %v", run, err)
 	}
-	fp := incident.FaultFingerprint(parent.GroupKey, incident.SupportedAlert)
-	memory := FaultMemory{Fingerprint: fp, GroupKey: parent.GroupKey, AlertName: incident.SupportedAlert, RCAText: "recovered", PlanJSON: *run.PlanJSON, Confidence: "high", FirstSeen: now, LastSuccess: now, TTLSeconds: 3600}
-	completion := VerificationCompletion{ApprovalID: approval.ID, ClaimedAt: *task.ClaimedAt, CheckedAt: now.Add(time.Second), Status: "passed", Observation: "healthy", Detail: "HTTP 200", Binding: binding, Memory: &memory}
+	fp := incident.FaultFingerprint(parent.GroupKey, testAlert)
+	memory := FaultMemory{Fingerprint: fp, GroupKey: parent.GroupKey, AlertName: testAlert, RCAText: "recovered", PlanJSON: *run.PlanJSON, Confidence: "high", FirstSeen: now, LastSuccess: now, TTLSeconds: 3600}
+	completion := VerificationCompletion{ApprovalID: approval.ID, ClaimedAt: *task.ClaimedAt, CheckedAt: now.Add(time.Second), Status: "passed", Observation: "healthy", Detail: "HTTP 200", Memory: &memory}
 	before, err := db.ListIncidentEvents(ctx, approval.IncidentID, 0, 100)
 	if err != nil {
 		t.Fatal(err)

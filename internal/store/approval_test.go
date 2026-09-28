@@ -12,7 +12,7 @@ func TestApprovalLifecycle(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	created, _ := executionFixture(t, db, now, false, "pending")
+	created, _ := executionFixture(t, db, now, "pending")
 	if _, err := db.DecideApproval(ctx, created.ID, "approved", "wrong-hash", "ops", "test", "api", now); !errors.Is(err, ErrApprovalConflict) {
 		t.Fatalf("wrong hash=%v", err)
 	}
@@ -25,7 +25,7 @@ func TestApprovalLifecycle(t *testing.T) {
 	if _, err := db.DecideApproval(ctx, 1<<62, "approved", created.PlanHash, "ops", "test", "api", now); !errors.Is(err, ErrApprovalNotFound) {
 		t.Fatalf("missing=%v", err)
 	}
-	expired, _ := executionFixture(t, db, now.Add(-2*time.Hour), false, "pending")
+	expired, _ := executionFixture(t, db, now.Add(-2*time.Hour), "pending")
 	if _, err := db.DecideApproval(ctx, expired.ID, "approved", expired.PlanHash, "ops", "test", "api", now); !errors.Is(err, ErrApprovalConflict) {
 		t.Fatalf("expired=%v", err)
 	}
@@ -63,7 +63,7 @@ func TestApprovalDecisionChecksActualSnapshotInsideTransaction(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	approval, _ := executionFixture(t, db, now, false, "pending")
+	approval, _ := executionFixture(t, db, now, "pending")
 	if err := db.Model(&Approval{}).Where("id = ?", approval.ID).Update("args_json", []byte(`{"target_kind":"container","target_name":"different"}`)).Error; err != nil {
 		t.Fatal(err)
 	}

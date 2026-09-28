@@ -1,5 +1,11 @@
 # Controlled execution-trust live acceptance
 
+> 当前无人值守回归入口为本目录的 `unattended_test.go`、`actions_test.go`、`prometheus_test.go`；运行方法与实际边界见 [无人值守验证记录](../../docs/unattended-remediation-verification.md)。下文旧的 live.py 实验保留历史用途，不作为本次自动模式验收证明。
+
+> **Harness updated 2026-09-25 for rule modes (observe/manual/auto); the updated
+> harness has not been run yet.** The recorded run below used the earlier
+> dry-run/allowlist model and is kept as history.
+>
 > Final parent recheck completed on 2026-09-12 UTC. The owned live stack was then removed; the acceptance DB/user were explicitly dropped after export to `final/live-database.sql`. URLs below describe the reproducible handoff, not a currently running service. Browser and complete T1–T17 evidence are summarized in [the verification report](../../docs/execution-trust-verification.md).
 
 This harness uses a freshly built embedded frontend + real Go server + real MySQL,
@@ -38,16 +44,20 @@ From the repository root, with the sandbox MySQL already running:
 python3 tests/acceptance/live.py prepare
 python3 tests/acceptance/live.py native
 python3 tests/acceptance/live.py up
-python3 tests/acceptance/live.py dry
+python3 tests/acceptance/live.py observe
 python3 tests/acceptance/live.py real
 python3 tests/acceptance/live.py report
 ```
 
 `native` must run **before `up`**, avoiding two server instances on one business
 DB. `prepare` refuses an existing test DB; `up` refuses existing named containers
-or network. `real` requires a successful dry-run artifact, stops the dry server,
-explicitly writes `dry_run: false`, then starts real mode. Approvals always use
-public HTTP and the returned immutable `plan_hash`, recording `anonymous/web`.
+or network. The configuration has one rule, `restart-stopped-process`
+(`docker_restart` for `Sub2APIDown`, at most 10 executions per 60 minutes).
+`observe` runs it in observe mode: a really stopped process yields a recorded
+"would docker_restart" decision and no approval, task, memory or Docker request.
+`real` requires that artifact, stops the observe server, switches the rule to
+`manual` and restarts. Approvals always use public HTTP, the configured operator
+token and the returned immutable `plan_hash`.
 
 The build copies current `cmd`, `internal`, migrations, `web`, go.mod/go.sum into
 `/tmp`, runs `npm ci && npm run build` there, then builds native and Linux Go
@@ -88,8 +98,8 @@ done
 
 Temporary overrides: verification **timeout 1s < interval 3s < window 90s**;
 Prometheus scrape/evaluation 2s; rule-group interval 2s; Down firing `for: 4s`;
-Alertmanager group_wait 1s, unchanged group_interval 30s; restart minimum 1s,
-maximum 10/hour. The real repository dependency rules and blackbox health-body
+Alertmanager group_wait 1s, unchanged group_interval 30s; one required pass and
+no recovery watch window (recurrence is covered by store and worker tests). The real repository dependency rules and blackbox health-body
 check are retained; only the unrelated node-exporter job is omitted. This is one
 instrumented functional trial, **not latency calibration of defaults 5/10/120**.
 
@@ -99,20 +109,19 @@ Two own-DB triggers deliberately expose otherwise short windows:
    occurs once; approval remains executing with **zero task and history** during
    repeated persistence failures. Removing trigger permits a single atomic result
    + task + history + event commit, with no extra Docker action.
-2. Reject verification claims temporarily. First task stays pending while another
-   Incident executes. Stop/restart backend, remove trigger, then only verification
-   resumes with unchanged deadlines. This is a pending queue, not a slow HTTP probe.
-
-Both first and second approvals target the same sole allowlisted test container,
-but belong to independent Incidents. The first task's passing probe occurs after
-both approved restarts: these timestamps must not be attributed to the first
-restart alone, or generalized into distinct-target throughput measurements.
+2. Reject verification claims temporarily. While the first task stays pending, a
+   second Incident on a really stopped process gets **no approval**: the policy
+   records "service sub2api is busy with approval N" (one disposition per service
+   at a time). The harness then starts the container itself, so the first task's
+   passing probe is not attributable to the approved restart alone. Stop/restart
+   backend, remove trigger, then only verification resumes with unchanged deadlines.
 
 A third approval's real action succeeds while result commit is rejected; the
-backend is killed with SIGKILL. Restart marks the old executing row failed with
-`manual_check: true`, creates no verify task, and does not replay the action.
+backend is killed with SIGKILL. Restart reconciles against the container (its
+start time moved), records the approval executed with outcome `written`, queues
+its verification and does not replay the action: two physical restarts in total.
 
-## Recorded run: 2026-09-11 UTC
+## Recorded run: 2026-09-11 UTC (previous dry-run model)
 
 The live experiment completed its action/state assertions. Initial evidence export
 failed because the mysql CLI's default character set produced non-UTF-8 text;

@@ -14,16 +14,13 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 )
 
-// Docker 只读工具名。D11 的受控重启是独立的 L2 工具，不在这里出现。
+// Docker 只读工具名。受控重启是动作（action_restart.go），不在工具面出现。
 const (
 	ToolDockerInspect = "docker_inspect"
 	ToolDockerLogs    = "docker_logs"
-	// ToolDockerRestart 是 D11 的 L2 变更动作：受控重启，目标受白名单约束。
-	ToolDockerRestart = "docker_restart"
 )
 
 // containerNamePattern 防 URL 路径注入：容器名只允许字母数字和 _.-
@@ -57,96 +54,7 @@ func NewDockerClient(socketPath string) (*DockerClient, error) {
 	return &DockerClient{socketPath: socketPath, httpClient: httpClient}, nil
 }
 
-// RestartLimits 是 docker_restart 的工具层限频护栏。
-// MinInterval 是同一容器两次重启的最小间隔，MaxPerHour 是滚动一小时内的次数上限。
-// 这是最后一道闸：即使上游策略或人工审批放行，反复重启同一个容器也会在这里被拒
-// （设计要求"同一 target/action 在时间窗口内限制执行次数"）。
-type RestartLimits struct {
-	MinInterval time.Duration
-	MaxPerHour  int
-}
-
-// restartLimitWindow 是次数上限的滚动窗口，与 MaxPerHour 的语义绑定。
-const restartLimitWindow = time.Hour
-
-// restartLimiter 记录每个容器最近的重启时刻。执行器可能并发消费审批单，
-// 所以这里必须带锁；now 可注入以便测试不依赖真实时钟。
-type restartLimiter struct {
-	mu      sync.Mutex
-	limits  RestartLimits
-	history map[string][]time.Time
-	now     func() time.Time
-}
-
-func newRestartLimiter(limits RestartLimits) *restartLimiter {
-	if limits.MaxPerHour < 1 {
-		limits.MaxPerHour = 1
-	}
-	if limits.MinInterval < 0 {
-		limits.MinInterval = 0
-	}
-	return &restartLimiter{limits: limits, history: make(map[string][]time.Time), now: time.Now}
-}
-
-// allow 判定并记账。尝试本身就计数 —— 失败的重启同样是对目标的一次动作，
-// 不计数就等于给"反复重启修不好的容器"开了后门。
-func (l *restartLimiter) allow(name string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	now := l.now()
-	kept := make([]time.Time, 0, len(l.history[name]))
-	for _, at := range l.history[name] {
-		if now.Sub(at) < restartLimitWindow {
-			kept = append(kept, at)
-		}
-	}
-	l.history[name] = kept
-	if len(kept) > 0 && l.limits.MinInterval > 0 {
-		if since := now.Sub(kept[len(kept)-1]); since < l.limits.MinInterval {
-			return fmt.Errorf("restart of %q rate limited: last restart %s ago, minimum interval is %s",
-				name, since.Truncate(time.Second), l.limits.MinInterval)
-		}
-	}
-	if len(kept) >= l.limits.MaxPerHour {
-		return fmt.Errorf("restart of %q rate limited: %d restarts in the last hour, limit is %d",
-			name, len(kept), l.limits.MaxPerHour)
-	}
-	l.history[name] = append(kept, now)
-	return nil
-}
-
-// RegisterRestartTool 登记 docker_restart（L2）。target 必须命中白名单
-// （GC-11：只对配置允许的 Sub2API 运行对象执行），白名单为空则不注册 ——
-// 没有可重启目标的部署形态下，这个动作在系统里不存在。
-// limits 是工具层限频，配置缺省时套 60s / 3 次每小时的保守值。
-func (c *DockerClient) RegisterRestartTool(registry *Registry, allowedContainers []string, limits RestartLimits) error {
-	if len(allowedContainers) == 0 {
-		return nil
-	}
-	allowed := make(map[string]bool, len(allowedContainers))
-	for _, name := range allowedContainers {
-		allowed[name] = true
-	}
-	if limits.MinInterval <= 0 {
-		limits.MinInterval = time.Minute
-	}
-	if limits.MaxPerHour < 1 {
-		limits.MaxPerHour = 3
-	}
-	return registry.Register(ToolSpec{
-		Name:        ToolDockerRestart,
-		Description: "Restart a container (L2, requires approval unless guardrails allow auto). Args: {name} or plan target_name.",
-		Level:       L2LowRisk,
-		Timeout:     30 * time.Second,
-		MaxOutput:   1024,
-		Params: []ParamSpec{
-			{Name: "name", Description: "container name from the allowlist", Required: true},
-		},
-		Handler: c.restart(allowed, newRestartLimiter(limits)),
-	})
-}
-
-// RegisterTools 登记 docker_inspect 和 docker_logs 两个 L1 只读工具。
+// RegisterTools 登记 docker_inspect 和 docker_logs 两个只读工具。
 // maxLogLines 是单次日志条数上限，由 evidence 配置统一下发。
 func (c *DockerClient) RegisterTools(registry *Registry, maxLogLines int) error {
 	if maxLogLines <= 0 {
@@ -155,8 +63,7 @@ func (c *DockerClient) RegisterTools(registry *Registry, maxLogLines int) error 
 	specs := []ToolSpec{
 		{
 			Name:        ToolDockerInspect,
-			Description: "Inspect a container's state. Returns status/restarts/timestamps as JSON.",
-			Level:       L1ReadOnly,
+			Description: "Inspect a container's state. Returns id/image/repo digests/status/restart policy/restarts/timestamps as JSON.",
 			Timeout:     promToolTimeout,
 			MaxOutput:   defaultMaxOutput,
 			Params: []ParamSpec{
@@ -166,8 +73,7 @@ func (c *DockerClient) RegisterTools(registry *Registry, maxLogLines int) error 
 		},
 		{
 			Name:        ToolDockerLogs,
-			Description: "Read bounded container logs. Never follows.",
-			Level:       L1ReadOnly,
+			Description: "Read bounded container logs aggregated by pattern: count, first/last Docker timestamp and latest sample, most recent first. Never follows.",
 			Timeout:     promToolTimeout,
 			MaxOutput:   defaultMaxOutput,
 			Params: []ParamSpec{
@@ -218,20 +124,52 @@ func (c *DockerClient) get(ctx context.Context, path string, query url.Values) (
 var errContainerNotFound = errors.New("container not found")
 
 type dockerContainerJSON struct {
+	ID    string `json:"Id"`
 	Name  string `json:"Name"`
+	Image string `json:"Image"` // 实际运行的镜像 ID（sha256:…），标签会漂移，ID 不会
 	State struct {
-		Status       string    `json:"Status"`
-		Running      bool      `json:"Running"`
-		OOMKilled    bool      `json:"OOMKilled"`
-		ExitCode     int       `json:"ExitCode"`
-		StartedAt    time.Time `json:"StartedAt"`
-		FinishedAt   time.Time `json:"FinishedAt"`
-		RestartCount int       `json:"RestartCount"`
+		Status     string    `json:"Status"`
+		Running    bool      `json:"Running"`
+		Restarting bool      `json:"Restarting"`
+		OOMKilled  bool      `json:"OOMKilled"`
+		ExitCode   int       `json:"ExitCode"`
+		StartedAt  time.Time `json:"StartedAt"`
+		FinishedAt time.Time `json:"FinishedAt"`
+		Health     *struct {
+			Status string `json:"Status"`
+		} `json:"Health"`
 	} `json:"State"`
 	Config struct {
 		Image string `json:"Image"`
 	} `json:"Config"`
+	HostConfig struct {
+		RestartPolicy struct {
+			Name string `json:"Name"`
+		} `json:"RestartPolicy"`
+	} `json:"HostConfig"`
 	RestartCount int `json:"RestartCount"`
+}
+
+// ContainerInspect 是 docker_inspect 的输出契约。只含诊断和动作前提要用的字段，
+// 不把整个 inspect（可能含环境变量里的密钥）外发。证据采集按这个结构解析。
+type ContainerInspect struct {
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	Image         string    `json:"image"`
+	ImageID       string    `json:"image_id"`
+	Status        string    `json:"status"`
+	Running       bool      `json:"running"`
+	Restarting    bool      `json:"restarting"`
+	OOMKilled     bool      `json:"oom_killed"`
+	ExitCode      int       `json:"exit_code"`
+	StartedAt     time.Time `json:"started_at"`
+	FinishedAt    time.Time `json:"finished_at"`
+	RestartCount  int       `json:"restart_count"`
+	RestartPolicy string    `json:"restart_policy"`
+	Health        string    `json:"health,omitempty"`
+	// RepoDigests are the registry digests of the running image: the identity
+	// release records and rollback verification compare, unlike drifting tags.
+	RepoDigests []string `json:"repo_digests,omitempty"`
 }
 
 type dockerNameArgs struct {
@@ -250,33 +188,55 @@ func (c *DockerClient) inspect(ctx context.Context, raw json.RawMessage) (string
 	if err := json.Unmarshal(raw, &args); err != nil {
 		return "", fmt.Errorf("invalid args: %w", err)
 	}
-	if err := validContainerName(args.Name); err != nil {
-		return "", err
-	}
-	body, err := c.get(ctx, "/containers/"+args.Name+"/json", nil)
+	result, err := c.Inspect(ctx, args.Name)
 	if err != nil {
 		return "", err
 	}
-	var full dockerContainerJSON
-	if err := json.Unmarshal(body, &full); err != nil {
-		return "", fmt.Errorf("decode inspect: %w", err)
-	}
-	// 只透出诊断要用的状态字段，不把整个 inspect（可能含环境变量里的密钥）外发。
-	out, err := json.Marshal(map[string]any{
-		"name":          strings.TrimPrefix(full.Name, "/"),
-		"image":         full.Config.Image,
-		"status":        full.State.Status,
-		"running":       full.State.Running,
-		"oom_killed":    full.State.OOMKilled,
-		"exit_code":     full.State.ExitCode,
-		"started_at":    full.State.StartedAt,
-		"finished_at":   full.State.FinishedAt,
-		"restart_count": full.RestartCount,
-	})
+	out, err := json.Marshal(result)
 	if err != nil {
 		return "", fmt.Errorf("encode inspect: %w", err)
 	}
 	return string(out), nil
+}
+
+// Inspect reads the container and its image digests. Actions use this typed
+// form; the model and collectors see the same content through docker_inspect.
+func (c *DockerClient) Inspect(ctx context.Context, name string) (ContainerInspect, error) {
+	if err := validContainerName(name); err != nil {
+		return ContainerInspect{}, err
+	}
+	body, err := c.get(ctx, "/containers/"+name+"/json", nil)
+	if err != nil {
+		return ContainerInspect{}, err
+	}
+	var full dockerContainerJSON
+	if err := json.Unmarshal(body, &full); err != nil {
+		return ContainerInspect{}, fmt.Errorf("decode inspect: %w", err)
+	}
+	result := ContainerInspect{
+		ID: full.ID, Name: strings.TrimPrefix(full.Name, "/"), Image: full.Config.Image, ImageID: full.Image,
+		Status: full.State.Status, Running: full.State.Running, Restarting: full.State.Restarting,
+		OOMKilled: full.State.OOMKilled, ExitCode: full.State.ExitCode,
+		StartedAt: full.State.StartedAt, FinishedAt: full.State.FinishedAt,
+		RestartCount: full.RestartCount, RestartPolicy: full.HostConfig.RestartPolicy.Name,
+	}
+	if full.State.Health != nil {
+		result.Health = full.State.Health.Status
+	}
+	if full.Image != "" {
+		image, err := c.get(ctx, "/images/"+url.PathEscape(full.Image)+"/json", nil)
+		if err != nil {
+			return ContainerInspect{}, fmt.Errorf("inspect image: %w", err)
+		}
+		var meta struct {
+			RepoDigests []string `json:"RepoDigests"`
+		}
+		if err := json.Unmarshal(image, &meta); err != nil {
+			return ContainerInspect{}, fmt.Errorf("decode image: %w", err)
+		}
+		result.RepoDigests = meta.RepoDigests
+	}
+	return result, nil
 }
 
 type dockerLogsArgs struct {
@@ -285,7 +245,7 @@ type dockerLogsArgs struct {
 	Since string `json:"since"` // RFC3339
 }
 
-// logs 读受限日志：tail 封顶、since 限窗口、绝不 follow。
+// logs 读受限日志：tail 封顶、since 限窗口、绝不 follow，按模式聚合后返回。
 // 非 TTY 容器的日志流是多路复用格式（8 字节帧头），需要解帧成纯文本。
 func (c *DockerClient) logs(maxLogLines int) Handler {
 	return func(ctx context.Context, raw json.RawMessage) (string, error) {
@@ -299,10 +259,13 @@ func (c *DockerClient) logs(maxLogLines int) Handler {
 		if args.Tail <= 0 || args.Tail > maxLogLines {
 			args.Tail = maxLogLines
 		}
+		// timestamps=1：每行带 Docker 记录的 RFC3339Nano 时间，
+		// 聚合日志模式时才有可信的首次/末次出现时间。
 		query := url.Values{
-			"stdout": {"1"},
-			"stderr": {"1"},
-			"tail":   {fmt.Sprintf("%d", args.Tail)},
+			"stdout":     {"1"},
+			"stderr":     {"1"},
+			"timestamps": {"1"},
+			"tail":       {fmt.Sprintf("%d", args.Tail)},
 		}
 		if strings.TrimSpace(args.Since) != "" {
 			since, err := time.Parse(time.RFC3339, args.Since)
@@ -315,7 +278,7 @@ func (c *DockerClient) logs(maxLogLines int) Handler {
 		if err != nil {
 			return "", err
 		}
-		return string(demuxDockerLog(body)), nil
+		return aggregateLogLines(string(demuxDockerLog(body))), nil
 	}
 }
 
@@ -346,66 +309,28 @@ func demuxDockerLog(raw []byte) []byte {
 	return []byte(out.String())
 }
 
-// post 调 Engine API 的写端点（目前仅 restart）。与 get 同一纪律：
-// 限量读、错误不带 URL。
-func (c *DockerClient) post(ctx context.Context, path string, query url.Values) ([]byte, error) {
-	endpoint := &url.URL{Scheme: "http", Host: "docker", Path: path, RawQuery: query.Encode()}
+// Restart asks Docker to restart the container once, giving the process ten
+// seconds to exit gracefully. Only the restart action calls it.
+func (c *DockerClient) Restart(ctx context.Context, name string) error {
+	if err := validContainerName(name); err != nil {
+		return err
+	}
+	endpoint := &url.URL{Scheme: "http", Host: "docker", Path: "/containers/" + name + "/restart", RawQuery: url.Values{"t": {"10"}}.Encode()}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+		return fmt.Errorf("build request: %w", err)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, errContainerNotFound
+		return errContainerNotFound
 	}
-	// 重启成功返回 204。
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		return nil, fmt.Errorf("docker returned HTTP %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("docker returned HTTP %d", resp.StatusCode)
 	}
-	return body, nil
-}
-
-// restart 是受控重启 handler：白名单 + 名字形态 + 限频三重校验，
-// 幂等（重启一个运行中的容器结果是确定的）。t=10 给进程 10 秒优雅退出。
-func (c *DockerClient) restart(allowed map[string]bool, limiter *restartLimiter) Handler {
-	return func(ctx context.Context, raw json.RawMessage) (string, error) {
-		var args struct {
-			Name       string `json:"name"`
-			TargetName string `json:"target_name"`
-		}
-		if err := json.Unmarshal(raw, &args); err != nil {
-			return "", fmt.Errorf("invalid args: %w", err)
-		}
-		name := args.Name
-		if name == "" {
-			name = args.TargetName
-		}
-		if err := validContainerName(name); err != nil {
-			return "", err
-		}
-		// 白名单是硬约束：配置之外的容器名一律拒绝（GC-11）。
-		if !allowed[name] {
-			return "", fmt.Errorf("container %q is not in the restart allowlist", name)
-		}
-		// 限频在真正发起请求之前：拒绝时容器状态没有被动过。
-		if err := limiter.allow(name); err != nil {
-			return "", err
-		}
-		if _, err := c.post(ctx, "/containers/"+name+"/restart", url.Values{"t": {"10"}}); err != nil {
-			return "", err
-		}
-		out, err := json.Marshal(map[string]any{"restarted": name})
-		if err != nil {
-			return "", fmt.Errorf("encode restart result: %w", err)
-		}
-		return string(out), nil
-	}
+	return nil
 }

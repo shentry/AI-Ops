@@ -11,7 +11,7 @@ import (
 )
 
 // Persist a fresh unhealthy probe before expiry, then claim the expiry decision.
-func failedVerificationCompletion(t *testing.T, db *DB, approvalID uint64, binding incident.ExecutionBinding) VerificationCompletion {
+func failedVerificationCompletion(t *testing.T, db *DB, approvalID uint64) VerificationCompletion {
 	t.Helper()
 	ctx := context.Background()
 	approval, err := db.GetApproval(ctx, approvalID)
@@ -24,7 +24,7 @@ func failedVerificationCompletion(t *testing.T, db *DB, approvalID uint64, bindi
 	if err != nil || !claimed {
 		t.Fatalf("probe claim=%v %v", claimed, err)
 	}
-	pending := VerificationCompletion{ApprovalID: approvalID, ClaimedAt: *task.ClaimedAt, CheckedAt: lastCheck, Status: "pending", NextCheckAt: deadline, Observation: "unhealthy", Detail: "HTTP 503", Binding: binding}
+	pending := VerificationCompletion{ApprovalID: approvalID, ClaimedAt: *task.ClaimedAt, CheckedAt: lastCheck, Status: "pending", NextCheckAt: deadline, Observation: "unhealthy", Detail: "HTTP 503"}
 	if result, err := db.FinalizeVerification(ctx, pending); err != nil || !result.Applied || result.Status != "pending" {
 		t.Fatalf("probe=%+v %v", result, err)
 	}
@@ -32,7 +32,7 @@ func failedVerificationCompletion(t *testing.T, db *DB, approvalID uint64, bindi
 	if err != nil || !claimed {
 		t.Fatalf("expiry claim=%v %v", claimed, err)
 	}
-	return VerificationCompletion{ApprovalID: approvalID, ClaimedAt: *task.ClaimedAt, CheckedAt: deadline, Status: "failed", Observation: "unhealthy", Detail: "HTTP 503", Binding: binding, Retry: true}
+	return VerificationCompletion{ApprovalID: approvalID, ClaimedAt: *task.ClaimedAt, CheckedAt: deadline, Status: "failed", Observation: "unhealthy", Detail: "HTTP 503", Retry: true}
 }
 
 func TestVerificationRetryAndMemoryDemotionAreOneTransaction(t *testing.T) {
@@ -40,7 +40,7 @@ func TestVerificationRetryAndMemoryDemotionAreOneTransaction(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	approval, binding, _ := verificationFixture(t, db, now)
+	approval, _, _ := verificationFixture(t, db, now)
 	// Seed the recorded source as an existing successful memory-hit diagnosis.
 	if err := db.Model(&AgentRun{}).Where("id = ?", approval.RunID).Update("mode", "memory_hit").Error; err != nil {
 		t.Fatal(err)
@@ -53,11 +53,11 @@ func TestVerificationRetryAndMemoryDemotionAreOneTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fp := incident.FaultFingerprint(parent.GroupKey, incident.SupportedAlert)
-	if err := db.UpsertFaultMemory(ctx, FaultMemory{Fingerprint: fp, GroupKey: parent.GroupKey, AlertName: incident.SupportedAlert, PlanJSON: *run.PlanJSON, Confidence: "high", FirstSeen: now, LastSuccess: now, TTLSeconds: 3600}); err != nil {
+	fp := incident.FaultFingerprint(parent.GroupKey, testAlert)
+	if err := db.UpsertFaultMemory(ctx, FaultMemory{Fingerprint: fp, GroupKey: parent.GroupKey, AlertName: testAlert, PlanJSON: *run.PlanJSON, Confidence: "high", FirstSeen: now, LastSuccess: now, TTLSeconds: 3600}); err != nil {
 		t.Fatal(err)
 	}
-	completion := failedVerificationCompletion(t, db, approval.ID, binding)
+	completion := failedVerificationCompletion(t, db, approval.ID)
 	completion.DemoteFingerprint = fp
 	before, err := db.ListIncidentEvents(ctx, approval.IncidentID, 0, 100)
 	if err != nil {
@@ -113,10 +113,10 @@ func TestVerificationRetryBudgetEndsInDurableEscalation(t *testing.T) {
 	t.Cleanup(func() { db.Close() })
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	current, binding, _ := verificationFixture(t, db, now)
+	current, policy, _ := verificationFixture(t, db, now)
 	incidentID := current.IncidentID
 	for attempt := range 3 {
-		completion := failedVerificationCompletion(t, db, current.ID, binding)
+		completion := failedVerificationCompletion(t, db, current.ID)
 		result, err := db.FinalizeVerification(ctx, completion)
 		if err != nil || !result.Applied || result.Status != "failed" {
 			t.Fatalf("attempt %d=%+v %v", attempt, result, err)
@@ -135,14 +135,17 @@ func TestVerificationRetryBudgetEndsInDurableEscalation(t *testing.T) {
 			t.Fatalf("chain=%+v %v", run, err)
 		}
 		at := completion.CheckedAt.Add(time.Second)
-		draft := Approval{IncidentID: incidentID, RunID: run.ID, ToolName: current.ToolName, ArgsJSON: current.ArgsJSON, ExecutionContext: current.ExecutionContext, PlanHash: current.PlanHash, Reason: "manual retry approval", Status: "pending", CreatedAt: at, ExpiresAt: at.Add(time.Hour)}
+		// The failed verification blocked the rule's automatic actions, so the
+		// retry's action waits for a person.
+		draft := withSnapshot(t, Approval{IncidentID: incidentID, RunID: run.ID, Service: current.Service, RuleID: current.RuleID, ToolName: current.ToolName, ArgsJSON: current.ArgsJSON, ExecutionContext: current.ExecutionContext, Reason: "manual retry approval", Status: "pending", CreatedAt: at},
+			func(s *incident.ExecutionContext) { s.Rule.Mode, s.ExpiresAt = incident.ModeManual, at.Add(time.Hour) })
 		if err := db.CompleteRun(ctx, RunCompletion{RunID: run.ID, Status: "succeeded", PlanJSON: []byte(`{"action":"docker_restart","confidence":"high"}`), FinishedAt: at, Approval: &draft}); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := db.DecideApproval(ctx, draft.ID, "approved", draft.PlanHash, "ops", "retry", "web", at); err != nil {
 			t.Fatal(err)
 		}
-		if _, claimed, err := db.ClaimApprovalExecution(ctx, draft.ID, at, binding); err != nil || !claimed {
+		if _, claimed, err := db.ClaimApprovalExecution(ctx, draft.ID, at, policy); err != nil || !claimed {
 			t.Fatalf("execution claim=%v %v", claimed, err)
 		}
 		if err := db.FinishExecution(ctx, ExecutionCompletion{ApprovalID: draft.ID, Status: "executed", ResultJSON: []byte(`{"output":"ok"}`), FinishedAt: at}); err != nil {

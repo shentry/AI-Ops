@@ -49,28 +49,27 @@ ingest.Worker (解析 / 指纹 / 去重 / 归并)
 diagnose.Worker (领取任务 Claim)
   │ (证据采集 Builder / Collector)
   ▼
-llm.Reasoner (ReAct 推理循环，限 L1 只读工具)
-  │ (产出 Plan & RCA)
+llm.Reasoner (ReAct 推理循环，只有只读工具；计划只能选已启用动作)
+  │ (产出 Plan & RCA；调用模型前完整输入已落 diagnosis_snapshot)
   ▼
-diagnose.Guard (确定性领域规则改写)
-  │ (评估风险等级)
+diagnose.Guard (依据结构化证据校验动作前提)
+  │
   ▼
-approval.Policy (限定故障/目标范围，构造 ExecutionContext & PlanHash)
-  │ (Service.Prepare 只准备审批草稿)
+approval.Policy (匹配处置规则，Action.Prepare 冻结快照，构造 ExecutionContext & PlanHash)
+  │ (observe 只记录；manual/auto 由 Service.Prepare 准备审批草稿)
   ▼
 store.CompleteRun (诊断终态 + 审批快照 + 事件同事务发布)
-  │ (人工裁决 / 系统批准)
+  │ (人工裁决 / 规则自动批准)
   ▼
-approval.Executor (锁内复验、执行；不等待验证)
-  │ (FinishExecution: 结果 + history + 事件；真实成功创建 verify_task)
+approval.Executor (服务锁内复验、执行一次；不等待验证)
+  │ (FinishExecution: 回执 + history + 事件；written 才创建 verify_task)
   ▼
-diagnose.VerificationWorker (领取到期任务，Verifier 单次健康检查)
+diagnose.VerificationWorker (领取到期任务，按快照检查项采样)
   │ (FinalizeVerification 同事务提交结论与后续变化)
-  ├── passed       → 满足门槛才写 Memory；不直接 resolve Incident
-  ├── inconclusive → 持久人工核查，不降级记忆/自动重诊
-  └── failed       → 必要记忆降级 + RequestRun 重诊 / 持久人工升级
-
-演练路径：FinishExecution → simulated；无外部动作、verify_task 或成功记忆。
+  ├── passed       → 进入观察阶段；stable 且满足门槛才写 Memory；不直接 resolve Incident
+  ├── recurred     → 阻断规则，人工处理
+  ├── inconclusive → 冻结了补偿就排队补偿；持久人工核查，不降级记忆/自动重诊
+  └── failed       → 补偿 + 规则阻断 + 必要记忆降级 + RequestRun 重诊 / 持久人工升级
 ```
 
 七个词记住就行：**摄入 → 归并 → 诊断 → 闸门 → 审批 → 执行 → 验证**。
@@ -156,9 +155,9 @@ Docker socket 没有 → 只跳过 Docker 相关的证据和工具，**其余全
 
 **5. 环境变量展开走 YAML AST。** `expandEnvironment` 只对 `!!str` 标量做 `${ENV}` 替换；再编码并用 `KnownFields(true)` 解码到默认 Config。未知/已删除键明确报错，不保留静默兼容；只接受一个 YAML 文档。
 
-独立验证默认 interval/window/timeout=`10/120/5` 秒，要求 `0 < timeout < interval < window` 且 timeout < 30 秒；独立于 evidence 超时。这是调度参数，不是实测恢复时间。
+恢复验证在 `remediation.verification`，默认 interval/window/timeout=`10/300/5` 秒、连续 3 次通过、观察 1800 秒，要求 `0 < timeout < interval < window` 且 timeout < 30 秒；独立于 evidence 超时。这是待演练校准的初值，不是实测恢复时间。已删除的旧键（`approval.dry_run`、`tools.docker` 等）会让启动失败。
 
-**6. 监听是部署安全边界。** `server.listen_addr` 默认 `127.0.0.1`；Compose 联调显式覆盖 `0.0.0.0:18080`，让 Alertmanager 从容器访问宿主机。Webhook、控制台、匿名写接口、SSE、飞书回调和 `/metrics` 共用一个 listener，必须限制整个 listener 到可信网络。`web.base_url` 不是访问控制，匿名控制台没有个人身份保证；Sub2API 示例的 `8080` 是另一服务。构建也有顺序：先 `web` 的 `npm run build`，再编译 Go embed，不能把 `.gitkeep` 当控制台产物。
+**6. 监听是部署安全边界。** `server.listen_addr` 默认 `127.0.0.1`；Compose 联调显式覆盖 `0.0.0.0:18080`，让 Alertmanager 从容器访问宿主机。Webhook、控制台、SSE、飞书回调和不带鉴权的 `/metrics` 共用一个 listener，必须限制整个 listener 到可信网络。访问控制来自 `api.Auth`：机器令牌、个人令牌或会话 Cookie，角色 viewer/operator/admin，没有匿名访问；Sub2API 示例的 `8080` 是另一服务。构建也有顺序：先 `web` 的 `npm run build`，再编译 Go embed，不能把 `.gitkeep` 当控制台产物。
 
 ## 可迁移的经验
 
@@ -433,34 +432,25 @@ out.WriteString("```\n")
 
 ## 看什么
 
-**1. 权限面 = 工具面。** `registry.go:110-120`：
+**1. 权限面 = 工具面。** `registry.go:ForLLM`：
 
 ```go
-// ForLLM 只导出 L1 只读工具（GC-08）：LLM 看到的工具面就是它的全部权限面，
-// L2/L3/L4 的动作只能由确定性执行路径触发，LLM 编造名字也调不到。
+// ForLLM 导出全部只读工具：模型看到的工具面就是它的全部权限面。写动作
+// 不在这里，模型编造动作名也调不到；它只能在计划里建议已启用的动作。
 func (r *Registry) ForLLM() []ToolSpec {
-    for _, spec := range r.tools {
-        if spec.Level == L1ReadOnly { exposed = append(exposed, spec) }
-    }
-    sort.Slice(...)     // 排序：prompt 里的工具清单稳定可 diff
+    ...
+    // 按名排序：每次导出顺序一致，prompt 里的工具清单稳定可 diff。
+    sort.Slice(exposed, ...)
 }
 ```
 
-这是 Agent 安全的核心心智：**不要靠 prompt 约束模型不做什么，要让它根本调不到。** LLM 拿到的工具列表就是它能力的全集。
+这是 Agent 安全的核心心智：**不要靠 prompt 约束模型不做什么，要让它根本调不到。** 写动作（`tools.Action`）另存一张表，只能由确定性执行路径调用。
 
 排序那行也值得注意 —— prompt 每次生成必须完全一致，否则你无法 diff「这次和上次的差异是模型变了还是输入变了」。
 
-**2. 单一执行入口。** `registry.go:124-146`：
+**2. 一份动作定义，两处使用。** `action.go:ActionDefinitions` 的注释：「The plan contract and its parser use the same list, so there is no second hard-coded whitelist」。模型看到的可选动作及参数说明、`parseContract` 接受的动作和参数，都来自同一份已启用定义；新增动作不需要改提示词或解析白名单。模型只能填动作声明的参数，目标、digest、阈值、补偿都由 `Prepare` 从可信配置和实时对象确定。
 
-```go
-// Execute 是工具的统一入口：套超时、截输出。任何调用方（LLM 工具循环、
-// 审批执行器）都走这里，保证超时和截断纪律只有一份实现。
-ctx, cancel := context.WithTimeout(ctx, spec.Timeout)
-```
-
-LLM 的工具循环和审批执行器**共用同一个** `Execute`。超时和截断的规则只有一份实现，不可能一边有一边没有。
-
-**3. 注册期校验，不是调用期。** `registry.go:74-100`：名字、描述、等级、handler、timeout 全部在 `Register` 时校验，`MaxOutput` 漏配自动兜底。**契约错误在启动时暴露**，而不是等 LLM 真的调用它才 panic。
+**3. 注册期校验，不是调用期。** `Register` 校验只读工具的名字、描述、handler、timeout，`MaxOutput` 漏配自动兜底；`RegisterAction` 校验动作的名字、版本、目标类型、描述和超时，且不能与工具重名。**契约错误在启动时暴露**，而不是等 LLM 真的调用它才 panic。只读工具统一走 `Execute`（超时、脱敏、截断只有一份实现）；LLM 工具循环、证据采集和恢复验证都用它。
 
 **4. 工具失败喂回模型，而不是炸掉循环。** `reasoner.go:274-281`：
 
@@ -513,7 +503,7 @@ func (m *usageModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatM
 
 ## 自测
 
-1. LLM 输出 `"action": "docker_restart"`，它自己能执行吗？为什么？
+1. LLM 输出 `"action": "docker_restart"`，它自己能执行吗？没有覆盖该告警的规则时会发生什么？
 2. Prometheus 挂了，这次诊断会失败吗？
 
 ---
@@ -525,10 +515,12 @@ func (m *usageModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatM
 | 文件 | 行号 | 内容 |
 |---|---|---|
 | `internal/diagnose/guard.go` | 全部 | 规则表 |
-| `internal/approval/policy.go` | `Decide` / `l2Guardrails` | 共同前置条件与自动执行护栏 |
+| `internal/approval/policy.go` | `Authority.match` / `Decide` | 规则匹配、Prepare 冻结快照、拒绝与降级 |
+| `internal/tools/action*.go` | `Prepare` / `Execute` / `Reconcile` | 每个动作自己的前提、单次写入与对账 |
 | `internal/incident/execution.go` | `ExecutionContext` / `PlanHash` / `CanonicalJSON` | 不可变执行契约与内容哈希 |
 | `internal/approval/service.go` | `Prepare` / `Decide` | 准备草稿、委托锁内裁决 |
-| `internal/store/approval.go` / `execution.go` | `DecideApproval` / `ClaimApprovalExecution` | 锁内复验与状态/事件原子提交 |
+| `internal/store/approval.go` / `execution.go` | `DecideApproval` / `ClaimApprovalExecution` / `claimRefusal` | 锁内复验与状态/事件原子提交 |
+| `internal/store/remediation.go` | `remediationState` | 急停、阻断、预算、服务互斥都从持久事实计算 |
 | `internal/store/incident.go` | `ExecutionMembersFromAlerts` | 从当前告警提取执行成员事实 |
 
 ## 看什么
@@ -547,27 +539,27 @@ type GuardRule struct {
 
 规则本身也值得看，`guard.go:64-90`：根因是**配置错误 / 镜像不存在 / 凭据问题**时，禁止一切重启类动作 —— 因为重启解决不了这类问题，只会抹掉现场。**这是领域知识写进代码**，不是通用逻辑。
 
-**2. 先检查人工/自动共同边界，再决定是否自动。** `Policy.Decide` 先确认注册工具与等级，调用 `incident.FiringFingerprints`、`ExecutionContext.ValidateBinding` 和 `incident.PlanHash`。当前只接受白名单 Sub2API 单容器 restart，firing 成员必须都是该目标的 `Sub2APIDown`。不支持的动作、Slow/依赖/混合故障直接 denied，不能靠人工批准越过范围限制。
+**2. 授权来自规则，不来自模型。** `Policy.Decide` 先要求动作已启用，再用 `Authority.match` 找覆盖当前 firing 告警的规则（`incident.FiringFingerprints` 要求每个 firing 成员都属于该服务且在规则的告警列表内），然后调用动作的 `Prepare` 冻结目标身份、修订、执行前状态、检查项和补偿。`observe` 到此为止，只记录“would …”。模型置信度、RCA 相似度都不授予执行权。
 
-通过共同条件后，`l2Guardrails` 才检查自动开关、dry-run 与 tool+target 限频。它返回原因字符串而不是 bool，降级原因直接进入审批 reason、事件和通知。快照 Hash 随故障成员和配置变化，不能再拿它代替目标限频键。
+判定分两类：让任何写入都错误的条件（急停、服务正在处置、预算耗尽、`Prepare` 拒绝）直接 denied；需要人看一眼的条件（维护窗口、规则被阻断、同一事件已执行过主要动作、监控数据不可用）把 `auto` 降级为 `manual`，原因写进审批 reason、事件和通知。
 
-**3. Fail closed 的三处写法。** Policy 与执行契约分别守住自动许可和共同边界：
+**3. Fail closed 的三处写法。**
 
 ```go
-// 1. 没有限频数据源 → 降级审批，不是"没数据就放行"
-if p.counter == nil || p.cfg.RateWindow <= 0 || p.cfg.MaxPerWindow < 1 {
-    return "rate limit is not configured"
-}
-// 2. 查库出错 → 按超限处理
+// 1. 读不到规则状态 → 拒绝，不是"没数据就放行"
+state, err := p.state.RemediationState(ctx, ...)
 if err != nil {
-    return "rate limit check failed: " + err.Error()
+    return denied("remediation state unavailable: %v", err)
 }
-// 3. 空白名单 = 没有任何可批准的变更目标（ExecutionContext.ValidateBinding）
+// 2. 没有规则覆盖 → 拒绝；人工批准也越不过规则范围
+rule, firing, ok := p.authority.match(action, input.Members)
+if !ok { return denied("no remediation rule authorizes %s for the firing alerts", action) }
+// 3. 规则预算缺失（Max < 1）在领取时也按耗尽处理（store.claimRefusal）
 ```
 
 **「不知道」一律等于「不允许」。** 这是安全护栏和普通业务逻辑最大的区别。
 
-**4. 用精确契约限制影响范围。** `ExecutionContext.Target` 只接受 `docker_restart`、`target_kind=container` 且名称等于快照的受控目标；`ValidateMembers` 拒绝未批准的新 firing 成员或不支持的故障。发布审批、领取执行与验证终结时都要检查范围，不能只在模型输出时查一次。
+**4. 领取时把所有条件再查一遍。** `claimRefusal` 在 Incident、审批和服务锁（`service_lock` 行）内重查 TTL、Hash、规则版本、故障范围、急停、服务互斥、维护窗口、预算、阻断和“同一事件已有动作”；任一不满足就把审批转 expired，旧快照永不换目标执行。动作的 `Execute` 还会再读一次对象（容器 ID 与启动时间、运行中的镜像 digest、账号调度状态），与快照修订不一致就不写并返回 `Written=false`。
 
 **5. 内容指纹绑定完整执行契约。** 唯一算法位于 `internal/incident/execution.go`：
 
@@ -575,27 +567,29 @@ if err != nil {
 PlanHash = SHA256(canonicalJSON(tool_name, args, execution_context))
 ```
 
-`CanonicalJSON` 消除 JSON 键序/空白差异，避免 MySQL JSON 重排后失配。`ExecutionContext` 固定 Registry 安全等级、明确的 dry-run 布尔值，以及服务端生成的目标/URL/成员/验证时长；缺字段不能默认成真实执行许可。
+`CanonicalJSON` 消除 JSON 键序/空白差异，避免 MySQL JSON 重排后失配。版本 3 的 `ExecutionContext` 固定规则 ID/版本/模式、动作版本、目标身份与修订、执行前状态、证据引用、故障成员、验证检查项与参数、补偿和有效期；缺字段的快照不能通过校验。
 
-`Service.Prepare` 只准备草稿，`CompleteRun` 才与诊断结论一起发布。Web/飞书都展示 target、scope、safety_level、dry_run、reason、plan_hash、expires_at；批准/拒绝携带预期 Hash，`DecideApproval` 持锁比较内容、Hash、TTL 和状态。执行领取重新检查当前白名单/工具等级/目标配置/安全开关与故障范围。
+`Service.Prepare` 只准备草稿，`CompleteRun` 才与诊断结论一起发布。Web/飞书都展示目标及身份、规则与模式、检查项、补偿、reason、plan_hash、expires_at；批准/拒绝携带预期 Hash，`DecideApproval` 持锁比较内容、Hash、TTL 和状态，裁决人取自服务端身份。
 
-**批准的内容和执行的内容必须是同一份。** 演练快照永远不能升级为真实执行；全局改为 dry-run 不会把旧真实审批偷偷变成演练；配置漂移也不能把旧验证任务转向新 URL。Hash 仅绑定内容，不是个人身份认证或数据库管理员不可伪造的签名。
+**批准的内容和执行的内容必须是同一份。** 规则或其版本改变后旧快照失效；配置漂移也不能把旧验证任务转向新地址。Hash 仅绑定内容，不是个人身份认证或数据库管理员不可伪造的签名。
 
-**6. 可信事实按固定字段提取。** `store.ExecutionMembersFromAlerts` 从当前成员告警提取 fingerprint/name/status，以及 `container`、`service` 标签；`incident.FiringFingerprints` 要求 service=sub2api、container=配置目标、name=Sub2APIDown。不是模型说“可验证”就可验证，也不是任意标签碰巧含目标名就算来源可信。
+**6. 可信事实按固定字段提取。** `store.ExecutionMembersFromAlerts` 从当前成员告警提取 fingerprint/name/status 和 `service` 标签；目标身份来自 Guard 依据证据确认的对象（例如 Docker 容器 ID），不是模型说“可验证”就可验证，也不是任意标签碰巧含目标名就算来源可信。
 
 ## 可迁移的经验
 
 - **规则表模式**：规则 = 谓词 + 动作 + 名字 + 原因；不要散落的 if。
-- **护栏返回原因字符串，不返回 bool**：拒绝理由要能直接给人看。
-- **Fail closed 铁律**：限频未知不允许自动执行，目标/范围未知不允许发布变更审批。
-- **共同前置条件先于审批**：不支持的目标/故障不能通过人工裁决放行。
+- **判定返回原因字符串，不返回 bool**：拒绝和降级理由要能直接给人看。
+- **Fail closed 铁律**：规则状态未知不允许执行，目标/范围未知不允许发布变更审批。
+- **授权边界先于审批**：规则没覆盖的目标/故障不能通过人工裁决放行。
+- **状态从事实计算**：急停、阻断、预算都由持久事件算出，不维护第二套计数表。
 - **指纹双向归一化**：两侧走同一归一化函数，执行前重算防篡改。
 - **可信提取需白名单**：明确定义哪些字段算数，不能放任所有标签充当目标。
 
 ## 自测
 
-1. LLM 建议 `restart container=*`，最终会发生什么？逐个闸门走一遍。
+1. LLM 建议 `docker_restart` 一个名字不是服务容器的目标，最终会发生什么？逐个闸门走一遍。
 2. 有人直接改数据库把 `approval.args_json` 的 target 换掉，会发生什么？
+3. 管理员在一个自动审批已排队后点了急停，这个审批会怎样？已经在执行的呢？
 
 ---
 
@@ -605,28 +599,29 @@ PlanHash = SHA256(canonicalJSON(tool_name, args, execution_context))
 
 | 文件 | 行号 | 内容 |
 |---|---|---|
-| `internal/approval/executor.go` | `RunOnce` / `execute` / `persist` | 只执行动作，提交失败只重试结果 |
-| `internal/store/execution.go` | `FinishExecution` / `RecoverExecutingApprovals` | 结果/验证任务原子落库与中断恢复 |
-| `internal/diagnose/verify.go` / `health.go` | `Check` / `readHTTPHealth` | 单次有界只读健康观测 |
-| `internal/diagnose/verification_worker.go` | `RunOnce` / `evaluateVerification` / `prepareEffects` | 持久调度、三态终结与后续变化准备 |
-| `internal/store/verification.go` | `FinalizeVerification` | 验证结论、审计、记忆与必要重诊同事务 |
+| `internal/approval/executor.go` | `RunOnce` / `execute` / `reconciled` / `recover` / `persist` | 只执行一次，出错先对账，提交失败只重试结果 |
+| `internal/store/execution.go` | `FinishExecution` | 回执、验证任务、变更记录原子落库 |
+| `internal/diagnose/verify.go` / `health.go` | `Check` / `readHTTPHealth` | 按快照检查项的单次有界只读观测 |
+| `internal/diagnose/verification_worker.go` | `RunOnce` / `evaluateVerification` / `prepareEffects` | 持久调度、验证与观察阶段终结、后续变化准备 |
+| `internal/store/verification.go` | `FinalizeVerification` | 验证结论、审计、记忆、补偿与必要重诊同事务 |
 | `internal/store/runrequest.go` | `checkRetryBudget` | retry_of 链校验与最多两次自动预算 |
 
 ## 看什么
 
-**1. 执行和恢复是两件事。** Executor 只领取、复验、执行和调用 `FinishExecution`；不持有 Verifier、记忆写入或重诊调度接口。真实成功提交 `executed + verify_task(pending)`，演练提交 `simulated` 且不调用工具、不创建验证任务。
+**1. 执行和恢复是两件事。** Executor 只领取、复验、执行和调用 `FinishExecution`；不持有 Verifier、记忆写入或重诊调度接口。结果按回执分三种：`written` 提交 `executed + verify_task`，`not_written`（例如对象已变、部署锁被占用）提交 `aborted`，出错时先 `Reconcile` 读目标，仍不确定就 `failed + manual_check`。
 
-**2. 观测和结论也要区分。** `Verifier.Check` 只检查一次快照绑定的 `/health`，不 sleep、不写库、不调用 LLM。Collector 和 Verifier 共用 `health.go`，不跟随重定向：2xx 是 healthy，非 2xx 是 unhealthy，请求/读取失败是 unavailable。Worker 才按固定 deadline 与观测新鲜度准备终态：
+**2. 观测和结论也要区分。** `Verifier.Check` 按快照里的检查项各观测一次（容器实例、健康、业务探针、运行镜像 digest、错误率、账号调度状态），不 sleep、不写库、不调用 LLM；数据不足或查询失败不是通过。Worker 才按固定 deadline、连续通过次数与观测新鲜度准备终态：
 
 | 结论 | 条件 | 后续同事务变化 |
 |---|---|---|
-| `passed` | 截止前完成健康观测 | 满足门槛才写成功记忆，不直接 resolve Incident |
-| `failed` | 窗口结束时仍有新鲜的截止前不健康观测 | memory_hit 才降级记忆；必要自动重诊或人工升级 |
-| `inconclusive` | 没有新鲜结论、配置漂移或故障范围不再支持 | 持久人工核查，不改记忆、不自动重诊 |
+| `passed` | 截止前连续达到要求的通过次数 | 有观察窗口时进入 watch 阶段；否则满足门槛写成功记忆。不直接 resolve Incident |
+| `stable` / `recurred` | 观察窗口内没有 / 出现连续不健康 | stable 才写成功记忆；recurred 阻断规则、人工处理 |
+| `failed` | 窗口结束时仍有新鲜的截止前不健康观测 | 冻结了补偿就同事务排队补偿；阻断规则；memory_hit 才降级记忆；必要自动重诊或人工升级 |
+| `inconclusive` | 没有新鲜结论、配置漂移或故障范围不再支持 | 冻结了补偿就排队补偿；持久人工核查，不改记忆、不自动重诊 |
 
 一次健康结果不能代表吞吐、延迟或所有依赖恢复；新故障/空成员也不能套用“全部通过”。告警 resolved 是否到达不是健康判断的必要条件，Incident 状态仍由告警成员驱动。
 
-**3. 不在执行队列里等待窗口。** `VerificationWorker.RunOnce` 每次只消费一个到期任务；未到终点就写 `next_check_at` 并释放领取。默认 10/120/5 秒来自审批快照，请求超时还受剩余窗口限制；迟到观测不用于通过。领取上限 30 秒，循环回收 stale running，提交比较 claimed_at，旧领取不能完成新任务。
+**3. 不在执行队列里等待窗口。** `VerificationWorker.RunOnce` 每次只消费一个到期任务；未到终点就写 `next_check_at` 并释放领取。默认 10/300/5 秒、连续 3 次来自审批快照，请求超时还受剩余窗口限制；迟到观测不用于通过。领取上限 30 秒，循环回收 stale running，提交比较 claimed_at，旧领取不能完成新任务。
 
 停机取消不是故障结论：Worker 传播取消/读库错误，保留可恢复领取，不脱离取消强行终结；恢复后仍使用原 deadline，不重新开始窗口。
 
@@ -634,9 +629,9 @@ PlanHash = SHA256(canonicalJSON(tool_name, args, execution_context))
 
 **5. 重诊预算和人工升级必须持久化。** `FinalizeVerification` 在同一事务内终结任务，再复用 `requestRun`，不会被自己的 running task 阻塞，也不把记忆、结论、重诊分开提交。自动预算按 `retry_of` 链计算最多两次，父 Run 必须属于同一 Incident 且已终结；断链/读库失败不能重置预算。超限先持久化人工问题与 escalation 事件，再通知，IM 失败不撤销这些事实。
 
-**6. 中断恢复的取舍。** `FinishExecution` 的相同结果重提交不追加第二份历史/事件/任务；当前进程只重试结果事务，不重调外部动作。若进程死在 executing、结果未持久化，`RecoverExecutingApprovals` 标 failed + critical manual_check，绝不盲目重放。若 executed 与任务已提交，则只恢复验证。
+**6. 中断恢复的取舍。** `FinishExecution` 的相同结果重提交不追加第二份历史/事件/任务；当前进程只重试结果事务，不重调外部动作。若进程死在 executing、结果未持久化，下次启动 `Executor.recover` 用领取时持久化的操作标识和快照修订调用 `Reconcile`：目标显示已写入就进入验证，显示未写入就结束且不重试，看不出来就 failed + critical manual_check，绝不盲目重放。若 executed 与任务已提交，则只恢复验证。
 
-「命令发出但未记账」和「未发出」不能仅靠数据库区分，所以不承诺外部动作 exactly-once。这里仍要求单实例，不把任务 CAS 宣传成多实例安全。
+「命令发出但未记账」和「未发出」不能仅靠数据库区分，所以靠读目标对账，也不承诺外部动作 exactly-once。执行器由 MySQL `GET_LOCK` 保证单个活动实例，但启动对账仍假设单实例部署，不宣传多实例安全。
 
 ## 可迁移的经验
 
@@ -650,7 +645,7 @@ PlanHash = SHA256(canonicalJSON(tool_name, args, execution_context))
 ## 自测
 
 1. 验证任务已过 deadline 且没有新鲜观测时，为什么应 inconclusive，而不是 failed？
-2. 进程在「docker restart 已发出、结果未回」时被 kill，系统怎么处理？
+2. 进程在「docker restart 已发出、结果未回」时被 kill，系统怎么处理？重启后怎么知道要不要再执行？
 
 ---
 
@@ -824,10 +819,10 @@ func (h *StreamAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {  // 标�
 | 3 | 失败分类 | `ingest/worker.go:131-139` | 重试有意义 vs 没意义，后者必须能出队 |
 | 4 | 行锁 + 条件更新领取 | `agentrun.go:256-262` | 抢不到不是 error |
 | 5 | 三态结论 | `verification_worker.go:evaluateVerification` | 成功 / 失败 / **无法判定**；按 deadline 和新鲜度判断 |
-| 6 | 护栏返回原因字符串 | `policy.go:l2Guardrails` | 拒绝理由要能直接给人看 |
+| 6 | 判定返回原因字符串 | `policy.go:Decide`、`execution.go:claimRefusal` | 拒绝和降级理由要能直接给人看 |
 | 7 | Fail closed | `policy.go:Decide` | 不知道 = 不允许 |
 | 8 | 内容指纹双向校验 | `incident/execution.go:PlanHash` | 绑定工具、参数和执行上下文；两侧归一化 |
-| 9 | 权限面 = 工具面 | `registry.go:110-120` | 不靠 prompt 约束，靠调不到 |
+| 9 | 权限面 = 工具面 | `registry.go:ForLLM` | 不靠 prompt 约束，靠调不到 |
 | 10 | 外部调用在事务外 | `pipeline.go:withStep` | 事务只包住写入，关键审计错误要传播 |
 | 11 | 截断留痕 | `pipeline.go:recordToolSteps` | 静默截断比没审计更危险 |
 | 12 | 只读任务可恢复 | `verification_worker.go:RunOnce` | 取消不终结，过期领取回队，deadline 不延长 |
@@ -840,9 +835,8 @@ func (h *StreamAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {  // 标�
 
 | 你会看到 | 别学，因为 |
 |---|---|
-| `api.Console` 无条件放行所有控制台读写 | 匿名身份掌握变更执行权（评审 B1）。注意这是**明确的设计选择**而非疏忽：原先那套 1200 行 OAuth/Session 从未接进路由，已于 2026-08-24 整体删除 |
 | `*store.DB` 是集中数据库边界 | 按域拆文件不等于缩小事务职责；共享事务不宜为了方法数量再拆多层转发，阅读调用边界见 `internal/store/doc.go` |
-| 当前只支持 Sub2APIDown 的受控 restart | 刻意收窄健康判据，不应把 `/health` 2xx 推广成 Slow/依赖故障已修复 |
+| sub2api 的 `/health` 固定返回 ok | 只证明进程在响应；除进程恢复外，每个动作都要用业务信号验证，不能把 `/health` 2xx 推广成业务已恢复 |
 | `helpers_test.go:openIntegrationDB` 由 `TEST_MYSQL_DSN` 门控 | 普通 `go test ./...` 不代表 MySQL 集成测试已执行；CI 必须提供独立真库、全量迁移及触发器权限 |
 | 浏览器交互测试拦截 API | 可检查契约/交互，但不能代替真实后端、数据库、Docker、告警链路实验 |
 
@@ -866,21 +860,22 @@ func (h *StreamAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {  // 标�
  9. ingest/worker.go + store/runrequest.go  promote → 统一准入 → 按 severity 落 agent_run
 10. diagnose/worker.go                 claim pending → running
 11. diagnose/pipeline.go:Run            memory.Lookup
-12. diagnose/builder.go:47-54           BuildForIncident → 7 个 collector
-13. diagnose/evidence.go:76-107         Render（脱敏 + 围栏）
-14. llm/reasoner.go:94-142              ReAct（最多 8 步，只有 L1 工具）
-15. diagnose/guard.go:44-95             确定性规则
-16. approval/policy.go:Decide           故障范围 + 执行快照 + Hash + L2 自动护栏
-17. approval/service.go:Prepare         草稿 → store.CompleteRun 原子发布结论/审批/事件
-18. api/approval.go / feishu/callback   人工提交 Hash → 锁内裁决
-19. approval/executor.go                复验领取 → Execute → FinishExecution（或 simulated）
-20. diagnose/verification_worker.go     消费持久 verify_task → Verifier 单次健康检查
-21. store/verification.go              结论 / 审计 / 记忆 / RequestRun 重诊同事务
+12. diagnose/builder.go                BuildForIncident → 各 collector（含发布记录、上游账号）
+13. store/diagnosis_snapshot.go         结构化证据落库；调用模型前写入完整输入
+14. diagnose/evidence.go               Render（脱敏 + 围栏）
+15. llm/reasoner.go                     ReAct（只有只读工具，计划只能选已启用动作）
+16. diagnose/guard.go                   依据结构化证据校验动作前提
+17. approval/policy.go:Decide           规则匹配 + Prepare 冻结快照 + Hash + 拒绝/降级
+18. approval/service.go:Prepare         草稿 → store.CompleteRun 原子发布结论/审批/事件
+19. api/approval.go / feishu/callback   operator 提交 Hash → 锁内裁决（manual 规则）
+20. approval/executor.go                服务锁内复验领取 → Action.Execute → FinishExecution
+21. diagnose/verification_worker.go     消费持久 verify_task → 检查项采样 → 观察阶段
+22. store/verification.go              结论 / 审计 / 记忆 / 补偿 / RequestRun 重诊同事务
 ```
 
 **每一步都问自己：这一步失败了会怎样？** 项目里绝大多数注释回答的正是这个问题。
-21 步都能答上来，再检查“结果已执行但未记账”和“验证已落库但通知失败”两个边界。
+22 步都能答上来，再检查“结果已执行但未记账”和“验证已落库但通知失败”两个边界。
 
-升级与验证操作见[执行安全升级说明](execution-trust-upgrade.md)：仅在停机、停止外部写入并备份后运行 `MYSQL_DSN=... go run ./cmd/retire-approvals -apply`。命令在 009 前/后都可退役旧 pending/approved（expired + 事件）与结果未知的旧 executing（failed + manual_check），不改现代快照；新服务需要全部 001–011 迁移。
+升级与验证操作见[执行安全升级说明](execution-trust-upgrade.md)：仅在停机、停止外部写入并备份后运行 `MYSQL_DSN=... go run ./cmd/retire-approvals -apply`。命令在 009 前/后都可退役旧 pending/approved（expired + 事件）与结果未知的旧 executing（failed + manual_check），不改现代快照；新服务需要全部 001–014 迁移（离线执行，执行快照随之升级到版本 3）。
 
 CI 保留 gofmt/vet/build/race 与前端 typecheck/build/交互测试；Go 构建前先生成前端产物。除了全量迁移后的业务测试库，还分别创建新库显式运行 empty/legacy 升级测试，避免默认模式门控跳过。独立 MySQL 故障注入用条件 trigger + SIGNAL，测试应用账号需 TRIGGER，binlog trust 只在可丢弃 CI 实例由 root 开启，不是生产配置。浏览器测试拦截 API，不能据此宣称 [T1–T17](execution-trust-design.md) 或真实故障验收全部完成。

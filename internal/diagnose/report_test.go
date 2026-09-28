@@ -12,6 +12,7 @@ import (
 	"oncall-agent/internal/llm"
 	"oncall-agent/internal/notify"
 	"oncall-agent/internal/store"
+	"oncall-agent/internal/tools"
 )
 
 type capturingReporter struct{ report DiagnosisReport }
@@ -32,15 +33,19 @@ func (c *capturingNotifier) Send(_ context.Context, n notify.Notification) (noti
 	return notify.Delivery{Provider: "capture"}, nil
 }
 
-func reportApproval(t *testing.T, dryRun bool) store.Approval {
+func reportApproval(t *testing.T, mode string) store.Approval {
 	t.Helper()
-	snapshot, err := json.Marshal(incident.ExecutionContext{SafetyLevel: "L3", DryRun: dryRun, Verification: incident.VerificationSpec{
-		Kind: incident.HealthVerification, TargetName: "sub2api", BaseURL: "http://private-target.invalid:8080", MemberFingerprints: []string{"private-fingerprint"}, IntervalSeconds: 10, WindowSeconds: 120, TimeoutSeconds: 5,
-	}})
+	expires := time.Now().UTC().Add(time.Hour).Truncate(time.Millisecond)
+	snapshot, err := json.Marshal(incident.ExecutionContext{Version: incident.ExecutionContextVersion, Kind: incident.KindPrimary, Service: "sub2api",
+		Rule: incident.RuleRef{ID: "restart", Version: "r1@000000000000", Mode: mode, Alerts: []string{"Sub2APIDown"}}, ActionVersion: 2,
+		Target: incident.Object{Kind: "container", Name: "sub2api", ID: "c0ffee"}, Revision: "started_at=x", PreState: json.RawMessage(`{}`),
+		Members: []string{"private-fingerprint"}, FaultAlert: "Sub2APIDown", ExpiresAt: expires,
+		Verification: incident.VerificationSpec{Checks: []incident.Check{{Kind: incident.CheckHealth, Params: json.RawMessage(`{"base_url":"http://private-target.invalid:8080"}`)}},
+			IntervalSeconds: 10, WindowSeconds: 120, TimeoutSeconds: 5, RequiredPasses: 1}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := store.Approval{ID: 42, IncidentID: 7, RunID: 31, Status: "pending", ToolName: incident.RestartAction, Reason: "manual approval required", ArgsJSON: []byte(`{"target_kind":"container","target_name":"sub2api"}`), ExecutionContext: snapshot, ExpiresAt: time.Now().UTC().Add(time.Hour)}
+	a := store.Approval{ID: 42, IncidentID: 7, RunID: 31, Status: "pending", ToolName: tools.ActionDockerRestart, Reason: "manual approval required", ArgsJSON: []byte(`{"target_kind":"container","target_name":"sub2api"}`), ExecutionContext: snapshot, ExpiresAt: expires}
 	a.PlanHash, err = incident.PlanHash(a.ToolName, a.ArgsJSON, a.ExecutionContext)
 	if err != nil {
 		t.Fatal(err)
@@ -50,10 +55,10 @@ func reportApproval(t *testing.T, dryRun bool) store.Approval {
 
 func TestPipelineReportCarriesCommittedApprovalSnapshot(t *testing.T) {
 	db := newFakeRunStore()
-	a := reportApproval(t, true)
+	a := reportApproval(t, incident.ModeManual)
 	policy := &fakePolicy{decision: approval.Decision{Kind: approval.DecisionApproval, ToolName: a.ToolName, Args: json.RawMessage(a.ArgsJSON), ExecutionContext: json.RawMessage(a.ExecutionContext), PlanHash: a.PlanHash, Reason: a.Reason}}
 	reporter := &capturingReporter{}
-	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, &fakeReasoner{result: &llm.DiagnoseResult{RCA: "容器退出", Confidence: "high"}}, policy, approval.NewService(nil, 30), reporter, nil, 0)
+	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, &fakeReasoner{result: &llm.DiagnoseResult{RCA: "容器退出", Confidence: "high"}}, policy, approval.NewService(nil), reporter, nil, 0)
 	if err := pipeline.Run(context.Background(), store.AgentRun{ID: 31, IncidentID: 7, Mode: "full", Status: "running"}); err != nil {
 		t.Fatal(err)
 	}
@@ -64,9 +69,9 @@ func TestPipelineReportCarriesCommittedApprovalSnapshot(t *testing.T) {
 }
 
 func TestNotifyDiagnosisApprovalPayloadUsesOnlySnapshot(t *testing.T) {
-	for _, dryRun := range []bool{false, true} {
+	for _, mode := range []string{incident.ModeManual, incident.ModeAuto} {
 		notifier := &capturingNotifier{}
-		a := reportApproval(t, dryRun)
+		a := reportApproval(t, mode)
 		err := NewNotifyReporter(notifier, "https://oncall.example.com").NotifyDiagnosis(context.Background(), DiagnosisReport{
 			IncidentID: 7, RunID: 31, Mode: "full", RCA: "容器退出", Confidence: "high", Approval: &a,
 			PolicyDecision: approval.DecisionApproval,
@@ -76,7 +81,7 @@ func TestNotifyDiagnosisApprovalPayloadUsesOnlySnapshot(t *testing.T) {
 			t.Fatal(err)
 		}
 		n := notifier.notification
-		for key, want := range map[string]any{"action": a.ToolName, "tool_name": a.ToolName, "target": "container/sub2api", "scope": "single_container", "safety_level": "L3", "dry_run": dryRun, "reason": a.Reason, "plan_hash": a.PlanHash, "approval_status": "pending", "expires_at": a.ExpiresAt.UTC().Format(time.RFC3339)} {
+		for key, want := range map[string]any{"mode": "full", "action": a.ToolName, "tool_name": a.ToolName, "target": "container/sub2api", "target_id": "c0ffee", "rule_id": "restart", "rule_mode": mode, "reason": a.Reason, "plan_hash": a.PlanHash, "approval_status": "pending", "expires_at": a.ExpiresAt.UTC().Format(time.RFC3339)} {
 			if got := n.Payload[key]; got != want {
 				t.Fatalf("%s = %v, want %v", key, got, want)
 			}
@@ -97,10 +102,10 @@ func TestNotifyDiagnosisApprovalPayloadUsesOnlySnapshot(t *testing.T) {
 }
 
 func TestNotifyDiagnosisSystemApprovalHasNoPendingAction(t *testing.T) {
-	a := reportApproval(t, false)
+	a := reportApproval(t, incident.ModeAuto)
 	a.Status = "approved"
 	notifier := &capturingNotifier{}
-	if err := NewNotifyReporter(notifier, "").NotifyDiagnosis(context.Background(), DiagnosisReport{IncidentID: 7, RunID: 31, Approval: &a, PolicyDecision: approval.DecisionAutoL2}); err != nil {
+	if err := NewNotifyReporter(notifier, "").NotifyDiagnosis(context.Background(), DiagnosisReport{IncidentID: 7, RunID: 31, Approval: &a, PolicyDecision: approval.DecisionAuto}); err != nil {
 		t.Fatal(err)
 	}
 	if notifier.notification.Kind == notify.NotificationApprovalRequired || notifier.notification.ApprovalID != nil || notifier.notification.Payload["approval_status"] != "approved" {
@@ -115,7 +120,7 @@ func TestNotifyDiagnosisRejectsMalformedApprovalSnapshot(t *testing.T) {
 		func(a *store.Approval) { a.PlanHash = "wrong" },
 		func(a *store.Approval) { a.ID = 0 },
 	} {
-		a := reportApproval(t, true)
+		a := reportApproval(t, incident.ModeManual)
 		change(&a)
 		notifier := &capturingNotifier{}
 		if err := NewNotifyReporter(notifier, "").NotifyDiagnosis(context.Background(), DiagnosisReport{IncidentID: 7, RunID: 31, Approval: &a}); err == nil || notifier.calls != 0 {

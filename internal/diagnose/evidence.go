@@ -4,6 +4,7 @@ package diagnose
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -24,20 +25,94 @@ type Target struct {
 	Alerts   []store.Alert
 }
 
-// 证据项状态。
+// 证据项状态。采集状态只说明"读没读到"，不说明服务是否健康：
+// 成功读到 HTTP 500 是 ok 之外的 error（故障证据），连接超时同样是 error（观测失败），
+// 二者靠结构化事实区分，而不是靠一个 ok 掩盖。
 const (
 	ItemOK      = "ok"      // 采到了
+	ItemPartial = "partial" // 多项查询中部分失败，正文逐项留痕
 	ItemMissing = "missing" // 数据源未配置，按缺席记录而不是报错
-	ItemError   = "error"   // 配置了但采集失败
+	ItemError   = "error"   // 配置了但采集失败，或数据源自身不健康
 )
+
+// ObjectRef 是证据描述的运行对象。只来自可信管理响应（docker inspect 等）
+// 或可信配置，告警标签和日志文本都不能充当对象身份。
+type ObjectRef struct {
+	Kind string // container | service | upstream_account
+	Name string
+	ID   string // 容器 ID、当前发布 ID 或账号 ID：执行前核对同一对象；名称只用于展示和关联
+}
+
+// ContainerFacts 是 docker inspect 中动作前提依赖的事实。
+// 与 Body 分开保存，正文截断不会截掉它们。
+type ContainerFacts struct {
+	Status        string
+	Running       bool
+	Restarting    bool
+	OOMKilled     bool
+	ExitCode      int
+	RestartCount  int
+	RestartPolicy string
+	Health        string    `json:",omitempty"` // 容器自带 HEALTHCHECK 的状态；未定义时为空
+	Image         string    `json:",omitempty"`
+	ImageID       string    `json:",omitempty"`
+	StartedAt     time.Time `json:",omitzero"`
+	FinishedAt    time.Time `json:",omitzero"`
+	RepoDigests   []string  `json:",omitempty"`
+}
+
+// ReleaseFacts summarize the recorded deployments around the fault. The
+// current release is the latest release or rollback record.
+type ReleaseFacts struct {
+	CurrentID        string    `json:",omitempty"`
+	CurrentAt        time.Time `json:",omitzero"`
+	CurrentMigration string    `json:",omitempty"`
+	// DeployedBeforeFault is true when the current release happened within
+	// the change lookback before the fault started.
+	DeployedBeforeFault bool
+	Changes             int
+}
+
+// UpstreamFacts are sub2api's scheduling state and the upstream errors of the
+// last five minutes per account. Sampled means per-account counts come from
+// a truncated page and undercount.
+type UpstreamFacts struct {
+	RealtimeEnabled bool
+	Sampled         bool
+	TotalErrors     int
+	Accounts        []UpstreamAccountFacts
+}
+
+type UpstreamAccountFacts struct {
+	ID                int64
+	GroupID           int64
+	Available         bool
+	TempUnschedulable bool
+	Errors            int
+}
+
+// HealthFacts 是一次 HTTP 健康读取的结构化结果：healthy / unhealthy（读到非 2xx）/
+// unavailable（没读到，观测失败，不代表已确认故障）。
+type HealthFacts struct {
+	Observation string
+	StatusCode  int
+	LatencyMS   int64
+}
 
 // EvidenceItem 是一项证据：有名字、有来源、有采集时间、有截断状态。
 // 失败不是丢弃，是带着错误摘要留痕（审计要求"记录缺失证据"）。
+// Object 和各类 Facts 是结构化事实，Guard 只信这些字段，不解析 Body。
 type EvidenceItem struct {
 	Name        string
 	Source      string
 	CollectedAt time.Time
 	Status      string
+	Object      *ObjectRef             `json:",omitempty"`
+	Container   *ContainerFacts        `json:",omitempty"`
+	Health      *HealthFacts           `json:",omitempty"`
+	Release     *ReleaseFacts          `json:",omitempty"`
+	Upstream    *UpstreamFacts         `json:",omitempty"`
+	Business    *tools.BusinessTraffic `json:",omitempty"`
 	Body        string
 	Truncated   bool
 	Err         string
@@ -47,6 +122,16 @@ type EvidenceItem struct {
 type Evidence struct {
 	IncidentID uint64
 	Items      []EvidenceItem
+}
+
+// Item 按名字取证据项；同名只取第一项（collector 名字唯一）。
+func (e Evidence) Item(name string) (EvidenceItem, bool) {
+	for _, item := range e.Items {
+		if item.Name == name {
+			return item, true
+		}
+	}
+	return EvidenceItem{}, false
 }
 
 // Collector 单项证据的采集契约。约定：Collect 不返回 error，
@@ -84,11 +169,33 @@ func (e Evidence) Render() string {
 		fmt.Fprintf(&out, "- source: %s\n", item.Source)
 		fmt.Fprintf(&out, "- collected_at: %s\n", item.CollectedAt.UTC().Format(time.RFC3339))
 		fmt.Fprintf(&out, "- status: %s\n", item.Status)
+		if item.Object != nil {
+			fmt.Fprintf(&out, "- object: %s %s", item.Object.Kind, item.Object.Name)
+			if item.Object.ID != "" {
+				fmt.Fprintf(&out, " id=%s", item.Object.ID)
+			}
+			out.WriteString("\n")
+		}
+		if item.Container != nil {
+			writeFacts(&out, item.Container)
+		}
+		if item.Health != nil {
+			writeFacts(&out, item.Health)
+		}
+		if item.Release != nil {
+			writeFacts(&out, item.Release)
+		}
+		if item.Upstream != nil {
+			writeFacts(&out, item.Upstream)
+		}
+		if item.Business != nil {
+			writeFacts(&out, item.Business)
+		}
 		if item.Truncated {
 			out.WriteString("- truncated: true\n")
 		}
 		if item.Err != "" {
-			fmt.Fprintf(&out, "- error: %s\n", Sanitize(item.Err))
+			fmt.Fprintf(&out, "- error: %s\n", tools.Sanitize(item.Err))
 		}
 		if item.Body != "" {
 			out.WriteString("```\n")
@@ -105,6 +212,12 @@ func (e Evidence) Render() string {
 	return out.String()
 }
 
+// writeFacts 把结构化事实渲染成一行 JSON，放在正文之前，不参与正文截断。
+func writeFacts(out *strings.Builder, facts any) {
+	encoded, _ := json.Marshal(facts)
+	fmt.Fprintf(out, "- facts: %s\n", tools.Sanitize(string(encoded)))
+}
+
 // finishItem 是 collector 的收尾统一入口：脱敏 + 截断 + 打时间戳。
 // collector 只管采，卫生工作都在这一处做。
 func finishItem(name, source string, body string, err error) EvidenceItem {
@@ -119,7 +232,7 @@ func finishItem(name, source string, body string, err error) EvidenceItem {
 		item.Err = err.Error()
 		return item
 	}
-	clean := Sanitize(ToSafeText(body))
+	clean := tools.Sanitize(tools.ToSafeText(body))
 	if truncated := tools.Truncate(clean, itemMaxRunes); truncated != clean {
 		item.Body = truncated
 		item.Truncated = true
@@ -142,11 +255,26 @@ func missingItem(name, source, reason string) EvidenceItem {
 }
 
 // degradedItem 记录"采到了，但数据源本身不健康"：状态是 error，正文保留。
-// finishItem 在有 error 时丢正文，这里不能丢 —— 500 的 /health 响应体和
-// 旁边的指标正是诊断要看的东西，只是状态不能报成 ok。
+// finishItem 在有 error 时丢正文，这里不能丢 —— 500 的 /health 响应体
+// 正是诊断要看的东西，只是状态不能报成 ok。
 func degradedItem(name, source, body string, err error) EvidenceItem {
 	item := finishItem(name, source, body, nil)
 	item.Status = ItemError
 	item.Err = err.Error()
+	return item
+}
+
+// queriesItem 收尾多查询 collector：全成功 ok，部分失败 partial，全失败 error。
+// 正文逐项保留成功值和失败原因，状态不让一个 ok 盖住部分失败。
+func queriesItem(name, source, body string, failed, total int) EvidenceItem {
+	switch {
+	case failed == 0:
+		return finishItem(name, source, body, nil)
+	case failed == total:
+		return degradedItem(name, source, body, fmt.Errorf("all %d queries failed", total))
+	}
+	item := finishItem(name, source, body, nil)
+	item.Status = ItemPartial
+	item.Err = fmt.Sprintf("%d of %d queries failed", failed, total)
 	return item
 }

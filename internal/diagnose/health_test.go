@@ -2,7 +2,6 @@ package diagnose
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/cookiejar"
@@ -12,7 +11,6 @@ import (
 	"testing"
 
 	"oncall-agent/internal/config"
-	"oncall-agent/internal/tools"
 )
 
 func TestCollectorSharedHealthBlocksRedirectsAndCredentials(t *testing.T) {
@@ -26,11 +24,7 @@ func TestCollectorSharedHealthBlocksRedirectsAndCredentials(t *testing.T) {
 		w.WriteHeader(http.StatusFound)
 	}))
 	defer server.Close()
-	registry := stubRegistry(t, map[string]tools.Handler{
-		tools.ToolPromInstantQuery: func(context.Context, json.RawMessage) (string, error) { return "[]", nil },
-	})
-	cfg := config.EvidenceConfig{Sub2APIBaseURL: server.URL, TimeoutSeconds: 1}
-	collector := NewSub2APICollector(cfg, registry).(*sub2apiCollector)
+	collector := NewSub2APIHealthCollector(config.ServiceConfig{Name: "sub2api", BaseURL: server.URL}, config.EvidenceConfig{TimeoutSeconds: 1}).(*sub2apiHealthCollector)
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -45,7 +39,7 @@ func TestCollectorSharedHealthBlocksRedirectsAndCredentials(t *testing.T) {
 	if calls != 1 || item.Status != ItemError || !strings.Contains(item.Err, "302") {
 		t.Fatalf("calls=%d item=%+v", calls, item)
 	}
-	collector.cfg.Sub2APIBaseURL = strings.Replace(server.URL, "://", "://user:secret@", 1)
+	collector.service.BaseURL = strings.Replace(server.URL, "://", "://user:secret@", 1)
 	item = collector.Collect(context.Background(), Target{})
 	if calls != 1 || item.Status != ItemError || strings.Contains(item.Err, "secret") {
 		t.Fatalf("calls=%d item=%+v", calls, item)
@@ -57,10 +51,7 @@ func TestCollectorSharedHealthExcerptIsBoundedAndSafe(t *testing.T) {
 		fmt.Fprint(w, "token=private-token \x00\x1b"+strings.Repeat("x", 4096)+"TAIL")
 	}))
 	defer server.Close()
-	registry := stubRegistry(t, map[string]tools.Handler{
-		tools.ToolPromInstantQuery: func(context.Context, json.RawMessage) (string, error) { return "[]", nil },
-	})
-	item := NewSub2APICollector(config.EvidenceConfig{Sub2APIBaseURL: server.URL, TimeoutSeconds: 1}, registry).Collect(context.Background(), Target{})
+	item := NewSub2APIHealthCollector(config.ServiceConfig{Name: "sub2api", BaseURL: server.URL}, config.EvidenceConfig{TimeoutSeconds: 1}).Collect(context.Background(), Target{})
 	if item.Status != ItemOK || len(item.Body) > 800 {
 		t.Fatalf("item status=%s length=%d", item.Status, len(item.Body))
 	}

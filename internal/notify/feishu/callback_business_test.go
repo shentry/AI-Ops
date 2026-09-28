@@ -171,7 +171,7 @@ func TestDecisionPatchRetainsApprovedSnapshotWithoutButtons(t *testing.T) {
 	}
 	select {
 	case content := <-client.patched:
-		for _, expected := range []string{"container/sub2api", "single_container", "L2", "**Dry run:** false"} {
+		for _, expected := range []string{"container/sub2api", "**Target ID:** c0ffee", "**Rule:** restart", "**Mode:** manual"} {
 			if !strings.Contains(content, expected) {
 				t.Fatalf("patch missing %s: %s", expected, content)
 			}

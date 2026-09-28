@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -29,12 +28,12 @@ type incidentStore interface {
 // 只读接口绝不改变告警或执行状态；唯一写路径是 diagnose 落 pending run。
 type IncidentAPI struct {
 	db            incidentStore
-	authToken     string
+	auth          *Auth
 	severityRoute map[string]string
 }
 
-func NewIncidentAPI(db incidentStore, authToken string, severityRoute map[string]string) *IncidentAPI {
-	return &IncidentAPI{db: db, authToken: authToken, severityRoute: severityRoute}
+func NewIncidentAPI(db incidentStore, auth *Auth, severityRoute map[string]string) *IncidentAPI {
+	return &IncidentAPI{db: db, auth: auth, severityRoute: severityRoute}
 }
 
 // Handle 适配 GoFrame 路由。路径参数由 GoFrame 解析后仍在 URL.Path 里，
@@ -43,9 +42,14 @@ func (h *IncidentAPI) Handle(r *ghttp.Request) {
 	h.ServeHTTP(r.Response.BufferWriter, r.Request)
 }
 
+// Reads accept any identity; queuing a diagnosis is an operator action that the
+// automation token may also trigger (it only enqueues read-only work).
 func (h *IncidentAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+h.authToken)) != 1 {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
+	role := RoleViewer
+	if r.Method != http.MethodGet {
+		role = RoleOperator
+	}
+	if _, ok := h.auth.Require(w, r, role, true); !ok {
 		return
 	}
 	// 三段式路径：/api/v1/incidents[/{id}[/diagnose]]

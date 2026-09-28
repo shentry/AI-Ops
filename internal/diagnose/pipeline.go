@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"oncall-agent/internal/llm"
 	"oncall-agent/internal/metrics"
 	"oncall-agent/internal/store"
+	"oncall-agent/internal/tools"
 )
 
 // stepPayloadMaxRunes 是 step input/output 摘要的截断预算：
@@ -24,7 +26,7 @@ const stepPayloadMaxRunes = 1024
 
 // reasoner 是 Pipeline 对 LLM 层的收窄接口，单测换假实现。
 type reasoner interface {
-	Diagnose(ctx context.Context, evidence string, mode string) (*llm.DiagnoseResult, error)
+	Diagnose(ctx context.Context, evidence string, mode string, record func(llm.DiagnosisInput) error) (*llm.DiagnoseResult, error)
 }
 
 // reporter 是 Pipeline 对通知层的收窄接口。
@@ -40,6 +42,7 @@ type runStore interface {
 	GetAgentRun(ctx context.Context, id uint64) (store.AgentRun, error)
 	ListRunSteps(ctx context.Context, runID uint64) ([]store.AgentRunStep, error)
 	UpdateAgentRunMode(ctx context.Context, id uint64, mode string) error
+	SaveDiagnosisSnapshot(ctx context.Context, snapshot store.DiagnosisSnapshot) error
 }
 
 // DiagnosisReport 是发给 IM 的诊断报告内容。
@@ -117,8 +120,8 @@ func (p *Pipeline) Run(ctx context.Context, run store.AgentRun) error {
 	}
 
 	// 阶段 1：记忆查找。重诊 run 不查记忆（防坏记忆循环命中，A11）。
-	// 命中则跳过证据采集与 LLM：0 次 LLM 调用（D13 验收），
-	// 但 Guard、Policy、审批和 Verify 一步不少（GC-17）。
+	// 命中只跳过 LLM：0 次 LLM 调用（D13 验收）。记忆只是候选计划，
+	// 证据照常采集，Guard 按当前事实复核，Policy、审批和 Verify 一步不少（GC-17）。
 	fingerprint := ""
 	if len(target.Alerts) > 0 {
 		fingerprint = incident.FaultFingerprint(target.Incident.GroupKey, target.Alerts[0].Name)
@@ -146,36 +149,49 @@ func (p *Pipeline) Run(ctx context.Context, run store.AgentRun) error {
 		metrics.Inc(map[bool]string{true: metrics.MemoryHit, false: metrics.MemoryMiss}[hit])
 	}
 
-	if run.Mode != "memory_hit" {
-		// 阶段 2：证据采集。重诊 run 额外注入上一轮的失败结论；
-		// 记忆 miss 但有历史命令时注入作为参考证据（不构成权限依据）。
-		var collected Evidence
-		evidence, err := p.withStep(ctx, run.ID, run.IncidentID, 2, "evidence", "collect", func() (string, error) {
-			ev, err := p.builder.BuildForIncident(ctx, run.IncidentID)
-			collected = ev
-			if err != nil {
-				return "", err
-			}
-			rendered := ev.Render()
-			if run.RetryOf != nil {
-				rendered = p.retryContext(ctx, *run.RetryOf) + rendered
-			}
-			if run.RetryOf == nil && fingerprint != "" && p.memories != nil && p.cmdHistoryInject > 0 {
-				if cmds, err := p.memories.RecentCmds(ctx, fingerprint, p.cmdHistoryInject); err == nil && len(cmds) > 0 {
-					rendered = renderCmdHistory(cmds) + rendered
-				}
-			}
-			return rendered, nil
-		}, func() ([]store.IncidentEvent, []store.ProblemMutation) {
-			events, problems := collectorAudit(run, collected)
-			return events, problems
-		})
+	// 阶段 2：证据采集，记忆命中也不跳过：Guard 只信本次采集的结构化事实。
+	var collected Evidence
+	rendered, err := p.withStep(ctx, run.ID, run.IncidentID, 2, "evidence", "collect", func() (string, error) {
+		ev, err := p.builder.BuildForIncident(ctx, run.IncidentID)
+		collected = ev
 		if err != nil {
-			return p.fail(ctx, run, err)
+			return "", err
+		}
+		return ev.Render(), nil
+	}, func() ([]store.IncidentEvent, []store.ProblemMutation) {
+		return collectorAudit(run, collected)
+	})
+	if err != nil {
+		return p.fail(ctx, run, err)
+	}
+	// 回放记录先落结构化证据；存不下关键证据就不发布任何计划。
+	evidenceJSON, err := json.Marshal(collected)
+	if err != nil {
+		return p.fail(ctx, run, fmt.Errorf("encode evidence snapshot: %w", err))
+	}
+	snapshot := store.DiagnosisSnapshot{RunID: run.ID, CodeVersion: codeVersion, EvidenceJSON: evidenceJSON, CreatedAt: time.Now().UTC()}
+	if run.Mode == "memory_hit" {
+		snapshot.FinishedAt = timePtr(snapshot.CreatedAt)
+	}
+	if err := p.db.SaveDiagnosisSnapshot(ctx, snapshot); err != nil {
+		return p.fail(ctx, run, err)
+	}
+
+	if run.Mode != "memory_hit" {
+		// 重诊 run 额外注入上一轮的失败结论；记忆 miss 但有历史命令时
+		// 注入作为参考证据（不构成权限依据）。
+		evidence := rendered
+		if run.RetryOf != nil {
+			evidence = p.retryContext(ctx, *run.RetryOf) + evidence
+		}
+		if run.RetryOf == nil && fingerprint != "" && p.memories != nil && p.cmdHistoryInject > 0 {
+			if cmds, err := p.memories.RecentCmds(ctx, fingerprint, p.cmdHistoryInject); err == nil && len(cmds) > 0 {
+				evidence = renderCmdHistory(cmds) + evidence
+			}
 		}
 
 		// 阶段 3：LLM 推理。mode=skip 的行不会进队列（D05 已直接落 succeeded）。
-		result, err := p.runReasonStep(ctx, run, evidence)
+		result, err := p.runReasonStep(ctx, run, evidence, &snapshot)
 		if err != nil {
 			return p.fail(ctx, run, err)
 		}
@@ -186,8 +202,8 @@ func (p *Pipeline) Run(ctx context.Context, run store.AgentRun) error {
 	}
 
 	// 阶段 4：Guard。确定性规则，LLM 之后没有任何环节能改回它的结论。
-	// 记忆命中的 RCA/Plan 同样过 Guard（GC-17）。
-	guardResult := Guard(rca, plan)
+	// 记忆命中的 RCA/Plan 同样按当前证据过 Guard（GC-17）。
+	guardResult := Guard(rca, plan, collected)
 	if guardResult.Overridden {
 		plan = guardResult.Plan
 	}
@@ -210,35 +226,42 @@ func (p *Pipeline) Run(ctx context.Context, run store.AgentRun) error {
 		return p.fail(ctx, run, fmt.Errorf("marshal plan: %w", err))
 	}
 
-	// Stage 5: policy receives current alert facts, never model-provided verification rules.
+	// Stage 5: policy receives current alert facts and the identity Guard
+	// proved, never model-provided verification rules.
 	members, err := store.ExecutionMembersFromAlerts(target.Alerts)
 	if err != nil {
 		return p.fail(ctx, run, fmt.Errorf("execution members: %w", err))
 	}
-	decision := p.policy.Decide(ctx, plan, approval.PolicyInput{Members: members})
+	faultAlert := ""
+	if len(target.Alerts) > 0 {
+		faultAlert = target.Alerts[0].Name
+	}
+	decision := p.policy.Decide(ctx, plan, approval.PolicyInput{IncidentID: run.IncidentID, Members: members, FaultAlert: faultAlert,
+		Target: guardResult.Target, EvidenceRefs: plan.EvidenceRefs, ObservationOK: observationOK(collected)})
 	policyProblems := make([]store.ProblemMutation, 0, 1)
-	if decision.Kind == approval.DecisionDenied {
+	switch {
+	case decision.Kind == approval.DecisionDenied:
 		policyProblems = append(policyProblems, openProblem(run, "policy_blocked", "warning", decision.Reason))
-	} else if decision.Kind == approval.DecisionApproval {
+	case decision.Demoted:
 		policyProblems = append(policyProblems, openProblem(run, "policy_degraded", "warning", decision.Reason))
 	}
-	policyEvents := []store.IncidentEvent{{IncidentID: run.IncidentID, RunID: uint64Ptr(run.ID), EventType: string(eventlog.EventPolicyEvaluated), Phase: "policy", Status: string(decision.Kind), Summary: safeEventSummary("policy evaluated"), CreatedAt: time.Now().UTC()}}
-	if decision.Kind == approval.DecisionApproval || decision.Kind == approval.DecisionDenied {
+	policyEvents := []store.IncidentEvent{{IncidentID: run.IncidentID, RunID: uint64Ptr(run.ID), EventType: string(eventlog.EventPolicyEvaluated), Phase: "policy", Status: string(decision.Kind), Summary: safeEventSummary(decision.Reason), CreatedAt: time.Now().UTC()}}
+	if decision.Demoted || decision.Kind == approval.DecisionDenied {
 		policyEvents = append(policyEvents, store.IncidentEvent{IncidentID: run.IncidentID, RunID: uint64Ptr(run.ID), EventType: string(eventlog.EventPolicyDegraded), Phase: "policy", Status: string(decision.Kind), Summary: safeEventSummary(decision.Reason), CreatedAt: time.Now().UTC()})
 	}
 	if err := p.appendStepWithTimeEventsProblems(ctx, run.ID, 5, "approval", "policy",
-		fmt.Sprintf("action=%s tool=%s", plan.Action, decision.ToolName),
+		fmt.Sprintf("action=%s rule=%s", plan.Action, decision.RuleID),
 		fmt.Sprintf("decision=%s reason=%s", decision.Kind, decision.Reason), nil, time.Now().UTC(), time.Now().UTC(), policyEvents, policyProblems); err != nil {
 		return p.fail(ctx, run, err)
 	}
 
 	var draft *store.Approval
-	if decision.Kind == approval.DecisionApproval || decision.Kind == approval.DecisionAutoL2 {
+	if decision.Kind == approval.DecisionApproval || decision.Kind == approval.DecisionAuto {
 		reason := decision.Reason
 		if guardResult.Overridden {
 			reason += "; guard: " + guardResult.Reason
 		}
-		prepared, err := p.approvals.Prepare(run.IncidentID, run.ID, decision, Sanitize(reason))
+		prepared, err := p.approvals.Prepare(run.IncidentID, run.ID, decision, tools.Sanitize(reason))
 		if err != nil {
 			return p.fail(ctx, run, fmt.Errorf("prepare approval: %w", err))
 		}
@@ -247,8 +270,13 @@ func (p *Pipeline) Run(ctx context.Context, run store.AgentRun) error {
 	// Publish diagnosis and executable permission together. On commit failure no
 	// notification or second completion may reinterpret the uncommitted outcome.
 	finishedAt := time.Now().UTC()
+	events := []store.IncidentEvent{{IncidentID: run.IncidentID, RunID: uint64Ptr(run.ID), EventType: string(eventlog.EventRunSucceeded), Phase: "run", Status: "succeeded", Summary: safeEventSummary("diagnosis completed"), CreatedAt: finishedAt}}
+	if decision.Kind != approval.DecisionAuto && decision.Kind != approval.DecisionObserve {
+		events = append(events, store.IncidentEvent{IncidentID: run.IncidentID, RunID: uint64Ptr(run.ID), EventType: string(eventlog.EventEscalationRequired), Phase: "diagnosis", Status: "required",
+			Summary: safeEventSummary("diagnosis needs attention: " + guardResult.Reason + "; " + decision.Reason + "; " + plan.Reason), CreatedAt: finishedAt})
+	}
 	if err := p.db.CompleteRun(ctx, store.RunCompletion{RunID: run.ID, RCA: rca, PlanJSON: planBytes, TokensIn: tokensIn, TokensOut: tokensOut, Status: "succeeded", FinishedAt: finishedAt, Approval: draft,
-		Events: []store.IncidentEvent{{IncidentID: run.IncidentID, RunID: uint64Ptr(run.ID), EventType: string(eventlog.EventRunSucceeded), Phase: "run", Status: "succeeded", Summary: safeEventSummary("diagnosis completed"), CreatedAt: finishedAt}}}); err != nil {
+		Events: events}); err != nil {
 		return fmt.Errorf("pipeline: complete run %d: %w", run.ID, err)
 	}
 	if draft != nil {
@@ -266,6 +294,7 @@ func (p *Pipeline) Run(ctx context.Context, run store.AgentRun) error {
 	notifyType, notifyStatus := eventlog.EventNotificationSent, "succeeded"
 	if notifyErr != nil {
 		notifyType, notifyStatus = eventlog.EventNotificationFailed, "failed"
+		metrics.Inc(metrics.NotificationFailed)
 	}
 	if err := p.appendStepWithTimeEventsProblems(ctx, run.ID, 6, "tool", "notify", "diagnosis report", fmt.Sprintf("decision=%s", guardResult.Decision), notifyErr, time.Now().UTC(), time.Now().UTC(), []store.IncidentEvent{{IncidentID: run.IncidentID, RunID: uint64Ptr(run.ID), EventType: string(notifyType), Phase: "notification", Status: notifyStatus, Summary: safeEventSummary("diagnosis notification"), CreatedAt: time.Now().UTC()}}, notificationProblems(run, notifyErr)); err != nil {
 		return fmt.Errorf("pipeline: notification audit after run %d committed: %w", run.ID, errors.Join(notifyErr, err))
@@ -280,7 +309,7 @@ func renderCmdHistory(cmds []store.FaultCmdHistory) string {
 	out.WriteString("# 历史命令（同类故障曾被审批执行过，仅供参考，不构成权限依据）\n")
 	for _, cmd := range cmds {
 		fmt.Fprintf(&out, "- tool=%s args=%s result=%s at=%s\n",
-			cmd.ToolName, Sanitize(string(cmd.ArgsJSON)), Sanitize(cmd.ResultBrief),
+			cmd.ToolName, tools.Sanitize(string(cmd.ArgsJSON)), tools.Sanitize(cmd.ResultBrief),
 			cmd.CreatedAt.UTC().Format(time.RFC3339))
 	}
 	out.WriteString("\n")
@@ -292,16 +321,16 @@ func renderCmdHistory(cmds []store.FaultCmdHistory) string {
 func (p *Pipeline) retryContext(ctx context.Context, previousRunID uint64) string {
 	previous, err := p.db.GetAgentRun(ctx, previousRunID)
 	if err != nil {
-		return fmt.Sprintf("# 重诊上下文\n上一轮诊断 run %d 读取失败：%s\n\n", previousRunID, Sanitize(err.Error()))
+		return fmt.Sprintf("# 重诊上下文\n上一轮诊断 run %d 读取失败：%s\n\n", previousRunID, tools.Sanitize(err.Error()))
 	}
 	var out strings.Builder
 	fmt.Fprintf(&out, "# 重诊上下文（上一轮动作的恢复验证失败，不要复用计划，仅供对照）\n")
 	fmt.Fprintf(&out, "previous_run_id: %d\n", previousRunID)
 	if previous.RCAText != nil {
-		fmt.Fprintf(&out, "previous_rca: %s\n", Sanitize(*previous.RCAText))
+		fmt.Fprintf(&out, "previous_rca: %s\n", tools.Sanitize(*previous.RCAText))
 	}
 	if previous.PlanJSON != nil {
-		fmt.Fprintf(&out, "previous_plan: %s\n", Sanitize(string(*previous.PlanJSON)))
+		fmt.Fprintf(&out, "previous_plan: %s\n", tools.Sanitize(string(*previous.PlanJSON)))
 	}
 	fmt.Fprintf(&out, "previous_status: %s\n", previous.Status)
 	// verify 的失败详情在上一轮 run 的 step 里，把它带出来 ——
@@ -312,10 +341,10 @@ func (p *Pipeline) retryContext(ctx context.Context, previousRunID uint64) strin
 				continue
 			}
 			if step.OutputJSON != nil {
-				fmt.Fprintf(&out, "previous_verify: %s\n", Sanitize(string(*step.OutputJSON)))
+				fmt.Fprintf(&out, "previous_verify: %s\n", tools.Sanitize(string(*step.OutputJSON)))
 			}
 			if step.Error != nil {
-				fmt.Fprintf(&out, "previous_verify_error: %s\n", Sanitize(*step.Error))
+				fmt.Fprintf(&out, "previous_verify_error: %s\n", tools.Sanitize(*step.Error))
 			}
 		}
 	}
@@ -325,17 +354,27 @@ func (p *Pipeline) retryContext(ctx context.Context, previousRunID uint64) strin
 
 // runReasonStep 把 LLM 阶段包成一条 step：输入是证据摘要长度，输出是 RCA 摘要。
 // 工具调用另外逐条落库（recordToolSteps）—— 摘要回答"结论是什么"，
-// 工具 step 回答"结论是怎么来的、调了几次工具"。
-func (p *Pipeline) runReasonStep(ctx context.Context, run store.AgentRun, evidence string) (*llm.DiagnoseResult, error) {
+// 工具 step 回答"结论是怎么来的、调了几次工具"。完整输入在调用模型前写入回放
+// 记录，工具调用及模型实际看到的输出在调用后补齐；任一写入失败本次诊断失败。
+func (p *Pipeline) runReasonStep(ctx context.Context, run store.AgentRun, evidence string, snapshot *store.DiagnosisSnapshot) (*llm.DiagnoseResult, error) {
 	var result *llm.DiagnoseResult
 	var reasonErr error
+	record := func(input llm.DiagnosisInput) error {
+		catalog, err := json.Marshal(RecordedCatalog{Tools: input.Tools, Actions: input.Actions})
+		if err != nil {
+			return err
+		}
+		toolsJSON := datatypes.JSON(catalog)
+		snapshot.Model, snapshot.PromptSHA256, snapshot.ToolsJSON, snapshot.InputText = &input.Model, &input.PromptSHA256, &toolsJSON, &input.Evidence
+		return p.db.SaveDiagnosisSnapshot(ctx, *snapshot)
+	}
 	_, err := p.withStep(ctx, run.ID, run.IncidentID, 3, "llm", "reason", func() (string, error) {
-		out, diagErr := p.reasoner.Diagnose(ctx, evidence, run.Mode)
+		out, diagErr := p.reasoner.Diagnose(ctx, evidence, run.Mode, record)
 		// 失败的 Diagnose 也可能带回 Steps（审计残骸），先接住再判错。
 		result = out
-		reasonErr = diagErr
-		if diagErr != nil {
-			return "", diagErr
+		reasonErr = errors.Join(diagErr, p.finishSnapshot(ctx, snapshot, out))
+		if reasonErr != nil {
+			return "", reasonErr
 		}
 		return fmt.Sprintf("context_compactions=%d estimated_input=%d->%d actual_prompt=%d estimate_factor=%.3f estimated_saved=%d tokens=%d/%d tool_calls=%d confidence=%s rca=%s",
 			out.Context.Compactions, out.Context.EstimatedBefore, out.Context.EstimatedAfter,
@@ -361,6 +400,57 @@ func (p *Pipeline) runReasonStep(ctx context.Context, run store.AgentRun, eviden
 	}
 	return result, nil
 }
+
+// finishSnapshot 补齐回放记录：工具调用（输出即模型所见；出错时模型看到的是
+// "tool error: " + Err）和上下文裁剪统计。失败的诊断同样补齐，便于回放失败原因。
+// RecordedCatalog is the tools_json of a replay record: the read-only tools
+// the model could call and the actions it could plan.
+type RecordedCatalog struct {
+	Tools   []llm.ToolDefinition     `json:"tools"`
+	Actions []tools.ActionDefinition `json:"actions"`
+}
+
+func (p *Pipeline) finishSnapshot(ctx context.Context, snapshot *store.DiagnosisSnapshot, result *llm.DiagnoseResult) error {
+	if result != nil {
+		calls, err := json.Marshal(result.Steps)
+		if err != nil {
+			return err
+		}
+		stats, err := json.Marshal(result.Context)
+		if err != nil {
+			return err
+		}
+		callsJSON, statsJSON := datatypes.JSON(calls), datatypes.JSON(stats)
+		snapshot.ToolCallsJSON, snapshot.ContextJSON = &callsJSON, &statsJSON
+	}
+	snapshot.FinishedAt = timePtr(time.Now().UTC())
+	return p.db.SaveDiagnosisSnapshot(ctx, *snapshot)
+}
+
+// codeVersion identifies the running build in replay records: the VCS revision
+// Go embeds at build time, marked dirty when built from modified sources.
+var codeVersion = func() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	revision, modified := "", false
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			revision = setting.Value
+		case "vcs.modified":
+			modified = setting.Value == "true"
+		}
+	}
+	if revision == "" {
+		return "unknown"
+	}
+	if modified {
+		revision += "-dirty"
+	}
+	return revision
+}()
 
 // toolStepSeqBase 是 Reasoner 工具调用的 seq 段。主链占 1-6，verify 占 90，
 // 工具调用用 30 起的独立段：既不撞号，排序后也自然落在 reason(3) 之后。
@@ -524,7 +614,7 @@ func collectorAudit(run store.AgentRun, evidence Evidence) ([]store.IncidentEven
 		if status == "" {
 			status = ItemMissing
 		}
-		failed := status == ItemError || status == ItemMissing
+		failed := status != ItemOK
 		typ := eventlog.EventCollectorCompleted
 		if failed {
 			typ = eventlog.EventCollectorFailed
@@ -542,6 +632,22 @@ func collectorAudit(run store.AgentRun, evidence Evidence) ([]store.IncidentEven
 	}
 	return events, problems
 }
+
+// observationOK is false when any monitoring query failed: automatic writes
+// then wait for a person, since missing data is neither healthy nor failed.
+func observationOK(evidence Evidence) bool {
+	metrics, ok := evidence.Item("sub2api_metrics")
+	if !ok || metrics.Status != ItemOK || metrics.Business == nil || time.Since(metrics.Business.SampledAt) > 2*time.Minute {
+		return false
+	}
+	for _, item := range evidence.Items {
+		if strings.HasPrefix(item.Source, "prometheus:") && (item.Status == ItemError || item.Status == ItemPartial) {
+			return false
+		}
+	}
+	return true
+}
+
 func notificationProblems(run store.AgentRun, err error) []store.ProblemMutation {
 	if err == nil {
 		return []store.ProblemMutation{{Kind: store.ProblemResolve, IncidentID: run.IncidentID, Code: "notification_failed", RunID: uint64Ptr(run.ID), ResolvedAt: time.Now().UTC()}}
@@ -551,7 +657,7 @@ func notificationProblems(run store.AgentRun, err error) []store.ProblemMutation
 
 // sanitizeForStep 统一 step 摘要卫生：脱敏 + 截断。
 func sanitizeForStep(text string) string {
-	return TruncateForStep(Sanitize(text))
+	return TruncateForStep(tools.Sanitize(text))
 }
 
 // TruncateForStep 按 step 预算截断（rune）。

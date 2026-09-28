@@ -36,14 +36,14 @@ func TestManualRunAdmissionErrorsSharedAcrossRoutes(t *testing.T) {
 		{"database", errors.New("password=secret database unavailable"), 503, "", ""},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			legacy := NewIncidentAPI(&fakeIncidentStore{incident: store.Incident{ID: 11, Status: "firing"}, requestErr: test.err}, "secret", nil)
-			console := NewConversationAPI(nil, NewConsole(), admissionActions{err: test.err})
+			legacy := NewIncidentAPI(&fakeIncidentStore{incident: store.Incident{ID: 11, Status: "firing"}, requestErr: test.err}, testAuth(t), nil)
+			console := NewConversationAPI(nil, testAuth(t), admissionActions{err: test.err})
 			for _, route := range []struct {
 				path    string
 				handler http.Handler
 			}{{"/api/v1/incidents/11/diagnose", legacy}, {"/api/v1/incidents/11/rediagnose", console}} {
 				request := httptest.NewRequest(http.MethodPost, route.path, nil)
-				request.Header.Set("Authorization", "Bearer secret")
+				request.Header.Set("Authorization", "Bearer "+testOperatorToken)
 				response := httptest.NewRecorder()
 				route.handler.ServeHTTP(response, request)
 				if response.Code != test.status || response.Header().Get("Retry-After") != test.retry {

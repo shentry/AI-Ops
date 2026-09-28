@@ -15,6 +15,7 @@ import (
 	"oncall-agent/internal/incident"
 	"oncall-agent/internal/llm"
 	"oncall-agent/internal/store"
+	"oncall-agent/internal/tools"
 )
 
 // fakeRunStore 记录 step 与终态，不碰真库。
@@ -30,6 +31,9 @@ type fakeRunStore struct {
 	failStep    string
 	failEvent   string
 	completeErr error
+	snapshots   []store.DiagnosisSnapshot
+	snapshotErr error
+	problems    []store.ProblemMutation
 }
 
 func newFakeRunStore() *fakeRunStore {
@@ -48,6 +52,7 @@ func (f *fakeRunStore) AppendRunStepRecord(ctx context.Context, record store.Run
 	if record.Step.Name == f.failStep {
 		return errors.New("audit step failed: " + f.failStep)
 	}
+	f.problems = append(f.problems, record.Problems...)
 	return f.AppendRunStep(ctx, record.Step)
 }
 
@@ -94,6 +99,17 @@ func (f *fakeRunStore) ListRunSteps(_ context.Context, runID uint64) ([]store.Ag
 	return out, nil
 }
 
+func (f *fakeRunStore) SaveDiagnosisSnapshot(_ context.Context, snapshot store.DiagnosisSnapshot) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.order = append(f.order, "snapshot")
+	if f.snapshotErr != nil {
+		return f.snapshotErr
+	}
+	f.snapshots = append(f.snapshots, snapshot)
+	return nil
+}
+
 func (f *fakeRunStore) UpdateAgentRunMode(_ context.Context, id uint64, mode string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -132,8 +148,13 @@ type fakeReasoner struct {
 	calls  int
 }
 
-func (f *fakeReasoner) Diagnose(context.Context, string, string) (*llm.DiagnoseResult, error) {
+func (f *fakeReasoner) Diagnose(_ context.Context, evidence, _ string, record func(llm.DiagnosisInput) error) (*llm.DiagnoseResult, error) {
 	f.calls++
+	if record != nil {
+		if err := record(llm.DiagnosisInput{Model: "fake-model", PromptSHA256: strings.Repeat("0", 64), Evidence: evidence}); err != nil {
+			return nil, err
+		}
+	}
 	return f.result, f.err
 }
 
@@ -176,7 +197,7 @@ func (f *fakeApprovals) Prepare(incidentID, runID uint64, decision approval.Deci
 		return store.Approval{}, f.err
 	}
 	created := store.Approval{IncidentID: incidentID, RunID: runID, ToolName: decision.ToolName, Reason: reason, Status: "pending", PlanHash: decision.PlanHash, ArgsJSON: datatypes.JSON(decision.Args), ExecutionContext: datatypes.JSON(decision.ExecutionContext)}
-	if decision.Kind == approval.DecisionAutoL2 {
+	if decision.Kind == approval.DecisionAuto {
 		created.Status = "approved"
 	}
 	f.created = append(f.created, created)
@@ -314,7 +335,7 @@ func TestPipelinePassesPolicyGuardrailInput(t *testing.T) {
 	builder := fakeEvidenceBuilder{evidence: testEvidence(), target: Target{
 		Incident: store.Incident{ID: 7, GroupKey: "payments"},
 		Members:  []store.IncidentMember{{Fingerprint: "stale-member", Name: "HighCPU", Status: "firing"}},
-		Alerts:   []store.Alert{{Fingerprint: "fp1", Name: incident.SupportedAlert, Status: "firing", Labels: []byte(`{"container":"sub2api","service":"sub2api"}`)}},
+		Alerts:   []store.Alert{{Fingerprint: "fp1", Name: "Sub2APIDown", Status: "firing", Labels: []byte(`{"container":"sub2api","service":"sub2api"}`)}},
 	}}
 	policy := allowPolicy()
 	pipeline := NewPipeline(db, builder, reasoner, policy, &fakeApprovals{}, &fakeReporter{}, nil, 0)
@@ -325,7 +346,7 @@ func TestPipelinePassesPolicyGuardrailInput(t *testing.T) {
 		t.Fatal("policy did not receive guardrail input")
 	}
 	members := policy.lastInput.Members
-	if len(members) != 1 || members[0] != (incident.ExecutionMember{Fingerprint: "fp1", Name: incident.SupportedAlert, Status: "firing", Container: "sub2api", Service: "sub2api"}) {
+	if len(members) != 1 || members[0] != (incident.ExecutionMember{Fingerprint: "fp1", Name: "Sub2APIDown", Status: "firing", Service: "sub2api"}) {
 		t.Fatalf("Members = %+v, want current alert facts", members)
 	}
 }
@@ -348,7 +369,7 @@ func TestPipelineGuardHitRecorded(t *testing.T) {
 	db := newFakeRunStore()
 	reasoner := &fakeReasoner{result: &llm.DiagnoseResult{
 		RCA: "配置错误导致启动失败", Confidence: "medium",
-		Plan: llm.Plan{Action: "restart_container", Target: llm.PlanTarget{Kind: "container", Name: "sub2api"}},
+		Plan: llm.Plan{Action: tools.ActionDockerRestart, Target: llm.PlanTarget{Kind: "container", Name: "sub2api"}},
 	}}
 	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, reasoner, allowPolicy(), &fakeApprovals{}, &fakeReporter{}, nil, 0)
 	run := store.AgentRun{ID: 12, IncidentID: 7, Mode: "full", Status: "running"}
@@ -417,7 +438,7 @@ func TestStepPayloadTruncation(t *testing.T) {
 	var _ datatypes.JSON // 类型锚定
 }
 
-func TestPipelineL3CreatesApproval(t *testing.T) {
+func TestPipelineApprovalDecisionCreatesApproval(t *testing.T) {
 	db := newFakeRunStore()
 	reasoner := &fakeReasoner{result: &llm.DiagnoseResult{
 		RCA: "连接池耗尽", Confidence: "high",
@@ -495,14 +516,20 @@ func TestPipelineMemoryHitSkipsLLM(t *testing.T) {
 		},
 	}
 	reasoner := &fakeReasoner{}
-	builder := fakeEvidenceBuilder{target: Target{
+	collections := 0
+	builder := fakeEvidenceBuilder{evidence: restartEvidence(exitedWithoutSelfHealing(), nil), calls: &collections, target: Target{
 		Incident: store.Incident{ID: 7, GroupKey: "payments"},
 		Alerts:   []store.Alert{{Name: "HighCPU", Labels: []byte(`{}`)}},
 	}}
-	pipeline := NewPipeline(db, builder, reasoner, allowPolicy(), &fakeApprovals{}, &fakeReporter{}, mem, 5)
+	var report DiagnosisReport
+	pipeline := NewPipeline(db, builder, reasoner, allowPolicy(), &fakeApprovals{}, &fakeReporter{onNotify: func(r DiagnosisReport) { report = r }}, mem, 5)
 	run := store.AgentRun{ID: 20, IncidentID: 7, Mode: "full", Status: "running"}
 	if err := pipeline.Run(context.Background(), run); err != nil {
 		t.Fatalf("Run() error = %v", err)
+	}
+	// 记忆只是候选：当前证据照常采集，Guard 按当前事实放行。
+	if collections != 1 || report.Decision != DecisionAllow || report.Plan.Action != "docker_restart" {
+		t.Fatalf("collections=%d decision=%s plan=%+v", collections, report.Decision, report.Plan)
 	}
 	// 0 次 LLM；RCA/Plan 来自记忆；token 为 0。
 	if reasoner.calls != 0 {
@@ -517,19 +544,41 @@ func TestPipelineMemoryHitSkipsLLM(t *testing.T) {
 	if db.runs[20].Mode != "memory_hit" {
 		t.Fatalf("mode = %q, want memory_hit", db.runs[20].Mode)
 	}
-	// step 链：memory_lookup + guard + policy + notify，无 evidence/llm。
+	// step 链：memory_lookup + evidence + guard + policy + notify，无 llm。
 	var kinds []string
 	for _, step := range db.steps {
 		kinds = append(kinds, step.Kind)
 	}
-	want := []string{"tool", "guard", "approval", "tool"}
-	if len(kinds) != 4 {
+	want := []string{"tool", "evidence", "guard", "approval", "tool"}
+	if len(kinds) != len(want) {
 		t.Fatalf("steps = %v", kinds)
 	}
 	for i := range want {
 		if kinds[i] != want[i] {
 			t.Fatalf("step %d kind = %q, want %q", i, kinds[i], want[i])
 		}
+	}
+}
+
+// 记忆里成功过的重启计划不能绕过当前事实：目标现在健康时 Guard 必须拦下。
+func TestPipelineMemoryHitRechecksCurrentFacts(t *testing.T) {
+	db := newFakeRunStore()
+	db.runs[24] = store.AgentRun{ID: 24, IncidentID: 7, Mode: "full", Status: "running"}
+	mem := &fakeMemory{hit: true, entry: store.FaultMemory{RCAText: "记忆中的根因", Confidence: "high",
+		PlanJSON: []byte(`{"action":"docker_restart","target":{"kind":"container","name":"sub2api"},"confidence":"high"}`)}}
+	healthy := restartEvidence(ContainerFacts{Status: "running", Running: true, RestartPolicy: "unless-stopped"}, &HealthFacts{Observation: "healthy", StatusCode: 200})
+	builder := fakeEvidenceBuilder{evidence: healthy, target: Target{
+		Incident: store.Incident{ID: 7, GroupKey: "payments"},
+		Alerts:   []store.Alert{{Name: "HighCPU", Labels: []byte(`{}`)}},
+	}}
+	policy := allowPolicy()
+	var report DiagnosisReport
+	pipeline := NewPipeline(db, builder, &fakeReasoner{}, policy, &fakeApprovals{}, &fakeReporter{onNotify: func(r DiagnosisReport) { report = r }}, mem, 0)
+	if err := pipeline.Run(context.Background(), store.AgentRun{ID: 24, IncidentID: 7, Mode: "full", Status: "running"}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if report.Decision != DecisionDeny || report.Plan.Action != "none" || !strings.Contains(report.GuardNote, "healthy") {
+		t.Fatalf("report = %+v, want current facts to deny the remembered restart", report)
 	}
 }
 
@@ -583,13 +632,13 @@ type capturingReasoner struct {
 	out   *string
 }
 
-func (c *capturingReasoner) Diagnose(ctx context.Context, evidence string, mode string) (*llm.DiagnoseResult, error) {
+func (c *capturingReasoner) Diagnose(ctx context.Context, evidence string, mode string, record func(llm.DiagnosisInput) error) (*llm.DiagnoseResult, error) {
 	*c.out = evidence
-	return c.inner.Diagnose(ctx, evidence, mode)
+	return c.inner.Diagnose(ctx, evidence, mode, record)
 }
 
 func TestPipelineCriticalAuditFailurePreventsApprovalPublication(t *testing.T) {
-	for _, kind := range []string{approval.DecisionApproval, approval.DecisionAutoL2} {
+	for _, kind := range []string{approval.DecisionApproval, approval.DecisionAuto} {
 		for _, stage := range []struct{ name, event, step string }{
 			{"memory", "", "memory_lookup"},
 			{"evidence start", "collector.started", ""},
@@ -603,11 +652,11 @@ func TestPipelineCriticalAuditFailurePreventsApprovalPublication(t *testing.T) {
 			t.Run(kind+"/"+stage.name, func(t *testing.T) {
 				db := newFakeRunStore()
 				db.failStep, db.failEvent = stage.step, stage.event
-				r := &fakeReasoner{result: &llm.DiagnoseResult{RCA: "容器退出", Confidence: "high", Plan: llm.Plan{Action: incident.RestartAction, Target: llm.PlanTarget{Kind: "container", Name: "sub2api"}}, Steps: []llm.StepLog{{Name: "docker_logs"}}}}
+				r := &fakeReasoner{result: &llm.DiagnoseResult{RCA: "容器退出", Confidence: "high", Plan: llm.Plan{Action: tools.ActionDockerRestart, Target: llm.PlanTarget{Kind: "container", Name: "sub2api"}}, Steps: []llm.StepLog{{Name: "docker_logs"}}}}
 				builds := 0
-				builder := fakeEvidenceBuilder{calls: &builds, evidence: testEvidence(), target: Target{Incident: store.Incident{ID: 7, GroupKey: "sub2api"}, Alerts: []store.Alert{{Name: incident.SupportedAlert, Labels: []byte(`{}`)}}}}
+				builder := fakeEvidenceBuilder{calls: &builds, evidence: testEvidence(), target: Target{Incident: store.Incident{ID: 7, GroupKey: "sub2api"}, Alerts: []store.Alert{{Name: "Sub2APIDown", Labels: []byte(`{}`)}}}}
 				approvals, reporter := &fakeApprovals{}, &fakeReporter{}
-				policy := &fakePolicy{decision: approval.Decision{Kind: kind, ToolName: incident.RestartAction}}
+				policy := &fakePolicy{decision: approval.Decision{Kind: kind, ToolName: tools.ActionDockerRestart}}
 				pipeline := NewPipeline(db, builder, r, policy, approvals, reporter, &fakeMemory{}, 0)
 				err := pipeline.Run(context.Background(), store.AgentRun{ID: 31, IncidentID: 7, Mode: "full", Status: "running"})
 				if err == nil || !strings.Contains(err.Error(), "audit") {
@@ -633,7 +682,7 @@ func TestPipelineCriticalAuditFailurePreventsApprovalPublication(t *testing.T) {
 }
 
 func TestPipelineDraftCommitNotifyOrder(t *testing.T) {
-	for _, kind := range []string{approval.DecisionApproval, approval.DecisionAutoL2} {
+	for _, kind := range []string{approval.DecisionApproval, approval.DecisionAuto} {
 		t.Run(kind, func(t *testing.T) {
 			db := newFakeRunStore()
 			approvals := &fakeApprovals{onPrepare: func() {
@@ -651,7 +700,7 @@ func TestPipelineDraftCommitNotifyOrder(t *testing.T) {
 				}
 				db.order = append(db.order, "notify")
 			}}
-			policy := &fakePolicy{decision: approval.Decision{Kind: kind, ToolName: incident.RestartAction, PlanHash: "snapshot-hash"}}
+			policy := &fakePolicy{decision: approval.Decision{Kind: kind, ToolName: tools.ActionDockerRestart, PlanHash: "snapshot-hash"}}
 			pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, &fakeReasoner{result: &llm.DiagnoseResult{RCA: "ok"}}, policy, approvals, reporter, nil, 0)
 			if err := pipeline.Run(context.Background(), store.AgentRun{ID: 31, IncidentID: 7, Mode: "full"}); err != nil {
 				t.Fatal(err)
@@ -682,7 +731,7 @@ func TestPipelineNotificationAuditFailurePropagatesWithoutRewritingRun(t *testin
 	db := newFakeRunStore()
 	db.failStep = "notify"
 	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, &fakeReasoner{result: &llm.DiagnoseResult{RCA: "ok"}},
-		&fakePolicy{decision: approval.Decision{Kind: approval.DecisionAutoL2}}, &fakeApprovals{}, &fakeReporter{err: errors.New("IM unavailable")}, nil, 0)
+		&fakePolicy{decision: approval.Decision{Kind: approval.DecisionAuto}}, &fakeApprovals{}, &fakeReporter{err: errors.New("IM unavailable")}, nil, 0)
 	err := pipeline.Run(context.Background(), store.AgentRun{ID: 31, IncidentID: 7, Mode: "full"})
 	if err == nil || !strings.Contains(err.Error(), "audit step failed") {
 		t.Fatalf("err=%v", err)
@@ -694,9 +743,9 @@ func TestPipelineNotificationAuditFailurePropagatesWithoutRewritingRun(t *testin
 
 func TestPipelineRejectsMalformedApprovalBeforeCompletion(t *testing.T) {
 	db := newFakeRunStore()
-	policy := &fakePolicy{decision: approval.Decision{Kind: approval.DecisionApproval, ToolName: incident.RestartAction, PlanHash: "invalid", Reason: "manual", ExecutionContext: []byte(`{"dry_run":false}`)}}
+	policy := &fakePolicy{decision: approval.Decision{Kind: approval.DecisionApproval, ToolName: tools.ActionDockerRestart, PlanHash: "invalid", Reason: "manual", ExecutionContext: []byte(`{"dry_run":false}`)}}
 	reporter := &fakeReporter{}
-	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, &fakeReasoner{result: &llm.DiagnoseResult{RCA: "ok"}}, policy, approval.NewService(nil, 30), reporter, nil, 0)
+	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, &fakeReasoner{result: &llm.DiagnoseResult{RCA: "ok"}}, policy, approval.NewService(nil), reporter, nil, 0)
 	if err := pipeline.Run(context.Background(), store.AgentRun{ID: 31, IncidentID: 7, Mode: "full"}); err == nil {
 		t.Fatal("malformed approval accepted")
 	}
@@ -707,7 +756,7 @@ func TestPipelineRejectsMalformedApprovalBeforeCompletion(t *testing.T) {
 
 func TestPipelineGuardAuditRetainsVerificationMemoryContract(t *testing.T) {
 	db := newFakeRunStore()
-	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: testEvidence()}, &fakeReasoner{result: &llm.DiagnoseResult{RCA: "容器退出", Plan: llm.Plan{Action: incident.RestartAction, Target: llm.PlanTarget{Kind: "container", Name: "sub2api"}}}}, allowPolicy(), &fakeApprovals{}, &fakeReporter{}, nil, 0)
+	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: restartEvidence(exitedWithoutSelfHealing(), nil)}, &fakeReasoner{result: &llm.DiagnoseResult{RCA: "容器退出", Plan: llm.Plan{Action: tools.ActionDockerRestart, Target: llm.PlanTarget{Kind: "container", Name: "sub2api"}}}}, allowPolicy(), &fakeApprovals{}, &fakeReporter{}, nil, 0)
 	if err := pipeline.Run(context.Background(), store.AgentRun{ID: 31, IncidentID: 7, Mode: "full"}); err != nil {
 		t.Fatal(err)
 	}
@@ -722,4 +771,97 @@ func TestPipelineGuardAuditRetainsVerificationMemoryContract(t *testing.T) {
 		return
 	}
 	t.Fatal("guard step missing")
+}
+
+// The replay record holds structured evidence and the exact model input before
+// the model call, then tool calls with what the model saw.
+func TestPipelinePersistsReplayableSnapshot(t *testing.T) {
+	db := newFakeRunStore()
+	reasoner := &fakeReasoner{result: &llm.DiagnoseResult{RCA: "容器退出", Confidence: "high",
+		Steps: []llm.StepLog{{Name: "prom_instant_query", Input: `{"query":"up"}`, Output: `{"result":[]}`}}}}
+	evidence := restartEvidence(exitedWithoutSelfHealing(), nil)
+	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: evidence}, reasoner, allowPolicy(), &fakeApprovals{}, &fakeReporter{}, nil, 0)
+	if err := pipeline.Run(context.Background(), store.AgentRun{ID: 41, IncidentID: 7, Mode: "full", Status: "running"}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(db.snapshots) != 3 {
+		t.Fatalf("snapshot writes = %d, want evidence, input and completion", len(db.snapshots))
+	}
+	first, input, final := db.snapshots[0], db.snapshots[1], db.snapshots[2]
+	var stored Evidence
+	if err := json.Unmarshal(first.EvidenceJSON, &stored); err != nil || len(stored.Items) != len(evidence.Items) || stored.Items[0].Object == nil || stored.Items[0].Object.ID != "c0ffee" {
+		t.Fatalf("evidence snapshot = %s (%v)", first.EvidenceJSON, err)
+	}
+	if first.RunID != 41 || first.CodeVersion == "" || first.Model != nil || first.FinishedAt != nil {
+		t.Fatalf("first snapshot = %+v", first)
+	}
+	if input.Model == nil || *input.Model != "fake-model" || input.InputText == nil || !strings.Contains(*input.InputText, "docker_inspect") || input.ToolCallsJSON != nil {
+		t.Fatalf("input snapshot = %+v", input)
+	}
+	if final.ToolCallsJSON == nil || !strings.Contains(string(*final.ToolCallsJSON), "prom_instant_query") || final.ContextJSON == nil || final.FinishedAt == nil {
+		t.Fatalf("final snapshot = %+v", final)
+	}
+}
+
+// 存不下回放记录就不发布计划：诊断失败，不产生审批。
+func TestPipelineSnapshotFailurePublishesNoPlan(t *testing.T) {
+	db := newFakeRunStore()
+	db.snapshotErr = errors.New("snapshot table unavailable")
+	reasoner := &fakeReasoner{result: &llm.DiagnoseResult{RCA: "容器退出", Confidence: "high",
+		Plan: llm.Plan{Action: "docker_restart", Target: llm.PlanTarget{Kind: "container", Name: "sub2api"}}}}
+	approvals := &fakeApprovals{}
+	policy := &fakePolicy{decision: approval.Decision{Kind: approval.DecisionAuto, ToolName: "docker_restart", Reason: "auto"}}
+	pipeline := NewPipeline(db, fakeEvidenceBuilder{evidence: restartEvidence(exitedWithoutSelfHealing(), nil)}, reasoner, policy, approvals, &fakeReporter{}, nil, 0)
+	if err := pipeline.Run(context.Background(), store.AgentRun{ID: 42, IncidentID: 7, Mode: "full", Status: "running"}); err == nil {
+		t.Fatal("Run() error = nil, want snapshot failure")
+	}
+	if db.completed[42] != "failed" || reasoner.calls != 0 || len(approvals.created) != 0 {
+		t.Fatalf("status=%s reasoner=%d approvals=%d", db.completed[42], reasoner.calls, len(approvals.created))
+	}
+}
+
+func TestPipelineMemoryHitSnapshotHasNoModelInput(t *testing.T) {
+	db := newFakeRunStore()
+	db.runs[43] = store.AgentRun{ID: 43, IncidentID: 7, Mode: "full", Status: "running"}
+	mem := &fakeMemory{hit: true, entry: store.FaultMemory{RCAText: "记忆", Confidence: "high", PlanJSON: []byte(`{"action":"none"}`)}}
+	builder := fakeEvidenceBuilder{evidence: testEvidence(), target: Target{
+		Incident: store.Incident{ID: 7, GroupKey: "payments"},
+		Alerts:   []store.Alert{{Name: "HighCPU", Labels: []byte(`{}`)}},
+	}}
+	pipeline := NewPipeline(db, builder, &fakeReasoner{}, allowPolicy(), &fakeApprovals{}, &fakeReporter{}, mem, 0)
+	if err := pipeline.Run(context.Background(), store.AgentRun{ID: 43, IncidentID: 7, Mode: "full", Status: "running"}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(db.snapshots) != 1 || db.snapshots[0].Model != nil || db.snapshots[0].FinishedAt == nil || len(db.snapshots[0].EvidenceJSON) == 0 {
+		t.Fatalf("snapshots = %+v", db.snapshots)
+	}
+}
+
+// Policy freezes the identity Guard proved, the fault that opened the incident,
+// and whether monitoring was fully readable; a demotion stays visible.
+func TestPipelinePassesGuardTargetFaultAndObservation(t *testing.T) {
+	db := newFakeRunStore()
+	evidence := restartEvidence(exitedWithoutSelfHealing(), nil)
+	evidence.Items = append(evidence.Items, EvidenceItem{Name: "sub2api_metrics", Source: "prometheus:query", Status: ItemPartial, Err: "1 of 10 queries failed"})
+	reasoner := &fakeReasoner{result: &llm.DiagnoseResult{RCA: "容器退出", Confidence: "high",
+		Plan: llm.Plan{Action: tools.ActionDockerRestart, Target: llm.PlanTarget{Kind: "container", Name: "sub2api"}, EvidenceRefs: []string{"docker_inspect"}}}}
+	builder := fakeEvidenceBuilder{evidence: evidence, target: Target{Incident: store.Incident{ID: 7, GroupKey: "sub2api"},
+		Alerts: []store.Alert{{Fingerprint: "fp1", Name: "Sub2APIDown", Status: "firing", Labels: []byte(`{"service":"sub2api"}`)}}}}
+	policy := &fakePolicy{decision: approval.Decision{Kind: approval.DecisionApproval, ToolName: tools.ActionDockerRestart, PlanHash: "h", Reason: "automatic execution withheld: monitoring data is unavailable", Demoted: true}}
+	pipeline := NewPipeline(db, builder, reasoner, policy, &fakeApprovals{}, &fakeReporter{}, nil, 0)
+	if err := pipeline.Run(context.Background(), store.AgentRun{ID: 51, IncidentID: 7, Mode: "full", Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	in := policy.lastInput
+	if in == nil || in.Target != (incident.Object{Kind: "container", Name: "sub2api", ID: "c0ffee"}) || in.FaultAlert != "Sub2APIDown" || in.ObservationOK ||
+		len(in.EvidenceRefs) != 1 || in.IncidentID != 7 {
+		t.Fatalf("policy input = %+v", in)
+	}
+	found := false
+	for _, problem := range db.problems {
+		found = found || problem.Problem.Code == "policy_degraded"
+	}
+	if !found {
+		t.Fatal("demotion was not recorded as a visible problem")
+	}
 }

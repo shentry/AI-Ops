@@ -60,6 +60,7 @@ services:
     environment:
       CONFIG_FILE: /app/config.bench.yaml
       AUTH_TOKEN: ${AUTH_TOKEN:?required}
+      BENCH_VIEWER_TOKEN_SHA256: ${BENCH_VIEWER_TOKEN_SHA256:?required}
       MYSQL_DSN: oncall:${MYSQL_PASSWORD:?required}@tcp(mysql:3306)/oncall_benchmark?parseTime=true&charset=utf8mb4&loc=UTC&timeout=3s&readTimeout=5s&writeTimeout=5s
       GOMAXPROCS: "1"
       GOMEMLIMIT: 320MiB

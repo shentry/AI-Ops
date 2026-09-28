@@ -86,7 +86,7 @@ flowchart TD
 | diagnose / llm / tools | 证据、ReAct、工具注册、输出契约及规则检查 | [pipeline.go](</Users/zxy/oncall agent/internal/diagnose/pipeline.go:1>)、[reasoner.go](</Users/zxy/oncall agent/internal/llm/reasoner.go:1>) |
 | approval / verification | 审批裁决、执行领取、持久验证 | [executor.go](</Users/zxy/oncall agent/internal/approval/executor.go:1>)、[verification_worker.go](</Users/zxy/oncall agent/internal/diagnose/verification_worker.go:81>) |
 | store / memory | MySQL 事务、持久任务、历史经验 | [models.go](</Users/zxy/oncall agent/internal/store/models.go:1>)、[store.go](</Users/zxy/oncall agent/internal/memory/store.go:1>) |
-| conversation / notify / web | Incident 问答、飞书绑定与审批、实时控制室 | [service.go](</Users/zxy/oncall agent/internal/conversation/service.go:1>)、[IncidentRoom.tsx](</Users/zxy/oncall agent/web/src/pages/IncidentRoom.tsx:49>) |
+| conversation / notify / web | Incident 问答、飞书绑定与审批、实时控制室 | [service.go](</Users/zxy/oncall agent/internal/conversation/service.go:1>)、[IncidentDetail.tsx](</Users/zxy/oncall agent/web/src/pages/IncidentDetail.tsx:56>) |
 
 ### 3.2 数据、异步任务和外部依赖
 
@@ -265,7 +265,7 @@ MySQL 是系统自身的业务库。`raw_event` 保存接入队列；`alert / la
 5. **主导度建议：** 负责模块实现与优化。
 6. **简历表述：** 打通 React 控制室与飞书审批、Incident 问答，复用后端审批与对话服务；通过持久事件和支持游标续传的 SSE 展示诊断、执行和验证进度。
 7. **技术拆解：** 不同操作面若各存状态，容易显示不一致或绕过审批。两端使用相同 Incident/Approval/Conversation 数据；飞书事件以 receipt 去重并绑定消息线程；SSE 按事件 ID 从数据库续取。收益是接入层不重复实现业务裁决；代价是数据库轮询、IM 网络失败与 UI 刷新仍需处理。
-8. **代码证据：** [共享服务注入](</Users/zxy/oncall agent/cmd/server/main.go:205>)；[CardAction](</Users/zxy/oncall agent/internal/notify/feishu/callback_business.go:146>)、[MessageReceive](</Users/zxy/oncall agent/internal/notify/feishu/callback_business.go:226>)；[SSE 处理](</Users/zxy/oncall agent/internal/api/stream.go:80>)；[前端订阅](</Users/zxy/oncall agent/web/src/api.ts:616>)、[IncidentRoom](</Users/zxy/oncall agent/web/src/pages/IncidentRoom.tsx:130>)。表 `incident_event / im_binding / integration_event_receipt / conversation_message`。
+8. **代码证据：** [共享服务注入](</Users/zxy/oncall agent/cmd/server/main.go:205>)；[CardAction](</Users/zxy/oncall agent/internal/notify/feishu/callback_business.go:146>)、[MessageReceive](</Users/zxy/oncall agent/internal/notify/feishu/callback_business.go:226>)；[SSE 处理](</Users/zxy/oncall agent/internal/api/stream.go:80>)；[前端订阅](</Users/zxy/oncall agent/web/src/api.ts:616>)、[IncidentDetail](</Users/zxy/oncall agent/web/src/pages/IncidentDetail.tsx:133>)。表 `incident_event / im_binding / integration_event_receipt / conversation_message`。
 9. **架构价值：** 核心在于多入口共享事实和操作服务，防止聊天入口形成另一条未受约束的执行路径。
 10. **理论映射：** 持久事件投影、游标续传、渠道适配；不是事件溯源平台或端到端实时消息必达系统。
 11. **JD 映射：** AI 应用产品化、后端平台、实时交互；无 RAG 检索与底层 AI 性能；不证明分布式消息系统建设。

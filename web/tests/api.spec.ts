@@ -5,31 +5,31 @@ import { approval, controlRoom } from "./fixtures";
 const originalFetch = globalThis.fetch;
 test.afterEach(() => { globalThis.fetch = originalFetch; });
 
-for (const dryRun of [false, true, null]) {
-  test(`approval contract preserves dry_run=${dryRun} and verification metadata`, async () => {
-    const dto = approval({ dry_run: dryRun, verification: { status: "pending", last_checked_at: null, deadline_at: "2026-08-24T12:03:00Z", detail: "等待观测" } });
-    globalThis.fetch = async () => new Response(JSON.stringify(controlRoom(dto)));
-    const room = await getControlRoom(1);
-    expect(room.pending_approval?.dry_run).toBe(dryRun);
-    expect(room.pending_approval?.safety_level).toBe("L2");
-    expect(room.pending_approval).not.toHaveProperty("risk");
-    expect(room.latest_action).toEqual(room.pending_approval);
-    expect(room.latest_action?.verification).toEqual(dto.verification);
+test("approval contract preserves rule snapshot, receipt and verification metadata", async () => {
+  const dto = approval({
+    result: { written: true, outcome: "written", before: "a", after: "b", manual_check: false },
+    verification: { status: "pending", phase: "watch", last_checked_at: null, deadline_at: "2026-08-24T12:03:00Z", detail: "等待观测" },
   });
-}
+  globalThis.fetch = async () => new Response(JSON.stringify(controlRoom(dto)));
+  const room = await getControlRoom(1);
+  const result = room.pending_approval!;
+  expect([result.rule_id, result.mode, result.target_id, result.checks]).toEqual(["restart-stopped-process", "manual", "c0ffee", ["container", "health"]]);
+  expect(result.result).toMatchObject({ written: true, outcome: "written", before: "a", after: "b" });
+  expect(result).not.toHaveProperty("risk");
+  expect(room.latest_action).toEqual(room.pending_approval);
+  expect(room.latest_action?.verification).toEqual(dto.verification);
+});
 
-test("absent action stays null; risk cannot replace safety_level", async () => {
+test("absent action stays null; missing snapshot fields are empty, never inferred", async () => {
   globalThis.fetch = async () => new Response(JSON.stringify(controlRoom(null)));
   expect((await getControlRoom(1)).latest_action).toBeNull();
-  const dto: Record<string, unknown> = approval({ risk: "L3" });
-  delete dto.safety_level;
-  delete dto.dry_run;
-  delete dto.verification;
+  const dto: Record<string, unknown> = approval({ risk: "low", dry_run: false });
+  for (const key of ["mode", "rule_id", "checks", "verification"]) delete dto[key];
   globalThis.fetch = async () => new Response(JSON.stringify(controlRoom(dto)));
   const result = (await getControlRoom(1)).pending_approval;
-  expect(result?.safety_level).toBe("");
-  expect(result?.dry_run).toBeNull();
+  expect([result?.mode, result?.rule_id, result?.checks, result?.result]).toEqual(["", "", [], null]);
   expect(result?.verification.status).toBe("unknown");
+  expect(result).not.toHaveProperty("dry_run");
 });
 
 for (const approve of [true, false]) {

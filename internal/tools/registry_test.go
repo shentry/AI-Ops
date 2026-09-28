@@ -13,9 +13,9 @@ func okHandler(output string) Handler {
 	return func(context.Context, json.RawMessage) (string, error) { return output, nil }
 }
 
-func testSpec(name string, level SafetyLevel) ToolSpec {
+func testSpec(name string) ToolSpec {
 	return ToolSpec{
-		Name: name, Description: "test tool", Level: level,
+		Name: name, Description: "test tool",
 		Timeout: time.Second, MaxOutput: 16, Handler: okHandler("ok"),
 	}
 }
@@ -25,11 +25,10 @@ func TestRegistryRegisterValidation(t *testing.T) {
 		name string
 		spec ToolSpec
 	}{
-		{"empty name", ToolSpec{Description: "d", Level: L1ReadOnly, Timeout: time.Second, Handler: okHandler("ok")}},
-		{"empty description", ToolSpec{Name: "a", Level: L1ReadOnly, Timeout: time.Second, Handler: okHandler("ok")}},
-		{"invalid level", ToolSpec{Name: "a", Description: "d", Level: "L9", Timeout: time.Second, Handler: okHandler("ok")}},
-		{"nil handler", ToolSpec{Name: "a", Description: "d", Level: L1ReadOnly, Timeout: time.Second}},
-		{"non-positive timeout", ToolSpec{Name: "a", Description: "d", Level: L1ReadOnly, Handler: okHandler("ok")}},
+		{"empty name", ToolSpec{Description: "d", Timeout: time.Second, Handler: okHandler("ok")}},
+		{"empty description", ToolSpec{Name: "a", Timeout: time.Second, Handler: okHandler("ok")}},
+		{"nil handler", ToolSpec{Name: "a", Description: "d", Timeout: time.Second}},
+		{"non-positive timeout", ToolSpec{Name: "a", Description: "d", Handler: okHandler("ok")}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -42,39 +41,54 @@ func TestRegistryRegisterValidation(t *testing.T) {
 
 func TestRegistryRejectsDuplicateName(t *testing.T) {
 	registry := NewRegistry()
-	if err := registry.Register(testSpec("dup", L1ReadOnly)); err != nil {
+	if err := registry.Register(testSpec("dup")); err != nil {
 		t.Fatal(err)
 	}
-	if err := registry.Register(testSpec("dup", L2LowRisk)); err == nil {
+	if err := registry.Register(testSpec("dup")); err == nil {
 		t.Fatal("Register(duplicate) error = nil, want failure")
+	}
+	if err := registry.RegisterAction(stubAction{def: ActionDefinition{Name: "dup", Version: 1, TargetKind: "container", Description: "d", Timeout: time.Second}}); err == nil {
+		t.Fatal("action shadowing a tool accepted")
 	}
 }
 
-func TestRegistryForLLMExposesOnlyL1(t *testing.T) {
+type stubAction struct {
+	Action
+	def ActionDefinition
+}
+
+func (a stubAction) Definition() ActionDefinition { return a.def }
+
+// Writes are never callable tools: the model sees only read tools, and may
+// merely name a plannable action in its plan.
+func TestRegistrySeparatesReadToolsFromActions(t *testing.T) {
 	registry := NewRegistry()
-	for _, spec := range []ToolSpec{
-		testSpec("z_read", L1ReadOnly),
-		testSpec("a_read", L1ReadOnly),
-		testSpec("restart", L2LowRisk),
-		testSpec("scale", L3Approval),
-		testSpec("drop_table", L4Forbidden),
-	} {
+	for _, spec := range []ToolSpec{testSpec("z_read"), testSpec("a_read")} {
 		if err := registry.Register(spec); err != nil {
 			t.Fatal(err)
 		}
 	}
-	exposed := registry.ForLLM()
-	if len(exposed) != 2 {
-		t.Fatalf("ForLLM() exposed %d tools, want 2", len(exposed))
-	}
-	// 按名排序，顺序稳定。
-	if exposed[0].Name != "a_read" || exposed[1].Name != "z_read" {
-		t.Fatalf("ForLLM() order = %q, %q", exposed[0].Name, exposed[1].Name)
-	}
-	for _, spec := range exposed {
-		if spec.Level != L1ReadOnly {
-			t.Fatalf("ForLLM() exposed non-L1 tool %s (%s)", spec.Name, spec.Level)
+	for _, def := range []ActionDefinition{
+		{Name: "restart", Version: 1, TargetKind: "container", Description: "d", Timeout: time.Second},
+		{Name: "undo", Version: 1, TargetKind: "container", Description: "d", Timeout: time.Second, Compensation: true},
+	} {
+		if err := registry.RegisterAction(stubAction{def: def}); err != nil {
+			t.Fatal(err)
 		}
+	}
+	if err := registry.RegisterAction(stubAction{def: ActionDefinition{Name: "bad"}}); err == nil {
+		t.Fatal("incomplete action definition accepted")
+	}
+	exposed := registry.ForLLM()
+	if len(exposed) != 2 || exposed[0].Name != "a_read" || exposed[1].Name != "z_read" {
+		t.Fatalf("ForLLM() = %+v", exposed)
+	}
+	if _, err := registry.Execute(context.Background(), "restart", nil); !errors.Is(err, ErrToolNotRegistered) {
+		t.Fatalf("action executed as a tool: %v", err)
+	}
+	plannable := registry.PlannableActions()
+	if len(plannable) != 1 || plannable[0].Name != "restart" || len(registry.ActionDefinitions()) != 2 {
+		t.Fatalf("plannable = %+v", plannable)
 	}
 }
 
@@ -89,7 +103,7 @@ func TestRegistryExecuteRejectsUnregistered(t *testing.T) {
 func TestRegistryExecuteAppliesTimeout(t *testing.T) {
 	registry := NewRegistry()
 	if err := registry.Register(ToolSpec{
-		Name: "slow", Description: "slow tool", Level: L1ReadOnly,
+		Name: "slow", Description: "slow tool",
 		Timeout: 20 * time.Millisecond, MaxOutput: 16,
 		Handler: func(ctx context.Context, _ json.RawMessage) (string, error) {
 			select {
@@ -115,7 +129,7 @@ func TestRegistryExecuteAppliesTimeout(t *testing.T) {
 func TestRegistryExecuteTruncatesOutput(t *testing.T) {
 	registry := NewRegistry()
 	if err := registry.Register(ToolSpec{
-		Name: "loud", Description: "loud tool", Level: L1ReadOnly,
+		Name: "loud", Description: "loud tool",
 		Timeout: time.Second, MaxOutput: 8,
 		Handler: okHandler(strings.Repeat("数", 32)),
 	}); err != nil {
@@ -131,10 +145,30 @@ func TestRegistryExecuteTruncatesOutput(t *testing.T) {
 	}
 }
 
+// 模型和回放看到的是同一份脱敏文本：日志里的凭据和控制字符在出 Registry 前就处理掉。
+func TestRegistryExecuteSanitizesOutput(t *testing.T) {
+	registry := NewRegistry()
+	if err := registry.Register(ToolSpec{
+		Name: "logs", Description: "log tool", Timeout: time.Second,
+		Handler: okHandler("connect postgres://app:s3cret@db/sub2api token=abc123\x1b[31m"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	output, err := registry.Execute(context.Background(), "logs", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leaked := range []string{"s3cret", "abc123", "\x1b"} {
+		if strings.Contains(output, leaked) {
+			t.Fatalf("Execute() output = %q leaked %q", output, leaked)
+		}
+	}
+}
+
 func TestRegistryExecuteWrapsHandlerError(t *testing.T) {
 	registry := NewRegistry()
 	if err := registry.Register(ToolSpec{
-		Name: "broken", Description: "broken tool", Level: L1ReadOnly,
+		Name: "broken", Description: "broken tool",
 		Timeout: time.Second, MaxOutput: 16,
 		Handler: func(context.Context, json.RawMessage) (string, error) { return "", errors.New("boom") },
 	}); err != nil {

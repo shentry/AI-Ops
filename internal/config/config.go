@@ -5,6 +5,9 @@ package config
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -14,6 +17,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"oncall-agent/internal/incident"
 )
 
 var (
@@ -42,6 +47,110 @@ type Config struct {
 	Tools     ToolsConfig     `yaml:"tools"`
 	Notify    NotifyConfig    `yaml:"notify"`
 	Web       WebConfig       `yaml:"web"`
+	// Service is the one trusted description of the monitored service: its
+	// identity, targets, health, admin API and release entry.
+	Service ServiceConfig `yaml:"service"`
+	// Remediation holds the versioned action rules and their verification.
+	Remediation RemediationConfig `yaml:"remediation"`
+}
+
+// ServiceConfig is the only place that names the monitored service. Evidence,
+// actions and verification all read targets from here.
+type ServiceConfig struct {
+	Name      string `yaml:"name"`
+	Env       string `yaml:"env"`
+	Container string `yaml:"container"`
+	// BaseURL is the service origin: health checks, admin API and probes.
+	BaseURL string `yaml:"base_url"`
+	// AdminAPIKey has full sub2api admin authority; callers are restricted to
+	// their own endpoint allowlists. Empty disables upstream evidence and actions.
+	AdminAPIKey   string        `yaml:"admin_api_key"`
+	PostgresDSN   string        `yaml:"postgres_dsn"`
+	RedisAddr     string        `yaml:"redis_addr"`
+	RedisPassword string        `yaml:"redis_password"`
+	Probe         ProbeConfig   `yaml:"probe"`
+	Release       ReleaseConfig `yaml:"release"`
+}
+
+// ProbeConfig is the optional business probe: a dedicated low-cost test key
+// and model. Each call reaches an upstream model and costs money.
+type ProbeConfig struct {
+	Path   string `yaml:"path"`
+	Model  string `yaml:"model"`
+	APIKey string `yaml:"api_key"`
+}
+
+// ReleaseConfig is the deployment entry used by deployment_rollback: a fixed
+// executable run with an argument array (the approved image reference is
+// appended), never a shell string. It must honor the same lock file as CI/CD.
+type ReleaseConfig struct {
+	Command        []string `yaml:"command"`
+	WorkDir        string   `yaml:"work_dir"`
+	LockFile       string   `yaml:"lock_file"`
+	TimeoutSeconds int      `yaml:"timeout_seconds"`
+}
+
+// RemediationConfig is the pre-authorization of automatic handling. It is a
+// version-managed configuration release; there is no second rule store.
+type RemediationConfig struct {
+	RulesVersion string              `yaml:"rules_version"`
+	Rules        []RuleConfig        `yaml:"rules"`
+	Maintenance  []MaintenanceWindow `yaml:"maintenance"`
+	Verification VerificationConfig  `yaml:"verification"`
+}
+
+// RuleConfig authorizes one action for a fault condition within bounds.
+// Mode observe records what would be done; manual needs a person to approve
+// the frozen snapshot; auto executes when every fact, scope and budget holds.
+type RuleConfig struct {
+	ID     string   `yaml:"id"`
+	Action string   `yaml:"action"`
+	Mode   string   `yaml:"mode"`
+	Alerts []string `yaml:"alerts"`
+	// MaxExecutions real executions per WindowMinutes.
+	MaxExecutions int `yaml:"max_executions"`
+	WindowMinutes int `yaml:"window_minutes"`
+	// MinAvailableAccounts is the floor of schedulable accounts left in each
+	// affected group after upstream_quarantine.
+	MinAvailableAccounts int `yaml:"min_available_accounts"`
+	// MaxErrorRatio and MinRequests define business recovery for actions
+	// verified on real traffic; too few requests is not a pass.
+	MaxErrorRatio float64 `yaml:"max_error_ratio"`
+	MinRequests   int     `yaml:"min_requests"`
+	// Compensate pre-authorizes the action's frozen undo when verification fails.
+	Compensate bool `yaml:"compensate"`
+	// VerifyWindowSeconds overrides the verification window for this rule.
+	// Traffic checks read a trailing five-minute window, so actions verified on
+	// real requests need a longer window than a health probe.
+	VerifyWindowSeconds int `yaml:"verify_window_seconds"`
+}
+
+type MaintenanceWindow struct {
+	Start  time.Time `yaml:"start"`
+	End    time.Time `yaml:"end"`
+	Reason string    `yaml:"reason"`
+}
+
+// Release binds permissions to the rules, service identity and verification.
+// Credentials are hashed with the configuration and are never returned or audited.
+func (r RemediationConfig) Release(service ServiceConfig) string {
+	content, _ := json.Marshal(struct {
+		Rules        []RuleConfig
+		Service      ServiceConfig
+		Verification VerificationConfig
+	}{r.Rules, service, r.Verification})
+	sum := sha256.Sum256(content)
+	return r.RulesVersion + "@" + hex.EncodeToString(sum[:])[:12]
+}
+
+// InMaintenance returns the reason of the window covering now, if any.
+func (r RemediationConfig) InMaintenance(now time.Time) (string, bool) {
+	for _, window := range r.Maintenance {
+		if !now.Before(window.Start) && now.Before(window.End) {
+			return window.Reason, true
+		}
+	}
+	return "", false
 }
 
 type ServerConfig struct {
@@ -112,31 +221,27 @@ type CorrelateConfig struct {
 }
 
 type DiagnoseConfig struct {
-	Budget        DiagnoseBudget     `yaml:"budget"`
-	SeverityRoute map[string]string  `yaml:"severity_route"`
-	Evidence      EvidenceConfig     `yaml:"evidence"`
-	Verification  VerificationConfig `yaml:"verification"`
+	Budget        DiagnoseBudget    `yaml:"budget"`
+	SeverityRoute map[string]string `yaml:"severity_route"`
+	Evidence      EvidenceConfig    `yaml:"evidence"`
 }
 
 // VerificationConfig 控制独立恢复验证的调度，不复用证据采集超时。
+// RequiredPasses 是判定恢复所需的连续健康观测次数；WatchSeconds 是恢复后
+// 识别复发的观察窗口。写入审批快照后对该次处置不可改。
 type VerificationConfig struct {
 	IntervalSeconds int `yaml:"interval_seconds"`
 	WindowSeconds   int `yaml:"window_seconds"`
 	TimeoutSeconds  int `yaml:"timeout_seconds"`
+	RequiredPasses  int `yaml:"required_passes"`
+	WatchSeconds    int `yaml:"watch_seconds"`
 }
 
-// EvidenceConfig 是 D07 证据采集的数据源配置。地址类字段全部可空：
-// 空表示该数据源缺席，对应 collector 记录"缺失"而不是让诊断失败。
+// EvidenceConfig 是证据采集自身的参数；采集目标来自 service。
 type EvidenceConfig struct {
-	Sub2APIBaseURL    string `yaml:"sub2api_base_url"`
-	Sub2APIMetricsJob string `yaml:"sub2api_metrics_job"`
-	PostgresDSN       string `yaml:"postgres_dsn"`
-	RedisAddr         string `yaml:"redis_addr"`
-	RedisPassword     string `yaml:"redis_password"`
-	DockerContainer   string `yaml:"docker_container"`
-	DockerSocket      string `yaml:"docker_socket"`
-	TimeoutSeconds    int    `yaml:"timeout_seconds"`
-	LogMaxLines       int    `yaml:"log_max_lines"`
+	DockerSocket   string `yaml:"docker_socket"`
+	TimeoutSeconds int    `yaml:"timeout_seconds"`
+	LogMaxLines    int    `yaml:"log_max_lines"`
 }
 
 type DiagnoseBudget struct {
@@ -154,35 +259,15 @@ type MemoryConfig struct {
 	CmdHistoryInject   int  `yaml:"cmd_history_inject"`
 }
 
+// ApprovalConfig 只管人工审批单的有效期；是否需要审批由 remediation 规则决定。
 type ApprovalConfig struct {
 	TTLMinutes int `yaml:"ttl_minutes"`
-	// AutoExecuteL2 是 L2 自动路径全局开关：默认关，L2 一律降级为审批。
-	AutoExecuteL2 bool `yaml:"auto_execute_l2"`
-	// DryRun 为真时 L2 只演练不真实执行（执行层检查）。
-	DryRun bool `yaml:"dry_run"`
-	// L2RateWindowMinutes / L2MaxPerWindow 是 L2 自动路径的限频护栏：
-	// 同一 target+action（同 plan_hash）在窗口内最多执行 L2MaxPerWindow 次，
-	// 超限降级审批 —— 自动路径不许无限重复同一个动作。
-	L2RateWindowMinutes int `yaml:"l2_rate_window_minutes"`
-	L2MaxPerWindow      int `yaml:"l2_max_per_window"`
 }
 
 type ToolsConfig struct {
-	Prometheus PrometheusConfig  `yaml:"prometheus"`
-	Logs       LogsConfig        `yaml:"logs"`
-	MySQLRead  MySQLReadConfig   `yaml:"mysql_select"`
-	Docker     DockerToolsConfig `yaml:"docker"`
-}
-
-// DockerToolsConfig 是 Docker 变更动作的配置。
-// AllowedContainers 是 docker_restart 的目标白名单（GC-11/GC-12）：
-// 空列表 = 没有可重启目标，一切重启请求被拒。
-// 两个限频字段是工具层的兜底护栏：即使上游决策放行，同一容器也不能
-// 被高频重启（对应设计"同一 target/action 在时间窗口内限制执行次数"）。
-type DockerToolsConfig struct {
-	AllowedContainers         []string `yaml:"allowed_containers"`
-	RestartMinIntervalSeconds int      `yaml:"restart_min_interval_seconds"`
-	RestartMaxPerHour         int      `yaml:"restart_max_per_hour"`
+	Prometheus PrometheusConfig `yaml:"prometheus"`
+	Logs       LogsConfig       `yaml:"logs"`
+	MySQLRead  MySQLReadConfig  `yaml:"mysql_select"`
 }
 
 type PrometheusConfig struct {
@@ -224,13 +309,30 @@ type FeishuConfig struct {
 }
 
 // WebConfig controls the browser control-room surface. A non-empty base_url
-// (or a configured feishu_app provider) enables the public console; the console
-// has no login, so there is no session or cookie configuration.
+// (or a configured feishu_app provider) enables the console, which then
+// requires at least one configured operator: there is no anonymous console.
 type WebConfig struct {
 	BaseURL string `yaml:"base_url"`
 	// OperatorAllowlist is the Feishu open_id allowlist for approval cards. It
-	// governs the Feishu callback only; the public console is not gated by it.
+	// governs the Feishu callback only; console access is governed by Operators.
 	OperatorAllowlist []string `yaml:"operator_allowlist"`
+	// Operators are the people (or service identities) allowed to use the
+	// console and operator APIs. Only the SHA-256 of each personal token is stored.
+	Operators []OperatorConfig `yaml:"operators"`
+}
+
+// OperatorConfig is one server-side identity. Role is viewer, operator or admin;
+// token_sha256 is the lowercase hex SHA-256 of a high-entropy personal token.
+type OperatorConfig struct {
+	ID          string `yaml:"id"`
+	Name        string `yaml:"name"`
+	Role        string `yaml:"role"`
+	TokenSHA256 string `yaml:"token_sha256"`
+}
+
+// ConsoleEnabled reports whether the browser console is served.
+func (c Config) ConsoleEnabled() bool {
+	return strings.TrimSpace(c.Web.BaseURL) != "" || strings.EqualFold(strings.TrimSpace(c.Notify.IM.Provider), "feishu_app")
 }
 
 // Load 读 YAML、展开 ${ENV}、套上非敏感默认值，再校验必填项和数值边界。
@@ -305,22 +407,20 @@ func defaultConfig() Config {
 				"low":      "skip",
 			},
 			Evidence: EvidenceConfig{
-				Sub2APIMetricsJob: "sub2api",
-				DockerContainer:   "sub2api",
-				DockerSocket:      "/var/run/docker.sock",
-				TimeoutSeconds:    5,
-				LogMaxLines:       200,
+				DockerSocket:   "/var/run/docker.sock",
+				TimeoutSeconds: 5,
+				LogMaxLines:    200,
 			},
-			Verification: VerificationConfig{IntervalSeconds: 10, WindowSeconds: 120, TimeoutSeconds: 5},
 		},
 		Memory: MemoryConfig{
 			TTLSeconds:         3600,
 			OnlyHighConfidence: true,
 			CmdHistoryInject:   5,
 		},
-		Approval: ApprovalConfig{
-			TTLMinutes: 30, DryRun: true,
-			L2RateWindowMinutes: 60, L2MaxPerWindow: 1,
+		Approval: ApprovalConfig{TTLMinutes: 30},
+		Service:  ServiceConfig{Name: "sub2api", Env: "prod", Container: "sub2api", Release: ReleaseConfig{TimeoutSeconds: 300}},
+		Remediation: RemediationConfig{
+			Verification: VerificationConfig{IntervalSeconds: 10, WindowSeconds: 300, TimeoutSeconds: 5, RequiredPasses: 3, WatchSeconds: 1800},
 		},
 		Tools: ToolsConfig{
 			Prometheus: PrometheusConfig{
@@ -329,8 +429,7 @@ func defaultConfig() Config {
 				RangeMinutes: 15,
 				MaxPoints:    300,
 			},
-			Logs:   LogsConfig{Provider: "cls"},
-			Docker: DockerToolsConfig{RestartMinIntervalSeconds: 60, RestartMaxPerHour: 3},
+			Logs: LogsConfig{Provider: "cls"},
 		},
 	}
 }
@@ -428,33 +527,17 @@ func validate(cfg Config) error {
 	if err := validatePositiveMinutes("approval.ttl_minutes", cfg.Approval.TTLMinutes); err != nil {
 		return err
 	}
-	if err := validatePositiveMinutes("approval.l2_rate_window_minutes", cfg.Approval.L2RateWindowMinutes); err != nil {
-		return err
-	}
-	if cfg.Approval.L2MaxPerWindow < 1 {
-		return fmt.Errorf("config: approval.l2_max_per_window must be at least 1")
-	}
 	if err := validatePositiveSeconds("diagnose.evidence.timeout_seconds", cfg.Diagnose.Evidence.TimeoutSeconds); err != nil {
 		return err
 	}
-	v := cfg.Diagnose.Verification
-	if err := validatePositiveSeconds("diagnose.verification.timeout_seconds", v.TimeoutSeconds); err != nil {
+	if err := validateVerification(cfg.Remediation.Verification); err != nil {
 		return err
 	}
-	if err := validatePositiveSeconds("diagnose.verification.interval_seconds", v.IntervalSeconds); err != nil {
+	if err := validateService(cfg.Service); err != nil {
 		return err
 	}
-	if err := validatePositiveSeconds("diagnose.verification.window_seconds", v.WindowSeconds); err != nil {
+	if err := validateRemediation(cfg.Remediation, cfg.Service); err != nil {
 		return err
-	}
-	if v.TimeoutSeconds >= 30 {
-		return fmt.Errorf("config: diagnose.verification.timeout_seconds must be less than 30 (verification claim limit)")
-	}
-	if v.TimeoutSeconds >= v.IntervalSeconds {
-		return fmt.Errorf("config: diagnose.verification.timeout_seconds must be less than diagnose.verification.interval_seconds")
-	}
-	if v.IntervalSeconds >= v.WindowSeconds {
-		return fmt.Errorf("config: diagnose.verification.interval_seconds must be less than diagnose.verification.window_seconds")
 	}
 	if cfg.Diagnose.Evidence.LogMaxLines < 1 {
 		return fmt.Errorf("config: diagnose.evidence.log_max_lines must be at least 1")
@@ -477,12 +560,6 @@ func validate(cfg Config) error {
 	if cfg.Tools.Prometheus.MaxPoints < 1 {
 		return fmt.Errorf("config: tools.prometheus.max_points must be at least 1")
 	}
-	if err := validateNonNegativeSeconds("tools.docker.restart_min_interval_seconds", cfg.Tools.Docker.RestartMinIntervalSeconds); err != nil {
-		return err
-	}
-	if cfg.Tools.Docker.RestartMaxPerHour < 1 {
-		return fmt.Errorf("config: tools.docker.restart_max_per_hour must be at least 1")
-	}
 	if cfg.LLM.Roles.Reasoner.MaxTokens < 1 {
 		return fmt.Errorf("config: llm.roles.reasoner.max_tokens must be at least 1")
 	}
@@ -490,6 +567,9 @@ func validate(cfg Config) error {
 		return err
 	}
 	if err := validateModelProfiles(cfg.LLM); err != nil {
+		return err
+	}
+	if err := validateOperators(cfg); err != nil {
 		return err
 	}
 	provider := strings.ToLower(strings.TrimSpace(cfg.Notify.IM.Provider))
@@ -522,6 +602,205 @@ func validate(cfg Config) error {
 		}
 	default:
 		return fmt.Errorf("config: notify.im.provider %q is unsupported", cfg.Notify.IM.Provider)
+	}
+	if cfg.AutomaticRemediation() {
+		if err := cfg.validateUnattended(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// AutomaticRemediation reports whether this configuration authorizes unattended writes.
+func (c Config) AutomaticRemediation() bool {
+	for _, rule := range c.Remediation.Rules {
+		if rule.Mode == incident.ModeAuto {
+			return true
+		}
+	}
+	return false
+}
+
+func (c Config) validateUnattended() error {
+	admin := false
+	for _, operator := range c.Web.Operators {
+		admin = admin || operator.Role == "admin"
+	}
+	if !admin {
+		return fmt.Errorf("config: auto remediation requires an admin identity for stop and recovery")
+	}
+	if !strings.EqualFold(c.Notify.IM.Provider, "feishu_app") && strings.TrimSpace(c.Notify.IM.Webhook) == "" {
+		return fmt.Errorf("config: auto remediation requires a notification provider")
+	}
+	for _, rule := range c.Remediation.Rules {
+		if rule.Mode != incident.ModeAuto {
+			continue
+		}
+		v := c.Remediation.VerificationFor(rule)
+		if v.RequiredPasses < 3 || v.WatchSeconds <= v.IntervalSeconds*v.RequiredPasses {
+			return fmt.Errorf("config: auto rule %s requires at least three passes and a watch window", rule.ID)
+		}
+		if rule.Action == "docker_restart" && strings.TrimSpace(c.Service.Probe.APIKey) == "" {
+			return fmt.Errorf("config: auto restart requires a business probe; health alone cannot prove recovery")
+		}
+		if rule.Action == "deployment_rollback" || rule.Action == "upstream_quarantine" {
+			if rule.MinRequests < 1 || v.WindowSeconds <= 300 {
+				return fmt.Errorf("config: auto rule %s requires real traffic samples and a window longer than five minutes", rule.ID)
+			}
+		}
+	}
+	return nil
+}
+
+func validateVerification(v VerificationConfig) error {
+	const field = "remediation.verification"
+	for name, seconds := range map[string]int{"timeout_seconds": v.TimeoutSeconds, "interval_seconds": v.IntervalSeconds, "window_seconds": v.WindowSeconds} {
+		if err := validatePositiveSeconds(field+"."+name, seconds); err != nil {
+			return err
+		}
+	}
+	if v.TimeoutSeconds >= 30 {
+		return fmt.Errorf("config: %s.timeout_seconds must be less than 30 (verification claim limit)", field)
+	}
+	if v.TimeoutSeconds >= v.IntervalSeconds {
+		return fmt.Errorf("config: %s.timeout_seconds must be less than interval_seconds", field)
+	}
+	if v.IntervalSeconds >= v.WindowSeconds {
+		return fmt.Errorf("config: %s.interval_seconds must be less than window_seconds", field)
+	}
+	if err := incident.ValidatePassWindow(v.RequiredPasses, v.IntervalSeconds, v.WindowSeconds); err != nil {
+		return fmt.Errorf("config: %s.required_passes must be 1..100 and (required_passes-1)*interval_seconds must be less than window_seconds", field)
+	}
+	if err := validateNonNegativeSeconds(field+".watch_seconds", v.WatchSeconds); err != nil {
+		return err
+	}
+	if v.WatchSeconds > 0 && v.WatchSeconds <= v.IntervalSeconds {
+		return fmt.Errorf("config: %s.watch_seconds must be 0 or longer than interval_seconds", field)
+	}
+	return nil
+}
+
+var serviceNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,63}$`)
+
+func validateService(s ServiceConfig) error {
+	if !serviceNamePattern.MatchString(s.Name) || !serviceNamePattern.MatchString(s.Container) || !serviceNamePattern.MatchString(s.Env) {
+		return fmt.Errorf("config: service.name, service.env and service.container must be 1-64 lowercase letters, digits and ._-")
+	}
+	if strings.TrimSpace(s.BaseURL) != "" {
+		if _, err := incident.NormalizeHealthBaseURL(s.BaseURL); err != nil {
+			return fmt.Errorf("config: service.base_url must be an HTTP(S) origin without credentials, path or query")
+		}
+	}
+	if p := s.Probe; strings.TrimSpace(p.APIKey) != "" && (!strings.HasPrefix(p.Path, "/") || strings.TrimSpace(p.Model) == "") {
+		return fmt.Errorf("config: service.probe requires path (starting with /) and model when api_key is set")
+	}
+	if r := s.Release; len(r.Command) > 0 {
+		if !strings.HasPrefix(r.Command[0], "/") || !strings.HasPrefix(r.WorkDir, "/") || !strings.HasPrefix(r.LockFile, "/") {
+			return fmt.Errorf("config: service.release requires an absolute command, work_dir and lock_file")
+		}
+		if err := validatePositiveSeconds("service.release.timeout_seconds", r.TimeoutSeconds); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+var (
+	ruleIDPattern  = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+	validRuleModes = map[string]bool{incident.ModeObserve: true, incident.ModeManual: true, incident.ModeAuto: true}
+)
+
+// VerificationFor returns the verification timing a rule freezes into snapshots.
+func (r RemediationConfig) VerificationFor(rule RuleConfig) VerificationConfig {
+	v := r.Verification
+	if rule.VerifyWindowSeconds > 0 {
+		v.WindowSeconds = rule.VerifyWindowSeconds
+	}
+	return v
+}
+
+// validateRemediation checks rule shape only; whether each action is available
+// (for example release needs service.release) is checked against the action
+// catalog at startup.
+func validateRemediation(r RemediationConfig, service ServiceConfig) error {
+	if len(r.Rules) > 0 && strings.TrimSpace(r.RulesVersion) == "" {
+		return fmt.Errorf("config: remediation.rules_version is required when rules are configured")
+	}
+	if len(r.Rules) > 0 && strings.TrimSpace(service.BaseURL) == "" {
+		return fmt.Errorf("config: service.base_url is required when remediation rules are configured")
+	}
+	ids := map[string]bool{}
+	for index, rule := range r.Rules {
+		field := fmt.Sprintf("remediation.rules[%d]", index)
+		if !ruleIDPattern.MatchString(rule.ID) || ids[rule.ID] {
+			return fmt.Errorf("config: %s.id must be unique, 1-64 lowercase letters, digits, _ or -", field)
+		}
+		ids[rule.ID] = true
+		if strings.TrimSpace(rule.Action) == "" || !validRuleModes[rule.Mode] {
+			return fmt.Errorf("config: %s needs an action and mode observe, manual or auto", field)
+		}
+		if len(rule.Alerts) == 0 {
+			return fmt.Errorf("config: %s.alerts must name the alerts this rule covers", field)
+		}
+		for _, alert := range rule.Alerts {
+			if strings.TrimSpace(alert) == "" {
+				return fmt.Errorf("config: %s.alerts must not contain empty names", field)
+			}
+		}
+		if rule.MaxExecutions < 1 {
+			return fmt.Errorf("config: %s.max_executions must be at least 1", field)
+		}
+		if err := validatePositiveMinutes(field+".window_minutes", rule.WindowMinutes); err != nil {
+			return err
+		}
+		if rule.MinAvailableAccounts < 0 || rule.MinRequests < 0 || rule.MaxErrorRatio < 0 || rule.MaxErrorRatio >= 1 {
+			return fmt.Errorf("config: %s bounds must be non-negative and max_error_ratio below 1", field)
+		}
+		if rule.VerifyWindowSeconds != 0 {
+			window := r.Verification
+			window.WindowSeconds = rule.VerifyWindowSeconds
+			if err := validateVerification(window); err != nil {
+				return fmt.Errorf("config: %s.verify_window_seconds: %w", field, err)
+			}
+		}
+	}
+	for index, window := range r.Maintenance {
+		if window.Start.IsZero() || !window.End.After(window.Start) {
+			return fmt.Errorf("config: remediation.maintenance[%d] needs start before end", index)
+		}
+	}
+	return nil
+}
+
+var (
+	operatorIDPattern  = regexp.MustCompile(`^[A-Za-z0-9._@-]{1,64}$`)
+	sha256HexPattern   = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	validOperatorRoles = map[string]bool{"viewer": true, "operator": true, "admin": true}
+)
+
+// validateOperators rejects an anonymous console and any identity that could be
+// confused with another or with the shared machine token.
+func validateOperators(cfg Config) error {
+	if cfg.ConsoleEnabled() && len(cfg.Web.Operators) == 0 {
+		return fmt.Errorf("config: web.operators is required when the console is enabled; the console has no anonymous access")
+	}
+	machine := sha256.Sum256([]byte(cfg.Server.AuthToken))
+	ids, hashes := map[string]bool{}, map[string]bool{}
+	for index, operator := range cfg.Web.Operators {
+		field := fmt.Sprintf("web.operators[%d]", index)
+		if !operatorIDPattern.MatchString(operator.ID) || ids[operator.ID] {
+			return fmt.Errorf("config: %s.id must be unique, 1-64 characters of letters, digits and ._@-", field)
+		}
+		if !validOperatorRoles[operator.Role] {
+			return fmt.Errorf("config: %s.role must be viewer, operator or admin", field)
+		}
+		if !sha256HexPattern.MatchString(operator.TokenSHA256) || hashes[operator.TokenSHA256] {
+			return fmt.Errorf("config: %s.token_sha256 must be a unique lowercase hex SHA-256", field)
+		}
+		if operator.TokenSHA256 == hex.EncodeToString(machine[:]) {
+			return fmt.Errorf("config: %s must not reuse server.auth_token; the machine token is not a human identity", field)
+		}
+		ids[operator.ID], hashes[operator.TokenSHA256] = true, true
 	}
 	return nil
 }

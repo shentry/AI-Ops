@@ -19,16 +19,8 @@ diagnose:
     low: skip
   evidence:
     docker_socket: /not-mounted/docker.sock
-    docker_container: ""
-    sub2api_base_url: ""
-    postgres_dsn: ""
-    redis_addr: ""
-approval:
-  dry_run: true
-  auto_execute_l2: false
+# No service endpoints and no remediation rules: nothing can be authorized.
 tools:
-  docker:
-    allowed_containers: []
   # Registration requires a syntactically valid URL; benchmark never queries it.
   prometheus:
     base_url: http://127.0.0.1:9090
@@ -38,3 +30,7 @@ notify:
     webhook: ""
 web:
   base_url: http://127.0.0.1:18081
+  operators:
+    - id: bench
+      role: viewer
+      token_sha256: "${BENCH_VIEWER_TOKEN_SHA256}"
