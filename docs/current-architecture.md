@@ -231,6 +231,7 @@ flowchart TB
 | `internal/incident` | 不依赖 store 的归并/生命周期/路由纯规则；ExecutionContext、PlanHash、FaultFingerprint 与重诊规则 |
 | `internal/diagnose` | Evidence（含发布记录与上游账号采集）、诊断快照、Pipeline、Guard、按检查项的 Verifier 和持久验证/观察 Worker |
 | `internal/llm` | OpenAI 兼容模型工厂、Eino ReAct、只读 Questioner、模型切换；计划契约由已启用动作定义生成 |
+| `internal/grafana` | 看板 JSON（`dashboards/`）编进二进制；Grafana 从同一目录 provisioning，控制台监控页渲染同一份 |
 | `internal/tools` | 只读工具（Prometheus、Docker、Loki）注册、统一超时、脱敏、输出截断；动作定义与实现（Prepare / Execute / Reconcile）：`docker_restart`、`deployment_rollback`、`upstream_quarantine` |
 | `internal/sub2api` | sub2api 管理接口客户端（只读 ops、账号调度）与业务探针 |
 | `internal/approval` | 规则授权（Authority / Policy）、审批 CAS、审批 TTL、执行器（领取复验、回执、对账） |
@@ -501,11 +502,13 @@ flowchart LR
         TABS["时间线 / 诊断轨迹 / 问 Agent<br/>EventTimeline · AgentTrace · Conversation"]
         SIDE["ApprovalCard · ActionCard<br/>ProblemsCard · MembersCard · ReviewCard"]
         OPS["Remediation / Report / Changes<br/>规则急停、效果评估、发布记录"]
+        MON["Monitor<br/>原生渲染 Grafana 看板（拷自 ongrid）"]
 
         APP --> SHELL
         SHELL --> OVERVIEW
         SHELL --> ROOM
         SHELL --> OPS
+        SHELL --> MON
         ROOM --> FLOW
         ROOM --> TABS
         ROOM --> SIDE
@@ -565,6 +568,7 @@ flowchart LR
   - `/incidents` → `Incidents`（按服务端状态筛选 + 本页文本过滤）
   - `/incidents/<id>` → `IncidentDetail`（诊断报告、处理流程、时间线/诊断轨迹/问 Agent 三个标签，右侧审批、最近变更、当前问题、告警成员、复盘标注）
   - `/remediation` → 处置规则、急停/复位、控制记录；`/report` → 效果评估与待复盘队列；`/changes` → 发布记录与「标记健康」
+  - `/monitor` → `Monitor`（按需加载）：用 `PanelGrid` / `PromQLPanel`（recharts）原生渲染 `internal/grafana/dashboards` 的四个看板，支持时间范围、自定义窗口和自动刷新；Incident 详情的“监控”按钮打开事件前后各 30 分钟。代码拷自 ongrid（AGPL-3.0，见 NOTICE）
 - 侧栏每 30 秒拉一次最近 50 个 Incident，供导航徽标、最近事件和 ⌘K 快速跳转使用；各页面需要筛选时自己查询服务端。
 - `IncidentDetail` 首屏读取控制室聚合、run steps 和对话历史。
 - 诊断结论与对话用 Markdown 渲染：不启用原始 HTML、去掉图片、链接新窗口且无 opener；step 输入输出在浏览器侧再按敏感键名脱敏一次。
@@ -639,6 +643,8 @@ sequenceDiagram
 | `/api/v1/incidents/:id/reviews` | 读任一身份；写 operator | 复盘标注 |
 | `/api/v1/changes`、`/changes/:id/verify` | 读任一身份；登记 operator 或机器令牌；确认健康 operator | 发布记录 |
 | `/api/v1/session` | 个人令牌 / 会话 | 登录、当前身份、登出 |
+| `GET /api/v1/observability/dashboards`、`/dashboards/:uid` | viewer（不含机器令牌） | 编进二进制的看板定义 |
+| `POST /api/v1/prometheus/query_range` | viewer（不含机器令牌） | 监控页的 PromQL 区间查询代理，表达式 ≤ 4 KB，30 秒超时 |
 | `/api/v1/control-room/model` | 任一身份 | 当前模型和 allowlist |
 | `/api/v1/control-room/incidents`、`/incidents/:id/control-room`、`/events`、`/problems`、`/runs...`、`/stream`、`/conversation` | 任一身份 | 控制室读取与 SSE |
 | `POST /api/v1/incidents/:id/questions\|rediagnose\|request-evidence` | operator | 提问、重诊、补充证据入队 |

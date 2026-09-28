@@ -2,7 +2,7 @@
 
 > 状态：第 1 步（监控）已实现，第 2–5 步待实施。编写日期：2026-09-28。
 >
-> 现状基线：本仓库 `ab3d939` 加当前工作区未提交修改，结论以源码为准。Ongrid 参考固定在 `81e08b5efbe9ccd9a5781574d5f3ba10215eccac`（v0.17.2），只借鉴设计，不复制代码或内置知识内容（AGPL）。
+> 现状基线：`feat/execution-trust` 分支，结论以源码为准。Ongrid 参考固定在 `81e08b5efbe9ccd9a5781574d5f3ba10215eccac`（v0.17.2）：监控页的代码直接拷自 ongrid（见 §7.3 与 `NOTICE`，本仓库因此为 AGPL-3.0），其余部分只借鉴设计，不复制内置知识内容。
 >
 > 本文取代此前的《多 Agent、可视化工作流与可观测平台演进设计》。持久 DAG、工作流编辑器和多角色 Agent 不再列入计划，原因见 §1.2。
 
@@ -16,7 +16,7 @@
 | Tool Search | 工具多了以后，怎么避免每步都携带全部 schema | 常驻工具加上技能声明的工具给完整 schema，其余只给名字，按需检索 |
 | 知识库 | 我们以前怎么处理过、这个组件的背景是什么 | 仓库手册加上人工确认过的 Incident 复盘，用 MySQL 中文全文检索 |
 | 拓扑 | 故障会波及谁、依赖是否健康 | 在配置中声明节点和边，实时状态来自 docker inspect 与 Prometheus `ALERTS` |
-| 监控 | 历史日志和看板在哪 | 在现有 monitoring Compose 中加入 Loki、Alloy、Grafana，控制台跳转到对应节点和时间窗 |
+| 监控 | 历史日志和看板在哪 | 在现有 monitoring Compose 中加入 Loki、Alloy、Grafana；控制台的监控页原生渲染同一套看板 |
 
 执行链 Guard → Policy → Approval → Executor → Verify 不变。这些新能力只提供上下文，不能产生授权。唯一的例外是拓扑向 Guard 提供一条新的**拒绝**规则（§6.4）。
 
@@ -30,7 +30,7 @@
 | 拓扑展示 | 手写 SVG 分层布局，不新增前端依赖 | 节点超过约 30 个时再考虑 `@xyflow/react` + dagre |
 | 日志 | Loki 单体部署；Alloy 通过 Docker API 采集指定 Compose 项目的容器日志，并采集 Agent 的 journal | 新增 3 个容器和磁盘占用；Alloy 持有 Docker socket，与 cAdvisor 同等权限 |
 | 模型查日志 | `loki_query` 按拓扑节点由服务端拼 selector | 模型不能写任意 LogQL |
-| 看板 | Grafana provisioning 纳入仓库，控制台只生成跳转链接 | 不做 iframe 嵌入，不在控制台重做指标浏览器 |
+| 看板 | 照搬 ongrid：看板 JSON 编进二进制，控制台用 recharts 原生渲染，查询走 `query_range` 代理；Grafana 用同一份 JSON，只负责 Explore 和日志面板 | 这部分代码拷自 ongrid，仓库因此改为 AGPL-3.0（见 NOTICE）；前端新增 recharts 依赖 |
 
 ### 1.2 本期不做
 
@@ -89,7 +89,7 @@ flowchart LR
 - `internal/diagnose`：新增 `collector_topology.go`，在 Guard 中增加依赖规则。
 - `skills/`、`knowledge/`：仓库内的 Markdown 内容。
 - `deploy/monitoring/`：Loki、Alloy、Grafana 的配置。
-- `internal/grafana/dashboards/`：看板 JSON，Grafana 从这里 provisioning。
+- `internal/grafana/dashboards/`：看板 JSON，服务端编进二进制，Grafana 也从这里 provisioning。
 
 ## 4. 排查技能与 Tool Search
 
@@ -302,7 +302,20 @@ topology:
 
 ### 7.3 看板与联动
 
-仓库内 provisioning 4 个看板：
+看板的实现照搬 ongrid 的做法，相关文件直接拷自 ongrid 并做了适配，逐文件清单见 `NOTICE`。
+
+- 看板定义是 Grafana 格式的 JSON，放在 `internal/grafana/dashboards/`，服务端用 `go:embed` 编进二进制。
+- 控制台的监控页（`/monitor`）通过 `GET /api/v1/observability/dashboards/:uid` 取定义，用 `PanelGrid`（24 列栅格）和 `PromQLPanel`（recharts，支持 timeseries / stat / gauge / bargauge / table）原生渲染。
+- 每个 PromQL target 通过 `POST /api/v1/prometheus/query_range` 查询，viewer 可用，表达式最长 4 KB，超时 30 秒。
+- Grafana 从同一目录 provisioning，两边的面板不会不一致。控制台不渲染 Loki 日志面板，这类面板只在 Grafana 中显示。
+- 为适配本项目改了这几处：
+  - 配色用主题 token，深浅两种主题都支持；
+  - 支持 `legendFormat` 和值映射，UP/DOWN 以文字显示；
+  - 自定义时间窗按窗口长度决定查询步长；
+  - 没有拷 ongrid 的设备与角色筛选、用户自定义面板、Grafana 跳转按钮。
+- Incident 详情页的"监控"按钮打开事件前后各 30 分钟的窗口。
+
+4 个看板：
 
 - sub2api 服务（黄金信号、业务探针、上游账号）；
 - 依赖与主机（Postgres、Redis、容器、磁盘）；
@@ -311,10 +324,7 @@ topology:
 
 处置效果统计仍放在控制台的"效果评估"页，不在 Grafana 重复一份。
 
-拓扑节点侧栏和 Incident 详情页生成两类链接，只做跳转，Grafana 独立认证：
-
-- 看板链接：dashboard uid（`sub2api`、`dependencies-host`、`oncall-agent`、`monitoring-stack`）和 Incident 前后的时间窗；
-- Explore 链接：该节点 service 对应的 Loki selector 和同一时间窗。
+第 2 步的拓扑节点侧栏复用监控页：看板链接为 `/monitor?board=<uid>&range=custom&start=…&end=…`；日志要么走控制台之后的日志页，要么跳到 Grafana Explore，并带上该节点 service 对应的 Loki selector。
 
 ### 7.4 平台自身告警与失效
 
@@ -348,7 +358,7 @@ topology:
 
 | 步骤 | 内容 | 验收 | 单人估算 |
 | --- | --- | --- | --- |
-| 1 监控（已实现） | Loki、Alloy、Grafana，4 个看板，`loki_query`，删除 CLS 与 mysql_select 配置，平台告警 | 日志能在 Loki 查到，容器重建和日志轮转后仍能续读；retention 实际生效；Loki 停止后诊断照常完成 | 3–4 天 |
+| 1 监控（已实现） | Loki、Alloy、Grafana，4 个看板（控制台原生渲染，代码拷自 ongrid），`loki_query`，删除 CLS 与 mysql_select 配置，平台告警 | 日志能在 Loki 查到，容器重建和日志轮转后仍能续读；retention 实际生效；Loki 停止后诊断照常完成 | 3–4 天 |
 | 2 拓扑 | 配置校验、实时状态、Collector、Guard 依赖规则、拓扑页与跳转链接 | 停掉 postgres 时拓扑显示 down，且 `docker_restart(sub2api)` 被拒；配置错误拒绝启动 | 4–5 天 |
 | 3 技能 | 加载校验、匹配注入、快照录制、5 个技能、技能标签页 | 引用未知工具或告警时拒绝启动；回放使用录制的正文；12 案例开/关对比 | 3–4 天 |
 | 4 知识库 | 表与同步、两个工具、复盘入库、文档标签页 | ngram 检索在真实 MySQL 上通过；带注入内容的条目不改变执行判定；召回评测 | 4–5 天 |
@@ -379,7 +389,7 @@ topology:
 | Tool Search | 工具数超过 30（可用环境变量调整）时，按名字把工具分成 core 和 specialty，specialty 只给名字；`select:` 或子串检索 | 同样的暴露方式，另外把技能纳入检索，并录制暴露状态用于回放 |
 | 知识库 | Qdrant + Embedding；内置 vault、git 仓库同步、上传；`query_knowledge` 工具 | MySQL ngram 全文检索；来源为仓库手册加复盘 Incident；不引入向量服务 |
 | 拓扑 | 通用节点和关系表；每 30 秒从遥测同步 `service deployed_on device`；`expand_topology` 做 BFS（默认 2 跳，最多 5 跳）；前端用 xyflow + dagre | 声明式配置加实时状态；整图作为证据；向 Guard 提供依赖规则；手写 SVG |
-| 可观测 | 自带 Loki、Tempo、Pyroscope、Grafana 等完整数据面 | 只加 Loki、Alloy、Grafana，不做链路和 Profiles |
+| 可观测 | 自带 Loki、Tempo、Pyroscope、Grafana 等完整数据面；Monitor 页原生渲染看板 | 只加 Loki、Alloy、Grafana，不做链路和 Profiles；Monitor 页的渲染代码直接拷自 ongrid（AGPL-3.0） |
 
 源码依据：[skill_registry.go](https://github.com/ongridio/ongrid/blob/81e08b5efbe9ccd9a5781574d5f3ba10215eccac/internal/manager/biz/aiops/chatruntime/skill_registry.go)、[toolbag.go](https://github.com/ongridio/ongrid/blob/81e08b5efbe9ccd9a5781574d5f3ba10215eccac/internal/manager/biz/aiops/tools/toolbag.go)、[query_knowledge_basetool.go](https://github.com/ongridio/ongrid/blob/81e08b5efbe9ccd9a5781574d5f3ba10215eccac/internal/manager/biz/aiops/tools/query_knowledge_basetool.go)、[knowledge/usecase.go](https://github.com/ongridio/ongrid/blob/81e08b5efbe9ccd9a5781574d5f3ba10215eccac/internal/manager/biz/knowledge/usecase.go)、[expand_topology_basetool.go](https://github.com/ongridio/ongrid/blob/81e08b5efbe9ccd9a5781574d5f3ba10215eccac/internal/manager/biz/aiops/tools/expand_topology_basetool.go)、[cmd/ongrid/service_topology.go](https://github.com/ongridio/ongrid/blob/81e08b5efbe9ccd9a5781574d5f3ba10215eccac/cmd/ongrid/service_topology.go)。
 

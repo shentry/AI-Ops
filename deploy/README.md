@@ -114,7 +114,8 @@ exporter 二进制来自上面的构建（`bin/sub2api-exporter`，Compose 以�
 
 - **Loki**（`loki.yaml`）：单体部署，数据在 `loki-data` 卷，保留 7 天。保留期由 compactor 删除，`retention_enabled` 必须为 true，否则 Loki 永不删除数据。Agent 通过 `127.0.0.1:3100` 查询，配置为 `tools.loki.base_url: http://127.0.0.1:3100`；留空则不注册 `loki_query`，诊断只用 `docker_logs`。
 - **Alloy**（`config.alloy`）：采集 `SUB2API_COMPOSE_PROJECT` 和本监控项目的容器日志，标签为 `service`（Compose 服务名）和 `container`；另外采集 journald 中 `oncall-agent.service` 的日志，标签为 `service=oncall-agent`。采集范围就是 `loki_query` 能读到的范围，其他容器不进入 Loki。Alloy 通过 Docker API 读日志，和 cAdvisor 一样持有 Docker socket，属于与 root 等价的权限；它不暴露端口。journald 需要持久化日志目录 `/var/log/journal`（Ubuntu 默认存在），`/etc/machine-id` 以只读方式挂载。
-- **Grafana**：数据源从 `grafana/provisioning` 加载，看板从仓库的 `internal/grafana/dashboards/` 加载，界面上不能修改，改动文件后约 30 秒生效。看板有 `sub2api 服务`、`依赖与主机`、`oncall-agent 运行`、`监控栈` 四个，位于 `oncall` 文件夹。匿名访问和注册已关闭，通过 SSH 隧道访问：`ssh -L 3000:127.0.0.1:3000 <host>`。
+- **看板**：`sub2api 服务`、`依赖与主机`、`oncall-agent 运行`、`监控栈` 四个，JSON 定义在仓库的 `internal/grafana/dashboards/`。平时直接在控制台的“监控”页查看：它原生渲染同一套定义，通过 Agent 查询 Prometheus，不依赖 Grafana 是否在线。
+- **Grafana**：数据源从 `grafana/provisioning` 加载，看板从 `internal/grafana/dashboards/` 加载，界面上不能修改，改动文件后约 30 秒生效。它用于 Explore 临时查询和日志面板。匿名访问和注册已关闭，通过 SSH 隧道访问：`ssh -L 3000:127.0.0.1:3000 <host>`。控制台里的看板随 Agent 二进制发布；监控栈这边用的是仓库里的文件，两边要用同一个版本的仓库部署。
 - 日志链路告警 `LogPipelineDropping`（Alloy 放弃发送或 Loki 拒收）和三个新抓取目标的 `MonitoringTargetDown` 都按 `layer=monitoring` 直接通知人工。超过保留期的旧日志被拒收属于预期，不计入告警：首次启动时 Alloy 会读取容器已有的日志。
 
 ### 告警送达与心跳
@@ -132,7 +133,7 @@ exporter 二进制来自上面的构建（`bin/sub2api-exporter`，Compose 以�
 1. `curl -s 127.0.0.1:3100/loki/api/v1/label/service/values` 中有 `sub2api`、`oncall-agent`，且没有其他项目的服务。
 2. `docker compose -p <sub2api 项目> up -d --force-recreate sub2api` 之后，新容器的日志在 1 分钟内能查到。
 3. `curl -s 127.0.0.1:3100/config | grep -E 'retention_(enabled|period)'` 为 `true` 和 `1w`；上线 8 天后确认 `loki-data` 卷不再增长，最早的日志不早于 7 天前。
-4. Grafana 四个看板都有数据，`sub2api 服务` 底部能看到日志。
+4. 控制台“监控”页四个看板都有数据；Grafana 里 `sub2api 服务` 底部能看到日志。
 5. 停掉 Loki（`docker compose stop loki`）后触发一次诊断：`loki_query` 返回错误，诊断照常完成；恢复后 `LogPipelineDropping` 不应持续触发。
 
 从旧版本升级时，Agent 的 `config.yaml` 需删掉 `tools.logs` 和 `tools.mysql_select`（它们从未被读取，现已移除，严格配置会拒绝未知字段），并按需加上 `tools.loki`。

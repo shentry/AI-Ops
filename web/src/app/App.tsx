@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, lazy, useEffect, useMemo, useState } from "react";
 import { Route, Routes } from "react-router";
 
 import { ModelState, Session, getCurrentModel, getSession, logout, unauthorizedEvent } from "../api";
@@ -13,6 +13,9 @@ import { Overview } from "../pages/Overview";
 import { Remediation } from "../pages/Remediation";
 import { Report } from "../pages/Report";
 import { IncidentFeedProvider, SessionProvider } from "./context";
+
+// 监控页带着图表库，按需加载，其他页面不下载它。
+const Monitor = lazy(() => import("../pages/Monitor").then((module) => ({ default: module.Monitor })));
 
 export function App() {
   // undefined: checking the session; null: signed out.
@@ -73,6 +76,7 @@ export function App() {
             <Route index element={<Overview />} />
             <Route path="incidents" element={<Incidents />} />
             <Route path="incidents/:id" element={<IncidentDetailRoute />} />
+            <Route path="monitor" element={<Suspense fallback={null}><Monitor /></Suspense>} />
             <Route path="remediation" element={<Remediation />} />
             <Route path="report" element={<Report />} />
             <Route path="changes" element={<Changes />} />

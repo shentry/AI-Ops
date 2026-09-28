@@ -166,9 +166,9 @@ services:
       - /etc/alloy/config.alloy
     networks: [monitoring]
 
-  # Dashboards and Explore. Datasources (./grafana/provisioning) and dashboards
-  # (internal/grafana/dashboards) are provisioned and cannot be edited in the
-  # UI; change the files instead.
+  # Explore and full dashboards. The console's Monitor page renders the same
+  # dashboards natively; Grafana stays for ad-hoc queries and log panels.
+  # Provisioned dashboards cannot be edited in the UI; change the files instead.
   grafana:
     image: grafana/grafana:13.2.2
     restart: unless-stopped
@@ -188,6 +188,7 @@ services:
       GF_NEWS_NEWS_FEED_ENABLED: "false"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      # Same dashboard JSON the console's Monitor page renders natively.
       - ../../internal/grafana/dashboards:/etc/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
     networks: [monitoring]

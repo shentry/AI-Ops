@@ -1,6 +1,6 @@
-import { MessagesSquare, OctagonAlert, RefreshCw, RotateCcw } from "lucide-react";
+import { Activity, MessagesSquare, OctagonAlert, RefreshCw, RotateCcw } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useParams } from "react-router";
+import { Link, useParams } from "react-router";
 
 import {
   ApiError,
@@ -30,7 +30,7 @@ import { ProblemsCard } from "../components/incident/ProblemsCard";
 import { ReportCard } from "../components/incident/ReportCard";
 import { ReviewCard } from "../components/incident/ReviewCard";
 import { PageHeader } from "../components/layout/PageHeader";
-import { Badge, Button, Notice, Skeleton, Tabs, cx } from "../components/ui";
+import { Badge, Button, Notice, Skeleton, Tabs, buttonClass, cx } from "../components/ui";
 import { relativeTime, severityLabel, statusLabel, timeLabel } from "../labels";
 import { Tone, severityTone, statusTone, toneText } from "../tone";
 import { NotFound } from "./NotFound";
@@ -236,6 +236,10 @@ function IncidentDetail({ incidentId }: { incidentId: number }) {
         actions={
           <>
             <StreamBadge state={streamState} />
+            <Link to={monitorLink(incident.started_at, incident.resolved_at)} className={buttonClass()}>
+              <Activity size={13} aria-hidden="true" />
+              监控
+            </Link>
             <Button onClick={openChat}>
               <MessagesSquare size={13} aria-hidden="true" />
               问 Agent
@@ -317,4 +321,15 @@ function StreamBadge({ state }: { state: StreamState }) {
   if (state === "live") return <Badge tone="ok" dot pulse>实时</Badge>;
   if (state === "reconnecting") return <Badge tone="warn" dot>重连中</Badge>;
   return <Badge dot>连接中</Badge>;
+}
+
+// monitorLink opens the Monitor page on the incident's window: 30 minutes of
+// context either side, capped to the page's 7-day limit.
+function monitorLink(startedAt: string, resolvedAt?: string | null): string {
+  const pad = 30 * 60_000;
+  const end = Math.min(Date.now(), (resolvedAt ? Date.parse(resolvedAt) : Date.now()) + pad);
+  const start = Math.max(Date.parse(startedAt) - pad, end - 7 * 86_400_000);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return "/monitor";
+  const params = new URLSearchParams({ range: "custom", start: new Date(start).toISOString(), end: new Date(end).toISOString() });
+  return `/monitor?${params}`;
 }

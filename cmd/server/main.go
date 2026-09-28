@@ -22,6 +22,7 @@ import (
 	"oncall-agent/internal/config"
 	"oncall-agent/internal/conversation"
 	"oncall-agent/internal/diagnose"
+	"oncall-agent/internal/grafana"
 	"oncall-agent/internal/incident"
 	"oncall-agent/internal/ingest"
 	"oncall-agent/internal/llm"
@@ -418,6 +419,14 @@ func run() error {
 		server.BindHandler("/api/v1/incidents/:id/questions", conversationAPI.Handle)
 		server.BindHandler("/api/v1/incidents/:id/rediagnose", conversationAPI.Handle)
 		server.BindHandler("/api/v1/incidents/:id/request-evidence", conversationAPI.Handle)
+		dashboards, err := grafana.Load()
+		if err != nil {
+			return fmt.Errorf("server: %w", err)
+		}
+		observabilityAPI := api.NewObservabilityAPI(promClient, dashboards, auth)
+		for _, route := range []string{"/api/v1/prometheus/query_range", "/api/v1/observability/dashboards", "/api/v1/observability/dashboards/:uid"} {
+			server.BindHandler(route, observabilityAPI.Handle)
+		}
 	}
 	if feishuCallback != nil {
 		server.BindHandler("/integrations/feishu/events", feishuCallback.Handle)

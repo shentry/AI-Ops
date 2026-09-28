@@ -23,6 +23,13 @@
   --danger: oklch(0.54 0.2 25);
   --info: oklch(0.52 0.12 235);
   --ring: oklch(0.53 0.19 262 / 0.45);
+  /* 图表分类色：固定顺序，按主题各取一组；已用 dataviz 校验脚本验证色弱区分与对比度。 */
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+  --series-6: #008300;
 }
 
 .dark {
@@ -43,6 +50,12 @@
   --danger: oklch(0.7 0.18 25);
   --info: oklch(0.76 0.11 230);
   --ring: oklch(0.68 0.16 262 / 0.5);
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+  --series-5: #d55181;
+  --series-6: #008300;
 }
 
 @theme inline {

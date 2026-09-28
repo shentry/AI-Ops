@@ -180,6 +180,8 @@ llm:
 | `GET /api/v1/incidents/{id}/stream` | 任一身份 | SSE 实时事件 |
 | `GET /api/v1/incidents/{id}/conversation` | 任一身份 | 对话历史 |
 | `POST /api/v1/incidents/{id}/questions\|rediagnose\|request-evidence` | operator | 提问、重新诊断、请求补充证据 |
+| `GET /api/v1/observability/dashboards`、`/dashboards/{uid}` | viewer（不含机器令牌） | 监控页看板定义，与 Grafana provisioning 同一份 JSON |
+| `POST /api/v1/prometheus/query_range` | viewer（不含机器令牌） | 监控页的 PromQL 区间查询代理：表达式 ≤ 4 KB，30 秒超时 |
 | `POST /integrations/feishu/events` | 飞书验签 | 飞书事件与卡片回调 |
 
 ## 验证命令
@@ -235,3 +237,7 @@ MYSQL_DSN=... go run ./cmd/retire-approvals -apply
 - 不保证外部动作与数据库的 exactly-once、不支持同库多实例，也不保证 IM 消息必达；
 - Token/DSN/密钥进日志、数据库、Prompt 前一律脱敏；
 - migration 手动执行，不用 AutoMigrate。
+
+## 许可证
+
+AGPL-3.0，见 [LICENSE](LICENSE)。控制台的监控页（原生渲染 Grafana 看板、PromQL 查询代理、时间范围选择）的代码拷自 [ongrid](https://github.com/ongridio/ongrid)（AGPL-3.0），逐个文件的来源和改动见 [NOTICE](NOTICE) 与各文件头。
