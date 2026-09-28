@@ -140,6 +140,16 @@ func run() error {
 	if err := promClient.RegisterTools(registry); err != nil {
 		return err
 	}
+	// Loki 是可选的历史日志：未配置时只剩 docker_logs 看当前容器实例。
+	if strings.TrimSpace(cfg.Tools.Loki.BaseURL) != "" {
+		lokiClient, err := tools.NewLokiClient(cfg.Tools.Loki)
+		if err != nil {
+			return fmt.Errorf("server: init loki client: %w", err)
+		}
+		if err := lokiClient.RegisterTools(registry); err != nil {
+			return err
+		}
+	}
 	// sub2api's admin key has no read-only scope: every caller gets a client
 	// built with exactly the endpoints it may call.
 	var opsReader *sub2api.Client

@@ -134,13 +134,11 @@ tools:
     base_url: "http://127.0.0.1:9090"
     range_minutes: 15
     max_points: 300
-  logs:
-    enabled: false
-    provider: cls
-    region: ap-guangzhou
-    topic_id: "${CLS_TOPIC}"
-  mysql_select:
-    dsn: "${MYSQL_RO_DSN}"
+  # 可选的历史日志查询（deploy/monitoring 的 Loki）。留空则不注册 loki_query。
+  loki:
+    base_url: "http://127.0.0.1:3100"
+    max_lines: 200
+    max_window_minutes: 360
 notify:
   im:
     # Supported: "" (disabled), wecom/feishu webhook, or feishu_app.

@@ -104,8 +104,18 @@ docker compose --env-file .env up -d
 | `REDIS_EXPORTER_ADDR` / `REDIS_EXPORTER_PASSWORD` | 默认 `redis://sub2api-redis:6379` |
 | `SUB2API_ADMIN_API_KEY` | 与 Agent 共用的管理员密钥（sub2api 只有一个）；exporter 只调用只读 ops 接口 |
 | `SUB2API_PROBE_API_KEY` / `SUB2API_PROBE_MODEL` / `SUB2API_PROBE_INTERVAL` | 可选业务探针：专用测试密钥、低成本模型、低频率。每次都会真实请求上游并产生费用 |
+| `SUB2API_COMPOSE_PROJECT` | sub2api 的 Compose 项目名（`docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' sub2api`），默认 `sub2api`；Alloy 只采集这个项目和本监控项目的容器日志 |
+| `GRAFANA_ADMIN_PASSWORD` | Grafana `admin` 的初始密码，必填；只在 Grafana 数据卷首次创建时生效，之后用 `docker compose exec grafana grafana cli admin reset-admin-password` 修改 |
+| `GRAFANA_ROOT_URL` | 可选，默认 `http://127.0.0.1:3000`；通过 SSH 隧道访问时保持默认 |
 
-exporter 二进制来自上面的构建（`bin/sub2api-exporter`，Compose 以只读方式挂载）。`alerts.yml` 直接使用仓库根目录的规则文件。`SUB2API_ADMIN_API_KEY` 是必填变量，未填时本目录的任何 `docker compose` 命令都会报插值错误，先生成密钥再操作整个栈。
+exporter 二进制来自上面的构建（`bin/sub2api-exporter`，Compose 以只读方式挂载）。`alerts.yml` 直接使用仓库根目录的规则文件。`SUB2API_ADMIN_API_KEY` 和 `GRAFANA_ADMIN_PASSWORD` 是必填变量，未填时本目录的任何 `docker compose` 命令都会报插值错误，先准备好再操作整个栈。
+
+### 日志与看板
+
+- **Loki**（`loki.yaml`）：单体部署，数据在 `loki-data` 卷，保留 7 天。保留期由 compactor 删除，`retention_enabled` 必须为 true，否则 Loki 永不删除数据。Agent 通过 `127.0.0.1:3100` 查询，配置为 `tools.loki.base_url: http://127.0.0.1:3100`；留空则不注册 `loki_query`，诊断只用 `docker_logs`。
+- **Alloy**（`config.alloy`）：采集 `SUB2API_COMPOSE_PROJECT` 和本监控项目的容器日志，标签为 `service`（Compose 服务名）和 `container`；另外采集 journald 中 `oncall-agent.service` 的日志，标签为 `service=oncall-agent`。采集范围就是 `loki_query` 能读到的范围，其他容器不进入 Loki。Alloy 通过 Docker API 读日志，和 cAdvisor 一样持有 Docker socket，属于与 root 等价的权限；它不暴露端口。journald 需要持久化日志目录 `/var/log/journal`（Ubuntu 默认存在），`/etc/machine-id` 以只读方式挂载。
+- **Grafana**：数据源从 `grafana/provisioning` 加载，看板从仓库的 `internal/grafana/dashboards/` 加载，界面上不能修改，改动文件后约 30 秒生效。看板有 `sub2api 服务`、`依赖与主机`、`oncall-agent 运行`、`监控栈` 四个，位于 `oncall` 文件夹。匿名访问和注册已关闭，通过 SSH 隧道访问：`ssh -L 3000:127.0.0.1:3000 <host>`。
+- 日志链路告警 `LogPipelineDropping`（Alloy 放弃发送或 Loki 拒收）和三个新抓取目标的 `MonitoringTargetDown` 都按 `layer=monitoring` 直接通知人工。超过保留期的旧日志被拒收属于预期，不计入告警：首次启动时 Alloy 会读取容器已有的日志。
 
 ### 告警送达与心跳
 
@@ -116,6 +126,16 @@ exporter 二进制来自上面的构建（`bin/sub2api-exporter`，Compose 以�
 ### 部署检查
 
 真实主机指标（node-exporter 挂载宿主根目录与 PID 命名空间）、容器日志轮转（`max-size 10m × 3`）、Prometheus 保留 15 天 / 5GB、所有端口只在 127.0.0.1、Webhook 鉴权、人工通知与心跳实际送达、状态库备份与恢复演练。开发用的根目录 Compose、`devtoken` 和端口不能作为生产部署。
+
+日志链路上线后另外核对：
+
+1. `curl -s 127.0.0.1:3100/loki/api/v1/label/service/values` 中有 `sub2api`、`oncall-agent`，且没有其他项目的服务。
+2. `docker compose -p <sub2api 项目> up -d --force-recreate sub2api` 之后，新容器的日志在 1 分钟内能查到。
+3. `curl -s 127.0.0.1:3100/config | grep -E 'retention_(enabled|period)'` 为 `true` 和 `1w`；上线 8 天后确认 `loki-data` 卷不再增长，最早的日志不早于 7 天前。
+4. Grafana 四个看板都有数据，`sub2api 服务` 底部能看到日志。
+5. 停掉 Loki（`docker compose stop loki`）后触发一次诊断：`loki_query` 返回错误，诊断照常完成；恢复后 `LogPipelineDropping` 不应持续触发。
+
+从旧版本升级时，Agent 的 `config.yaml` 需删掉 `tools.logs` 和 `tools.mysql_select`（它们从未被读取，现已移除，严格配置会拒绝未知字段），并按需加上 `tools.loki`。
 
 ## 4. 上线顺序（阶段 E）
 

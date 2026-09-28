@@ -266,8 +266,7 @@ type ApprovalConfig struct {
 
 type ToolsConfig struct {
 	Prometheus PrometheusConfig `yaml:"prometheus"`
-	Logs       LogsConfig       `yaml:"logs"`
-	MySQLRead  MySQLReadConfig  `yaml:"mysql_select"`
+	Loki       LokiConfig       `yaml:"loki"`
 }
 
 type PrometheusConfig struct {
@@ -276,15 +275,12 @@ type PrometheusConfig struct {
 	MaxPoints    int    `yaml:"max_points"`
 }
 
-type LogsConfig struct {
-	Enabled  bool   `yaml:"enabled"`
-	Provider string `yaml:"provider"`
-	Region   string `yaml:"region"`
-	TopicID  string `yaml:"topic_id"`
-}
-
-type MySQLReadConfig struct {
-	DSN string `yaml:"dsn"`
+// LokiConfig is the optional historical log search. An empty base_url leaves
+// loki_query unregistered; diagnosis then relies on docker_logs alone.
+type LokiConfig struct {
+	BaseURL          string `yaml:"base_url"`
+	MaxLines         int    `yaml:"max_lines"`
+	MaxWindowMinutes int    `yaml:"max_window_minutes"`
 }
 
 type NotifyConfig struct {
@@ -429,7 +425,7 @@ func defaultConfig() Config {
 				RangeMinutes: 15,
 				MaxPoints:    300,
 			},
-			Logs: LogsConfig{Provider: "cls"},
+			Loki: LokiConfig{MaxLines: 200, MaxWindowMinutes: 360},
 		},
 	}
 }
@@ -559,6 +555,12 @@ func validate(cfg Config) error {
 	}
 	if cfg.Tools.Prometheus.MaxPoints < 1 {
 		return fmt.Errorf("config: tools.prometheus.max_points must be at least 1")
+	}
+	if cfg.Tools.Loki.MaxLines < 1 {
+		return fmt.Errorf("config: tools.loki.max_lines must be at least 1")
+	}
+	if err := validatePositiveMinutes("tools.loki.max_window_minutes", cfg.Tools.Loki.MaxWindowMinutes); err != nil {
+		return err
 	}
 	if cfg.LLM.Roles.Reasoner.MaxTokens < 1 {
 		return fmt.Errorf("config: llm.roles.reasoner.max_tokens must be at least 1")

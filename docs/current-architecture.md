@@ -154,7 +154,7 @@ flowchart TB
 
     subgraph adapters["适配器与安全工具"]
         LLM["internal/llm<br/>Factory、Reasoner、Questioner、ModelSwitcher"]
-        TOOLS["internal/tools<br/>Registry、Prometheus、Docker"]
+        TOOLS["internal/tools<br/>Registry、Prometheus、Docker、Loki"]
         NOTIFY["internal/notify<br/>Webhook / Feishu / Noop"]
     end
 
@@ -231,7 +231,7 @@ flowchart TB
 | `internal/incident` | 不依赖 store 的归并/生命周期/路由纯规则；ExecutionContext、PlanHash、FaultFingerprint 与重诊规则 |
 | `internal/diagnose` | Evidence（含发布记录与上游账号采集）、诊断快照、Pipeline、Guard、按检查项的 Verifier 和持久验证/观察 Worker |
 | `internal/llm` | OpenAI 兼容模型工厂、Eino ReAct、只读 Questioner、模型切换；计划契约由已启用动作定义生成 |
-| `internal/tools` | 只读工具注册、统一超时、输出截断；动作定义与实现（Prepare / Execute / Reconcile）：`docker_restart`、`deployment_rollback`、`upstream_quarantine` |
+| `internal/tools` | 只读工具（Prometheus、Docker、Loki）注册、统一超时、脱敏、输出截断；动作定义与实现（Prepare / Execute / Reconcile）：`docker_restart`、`deployment_rollback`、`upstream_quarantine` |
 | `internal/sub2api` | sub2api 管理接口客户端（只读 ops、账号调度）与业务探针 |
 | `internal/approval` | 规则授权（Authority / Policy）、审批 CAS、审批 TTL、执行器（领取复验、回执、对账） |
 | `internal/memory` | 精确故障指纹记忆；高置信 TTL 召回、写回和降级 |
@@ -385,8 +385,10 @@ flowchart TB
         L1["Registry.ForLLM()<br/>只读工具"]
         PROMTOOL["Prometheus instant/range/series"]
         DOCTOOL["Docker inspect/logs<br/>若 socket 可用"]
+        LOKITOOL["loki_query 历史日志<br/>若配置 tools.loki"]
         L1 --> PROMTOOL
         L1 --> DOCTOOL
+        L1 --> LOKITOOL
     end
 
     REASON -.-> L1
@@ -1045,6 +1047,7 @@ raw_event → incident
 | 严格配置 | YAML AST 展开后 `KnownFields(true)` | 未知/删除字段、多文档或无效时长拒绝启动 |
 | Prometheus | 默认本机 `9090` | 证据和黄金指标查询使用该地址 |
 | Docker socket | 默认 `/var/run/docker.sock` | socket 不存在时跳过 Docker 工具和证据 |
+| Loki | `tools.loki.base_url`，示例为本机 `3100` | 留空不注册 `loki_query`；模型只能按 `service` 标签查询，窗口和行数受 `max_window_minutes` / `max_lines` 限制 |
 | Web 前端产物 | `web/dist/` 不入库 | 必须先 `npm run build` 再编译 Go；`.gitkeep` 不是可用控制台 |
 
 ## 12. 安全与可靠性不变量

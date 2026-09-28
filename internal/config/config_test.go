@@ -114,7 +114,7 @@ func TestLoadAcceptsVerificationDurationBoundaries(t *testing.T) {
 }
 
 func TestLoadExampleConfig(t *testing.T) {
-	for _, name := range []string{"AUTH_TOKEN", "MYSQL_DSN", "ARK_KEY", "PG_RO_DSN", "REDIS_ADDR", "REDIS_PASSWORD", "CLS_TOPIC", "MYSQL_RO_DSN", "SUB2API_ADMIN_API_KEY"} {
+	for _, name := range []string{"AUTH_TOKEN", "MYSQL_DSN", "ARK_KEY", "PG_RO_DSN", "REDIS_ADDR", "REDIS_PASSWORD", "SUB2API_ADMIN_API_KEY"} {
 		t.Setenv(name, "test")
 	}
 	t.Setenv("SUB2API_BASE_URL", "http://127.0.0.1:8080")

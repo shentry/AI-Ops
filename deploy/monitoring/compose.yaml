@@ -128,6 +128,70 @@ services:
       SUB2API_PROBE_INTERVAL: ${SUB2API_PROBE_INTERVAL:-5m}
     networks: [monitoring, sub2api]
 
+  # Log storage. Retention is enforced by the compactor settings in loki.yaml;
+  # without them Loki never deletes anything. The agent queries it on 3100.
+  loki:
+    image: grafana/loki:3.7.8
+    restart: unless-stopped
+    logging: *logging
+    ports:
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - ./loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    command:
+      - -config.file=/etc/loki/loki.yaml
+    networks: [monitoring]
+
+  # Ships container logs and the oncall-agent journal to Loki (config.alloy).
+  # The Docker API has no read-only mode: the :ro mount only protects the socket
+  # file. cAdvisor above already holds the same trust level on this host.
+  alloy:
+    image: grafana/alloy:v1.20.0
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      SUB2API_COMPOSE_PROJECT: ${SUB2API_COMPOSE_PROJECT:-sub2api}
+    volumes:
+      - ./config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/log/journal:/var/log/journal:ro
+      - /etc/machine-id:/etc/machine-id:ro
+      - alloy-data:/var/lib/alloy/data
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - --disable-reporting
+      - /etc/alloy/config.alloy
+    networks: [monitoring]
+
+  # Dashboards and Explore. Datasources (./grafana/provisioning) and dashboards
+  # (internal/grafana/dashboards) are provisioned and cannot be edited in the
+  # UI; change the files instead.
+  grafana:
+    image: grafana/grafana:13.2.2
+    restart: unless-stopped
+    logging: *logging
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      # Applies when the Grafana database is first created only.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set the Grafana admin password}
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://127.0.0.1:3000}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../internal/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    networks: [monitoring]
+
 networks:
   monitoring: {}
   # The sub2api Compose project's network, so targets resolve by service name.
@@ -138,3 +202,6 @@ networks:
 volumes:
   prometheus-data:
   alertmanager-data:
+  loki-data:
+  alloy-data:
+  grafana-data:

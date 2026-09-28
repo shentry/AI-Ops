@@ -286,6 +286,21 @@ groups:
           summary: Prometheus rule evaluation is failing
           description: Alert rules may silently stop firing.
 
+      # Alloy gave up sending, or Loki rejected entries. Lines older than the
+      # retention are rejected by design (first start after a long uptime) and
+      # are not a pipeline fault.
+      - alert: LogPipelineDropping
+        expr: |
+          sum(increase(loki_write_dropped_entries_total[15m])) > 0
+          or sum(increase(loki_discarded_samples_total{reason!="greater_than_max_sample_age"}[15m])) > 0
+        labels:
+          severity: warning
+          layer: monitoring
+          observation: unavailable
+        annotations:
+          summary: Logs are being dropped before they reach Loki
+          description: Alloy dropped or Loki rejected log entries in 15 minutes; loki_query and Grafana miss those lines.
+
       # Always firing. Alertmanager forwards it to an external dead man's switch
       # that pages when it stops arriving: the host, Prometheus or Alertmanager
       # itself cannot report its own death.
