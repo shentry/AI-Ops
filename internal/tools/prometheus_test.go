@@ -123,20 +123,26 @@ func TestSeriesMetaAppliesLimit(t *testing.T) {
 		}
 		fmt.Fprint(w, promSuccess(`[{"__name__":"up","instance":"a"},{"__name__":"up","instance":"b"},{"__name__":"up","instance":"c"}]`))
 	})
-	out, err := client.seriesMeta(context.Background(), json.RawMessage(`{"match":["up"],"limit":2}`))
-	if err != nil {
-		t.Fatal(err)
+	// The schema declares every parameter a string; both spellings must work.
+	for _, args := range []string{`{"match":["up"],"limit":2}`, `{"match":["up"],"limit":"2"}`} {
+		out, err := client.seriesMeta(context.Background(), json.RawMessage(args))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded struct {
+			Series    []map[string]string `json:"series"`
+			Truncated bool                `json:"truncated"`
+			Returned  int                 `json:"returned"`
+		}
+		if err := json.Unmarshal([]byte(out), &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if decoded.Returned != 2 || !decoded.Truncated || len(decoded.Series) != 2 {
+			t.Fatalf("%s: series result = %+v", args, decoded)
+		}
 	}
-	var decoded struct {
-		Series    []map[string]string `json:"series"`
-		Truncated bool                `json:"truncated"`
-		Returned  int                 `json:"returned"`
-	}
-	if err := json.Unmarshal([]byte(out), &decoded); err != nil {
-		t.Fatal(err)
-	}
-	if decoded.Returned != 2 || !decoded.Truncated || len(decoded.Series) != 2 {
-		t.Fatalf("series result = %+v", decoded)
+	if _, err := client.seriesMeta(context.Background(), json.RawMessage(`{"match":["up"],"limit":"two"}`)); err == nil {
+		t.Fatal("seriesMeta(non-numeric limit) error = nil")
 	}
 
 	if _, err := client.seriesMeta(context.Background(), json.RawMessage(`{"match":[]}`)); err == nil {

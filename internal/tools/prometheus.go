@@ -271,7 +271,7 @@ func (c *PrometheusClient) QueryRange(ctx context.Context, expr string, start, e
 type seriesArgs struct {
 	// LLM 可能给字符串也可能给数组，两种都接。
 	Match json.RawMessage `json:"match"`
-	Limit int             `json:"limit"`
+	Limit json.RawMessage `json:"limit"`
 }
 
 // matchSelectors 把 match 参数归一成 selector 列表。
@@ -304,8 +304,12 @@ func (c *PrometheusClient) seriesMeta(ctx context.Context, raw json.RawMessage) 
 	if err != nil {
 		return "", err
 	}
-	if args.Limit <= 0 {
-		args.Limit = 50
+	limit, err := IntArg(args.Limit)
+	if err != nil {
+		return "", fmt.Errorf("limit must be an integer: %w", err)
+	}
+	if limit <= 0 {
+		limit = 50
 	}
 	query := url.Values{}
 	for _, selector := range selectors {
@@ -323,8 +327,8 @@ func (c *PrometheusClient) seriesMeta(ctx context.Context, raw json.RawMessage) 
 		return "", fmt.Errorf("decode series data: %w", err)
 	}
 	truncated := false
-	if len(series) > args.Limit {
-		series = series[:args.Limit]
+	if len(series) > limit {
+		series = series[:limit]
 		truncated = true
 	}
 	out, err := json.Marshal(map[string]any{"series": series, "truncated": truncated, "returned": len(series)})
